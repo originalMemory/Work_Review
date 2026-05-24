@@ -12,11 +12,11 @@ test('前端应向日报生成与工作助手透传当前 locale，并让日期�
   ]);
 
   assert.match(appSource, /invoke\('generate_report', \{ date: today, force: false, locale: currentLocale \}\)/);
-  assert.match(reportSource, /invoke\('generate_report', \{ date: selectedDate, force, locale: currentLocale \}\)/);
-  assert.match(reportSource, /invoke\('get_saved_report', \{ date: selectedDate, locale: currentLocale \}\)/);
+  assert.match(reportSource, /invoke\('generate_report', \{[\s\S]*date: selectedDate,[\s\S]*force,[\s\S]*locale: currentLocale,[\s\S]*deviceId: \$selectedDeviceId \?\? null,[\s\S]*\}\)/);
+  assert.match(reportSource, /invoke\('get_saved_report', \{[\s\S]*date: selectedDate,[\s\S]*locale: currentLocale,[\s\S]*deviceId: \$selectedDeviceId \?\? null,[\s\S]*\}\)/);
   assert.match(
     reportSource,
-    /if \(!savedReport && previousReport\?\.date === selectedDate && previousReport\?\.content\)[\s\S]*invoke\('generate_report', \{ date: selectedDate, force: false, locale: currentLocale \}\)/,
+    /if \(!savedReport && previousReport\?\.date === selectedDate && previousReport\?\.content\)[\s\S]*invoke\('generate_report', \{[\s\S]*date: selectedDate,[\s\S]*force: false,[\s\S]*locale: currentLocale,[\s\S]*deviceId: \$selectedDeviceId \?\? null,[\s\S]*\}\)/,
   );
   assert.match(askSource, /invoke\('chat_work_assistant', \{[\s\S]*locale: currentLocale,[\s\S]*\}\)/);
 

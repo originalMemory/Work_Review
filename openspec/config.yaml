@@ -1,0 +1,19 @@
+schema: spec-driven
+
+context: |
+  Tech stack: Rust (Tauri 2) + Svelte 4 + Vite + Tailwind CSS
+  Backend: Rust with rusqlite (SQLite), tokio async runtime
+  Frontend: Svelte SPA with svelte-spa-router, Chart.js
+  Desktop app: Tauri 2 framework (桌面端工作轨迹记录器)
+  Data: SQLite database (workreview.db) + JPEG screenshots + OCR text
+  Platform: macOS / Windows / Linux
+  Language: 代码注释和日志使用中文
+
+rules:
+  proposal:
+    - Keep proposals under 500 words
+    - Always include a "Non-goals" section
+    - Reference the existing design doc at docs/SYNC_DESIGN.md
+  tasks:
+    - Break tasks into chunks of max 2 hours
+    - Group tasks by component (client data model, client sync logic, sync-server, client UI)

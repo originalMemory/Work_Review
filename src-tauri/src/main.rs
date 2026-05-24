@@ -29,6 +29,7 @@ mod remote_upload;
 mod screen_lock;
 mod screenshot;
 mod storage;
+mod sync;
 mod telegram_bot;
 mod work_intelligence;
 
@@ -1556,6 +1557,7 @@ async fn background_avatar_task(state: Arc<Mutex<AppState>>, app: AppHandle) {
                     Some(date_from.as_str()),
                     None,
                     480,
+                    Some(state_guard.config.sync.device_id.as_str()),
                 );
                 (
                     activities,
@@ -1954,7 +1956,7 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
 
         // 使用距离上次截图的实际经过时间作为本次记录的时长
         // 而非固定的轮询间隔，避免截图间隔大于轮询间隔时丢失时长
-        let (privacy_action, duration_to_record) = {
+        let (privacy_action, duration_to_record, current_device_id) = {
             let state_guard = state.lock().unwrap_or_else(|e| e.into_inner());
             let action = state_guard.privacy_filter.check_privacy_full(
                 &active_window.app_name,
@@ -1963,7 +1965,8 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
             );
             // elapsed_secs 是距离上次截图的真实秒数，确保时长不丢失
             let duration = elapsed_secs.max(1) as i64;
-            (action, duration)
+            let did = state_guard.config.sync.device_id.clone();
+            (action, duration, did)
         };
         // 锁已释放
 
@@ -2048,6 +2051,8 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                         semantic_category: Some(classification.semantic_category),
                         semantic_confidence: Some(i32::from(classification.confidence)),
                         screenshot_url: None,
+                        uuid: None,
+                        device_id: current_device_id.clone(),
                     };
 
                     // 短暂获取锁写入数据库
@@ -2343,6 +2348,8 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                         semantic_category: Some(classification.semantic_category.clone()),
                         semantic_confidence: Some(i32::from(classification.confidence)),
                         screenshot_url: None,
+                        uuid: None,
+                        device_id: current_device_id.clone(),
                     })
                 } else {
                     // === 新建路径：正常截屏并保存 ===
@@ -2437,6 +2444,8 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                                     ),
                                     semantic_confidence: Some(i32::from(classification.confidence)),
                                     screenshot_url: None,
+                                    uuid: None,
+                                    device_id: current_device_id.clone(),
                                 };
 
                                 let inserted = {
@@ -2590,6 +2599,8 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                             semantic_category: Some(classification.semantic_category.clone()),
                             semantic_confidence: Some(i32::from(classification.confidence)),
                             screenshot_url: None,
+                            uuid: None,
+                            device_id: current_device_id.clone(),
                         };
 
                         let inserted = {
@@ -2726,6 +2737,8 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                     semantic_category: Some(classification.semantic_category),
                     semantic_confidence: Some(i32::from(classification.confidence)),
                     screenshot_url: None,
+                    uuid: None,
+                    device_id: current_device_id.clone(),
                 };
 
                 let state_guard = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -2773,6 +2786,10 @@ pub(crate) fn generate_and_save_summary(state: &Arc<Mutex<AppState>>, date: &str
                     serde_json::to_string(&stats.representative_screenshots).unwrap_or_default(),
                 ),
                 created_at: chrono::Local::now().timestamp(),
+                device_id: {
+                    let state_guard = state.lock().unwrap_or_else(|e| e.into_inner());
+                    state_guard.config.sync.device_id.clone()
+                },
             };
 
             let save_result = {
@@ -2896,6 +2913,10 @@ async fn main() {
         log::warn!("加载配置失败，使用默认配置: {e}");
         AppConfig::default()
     });
+    config.normalize();
+    if let Err(e) = config.save(&config_path) {
+        log::warn!("保存规范化后的配置失败: {e}");
+    }
 
     // 迁移旧版 excluded_apps → app_rules
     if config.privacy.migrate_legacy_excluded_apps() {
@@ -2914,11 +2935,15 @@ async fn main() {
         log::warn!("FTS 索引重建失败（不影响核心功能）: {e}");
     }
 
+    // 回填旧记录的 device_id 并迁移截图目录
+    database.backfill_device_id(&config.sync.device_id);
+    database.migrate_screenshots_to_device_dir(&data_dir, &config.sync.device_id);
+
     // 初始化隐私过滤器
     let privacy_filter = PrivacyFilter::from_config(&config.privacy);
 
     // 初始化截屏服务
-    let screenshot_service = ScreenshotService::new(&data_dir, &config.storage);
+    let screenshot_service = ScreenshotService::new(&data_dir, &config.storage, &config.sync.device_id);
 
     // 版本更新后重置 macOS 录屏权限引导标记，确保更新后能重新弹窗
     let current_version = env!("CARGO_PKG_VERSION").to_string();
@@ -3290,6 +3315,11 @@ async fn main() {
                 hourly_summary_task(state_clone2).await;
             });
 
+            let state_clone_sync = state.inner().clone();
+            tauri::async_runtime::spawn(async move {
+                sync::sync_background_task(state_clone_sync).await;
+            });
+
             // 启动时清理当天的重复记录
             {
                 let state_guard = state.inner().lock().unwrap_or_else(|e| e.into_inner());
@@ -3415,6 +3445,12 @@ async fn main() {
             commands::clear_background_image,
             commands::show_main_window,
             commands::handle_avatar_followup_action,
+            commands::set_ui_selected_device_id,
+            commands::sync_now,
+            commands::get_sync_status,
+            commands::register_device,
+            commands::get_known_devices,
+            commands::get_reports_by_date,
             get_platform,
         ])
         .build(tauri::generate_context!())

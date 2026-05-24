@@ -634,8 +634,11 @@ mod tests {
             ..Default::default()
         };
 
-        let summary = generate_stats_summary_for_locale(&stats, AppLocale::ZhCn);
-        let english_summary = generate_stats_summary_for_locale(&stats, AppLocale::En);
+        let empty = std::collections::HashMap::new();
+        let summary =
+            generate_stats_summary_for_locale(&stats, AppLocale::ZhCn, &empty);
+        let english_summary =
+            generate_stats_summary_for_locale(&stats, AppLocale::En, &empty);
 
         assert!(summary.contains("按小时活跃度"));
         assert!(summary.contains("高峰时段"));
@@ -646,7 +649,7 @@ mod tests {
 
     #[test]
     fn 英文语义分类应翻译为英文标签() {
-        let empty = HashMap::new();
+        let empty = std::collections::HashMap::new();
         assert_eq!(
             translate_semantic_category_name("编码开发", AppLocale::En, &empty),
             "Development"

@@ -21,6 +21,7 @@ use crate::work_intelligence::{
     generate_weekly_review as build_weekly_review, IntentAnalysisResult, TodoExtractionResult,
     WeeklyReviewResult, WorkSession,
 };
+use crate::sync::SyncService;
 use crate::AppState;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -249,20 +250,33 @@ fn normalize_saved_report_ai_mode(value: &str) -> String {
     value.trim().to_lowercase()
 }
 
-fn build_daily_report_export_path(export_dir: &Path, date: &str) -> PathBuf {
+fn build_daily_report_export_path(export_dir: &Path, date: &str, device_id: Option<&str>) -> PathBuf {
     let safe_date = date.replace('/', "-").replace('\\', "-");
-    export_dir.join(format!("{safe_date}.md"))
+    let safe_device_id = device_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .unwrap_or("all")
+        .replace('/', "-")
+        .replace('\\', "-");
+    export_dir.join(format!("{safe_date}.{safe_device_id}.md"))
 }
 
 fn export_daily_report_markdown(
     export_dir: &Path,
     date: &str,
+    device_id: Option<&str>,
     content: &str,
 ) -> Result<(), AppError> {
     std::fs::create_dir_all(export_dir)?;
-    let output_path = build_daily_report_export_path(export_dir, date);
+    let output_path = build_daily_report_export_path(export_dir, date, device_id);
     std::fs::write(output_path, content)?;
     Ok(())
+}
+
+fn normalize_report_device_id(device_id: Option<String>) -> Option<String> {
+    device_id
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
 }
 
 #[cfg(target_os = "linux")]
@@ -2875,11 +2889,15 @@ fn apply_excluded_domains_to_stats(
     stats
 }
 
-fn load_daily_stats_for_overview(state: &AppState, date: &str) -> Result<DailyStats, AppError> {
+fn load_daily_stats_for_overview(
+    state: &AppState,
+    date: &str,
+    device_id: Option<&str>,
+) -> Result<DailyStats, AppError> {
     let segments = state.config.effective_work_segments();
     state
         .database
-        .get_daily_stats_with_segments(date, &segments)
+        .get_daily_stats_with_segments(date, &segments, device_id)
 }
 
 fn overview_week_bounds_for_date(anchor: chrono::NaiveDate) -> (String, String) {
@@ -3184,10 +3202,13 @@ fn resolve_overview_date_span(
 }
 
 /// 获取今日统计 —— 内部复用版（供 Tauri 命令与 localhost API 共用）
-pub(crate) fn get_today_stats_inner(state: &Arc<Mutex<AppState>>) -> Result<DailyStats, AppError> {
+pub(crate) fn get_today_stats_inner(
+    state: &Arc<Mutex<AppState>>,
+    device_id: Option<&str>,
+) -> Result<DailyStats, AppError> {
     let state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let stats = load_daily_stats_for_overview(&state, &today)?;
+    let stats = load_daily_stats_for_overview(&state, &today, device_id)?;
     let (ignored_apps, excluded_domains) = collect_privacy_filters(&state);
     let stats = apply_ignored_apps_to_stats(stats, &ignored_apps);
     Ok(apply_excluded_domains_to_stats(stats, &excluded_domains))
@@ -3196,9 +3217,13 @@ pub(crate) fn get_today_stats_inner(state: &Arc<Mutex<AppState>>) -> Result<Dail
 /// 获取今日统计
 #[tauri::command]
 pub async fn get_today_stats(
+    device_id: Option<String>,
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<DailyStats, AppError> {
-    get_today_stats_inner(state.inner())
+    get_today_stats_inner(
+        state.inner(),
+        device_id.as_deref().filter(|s| !s.is_empty()),
+    )
 }
 
 /// 获取概览统计 —— 内部复用版
@@ -3207,6 +3232,7 @@ pub(crate) fn get_overview_stats_inner(
     date: Option<String>,
     date_from: Option<String>,
     date_to: Option<String>,
+    device_id: Option<&str>,
     state: &Arc<Mutex<AppState>>,
 ) -> Result<DailyStats, AppError> {
     let state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
@@ -3223,13 +3249,13 @@ pub(crate) fn get_overview_stats_inner(
 
             if start == end {
                 let date_value = start.format("%Y-%m-%d").to_string();
-                load_daily_stats_for_overview(&state, &date_value)?
+                load_daily_stats_for_overview(&state, &date_value, device_id)?
             } else {
                 let mut daily_stats = Vec::new();
                 let mut current = start;
                 while current <= end {
                     let current_date = current.format("%Y-%m-%d").to_string();
-                    daily_stats.push(load_daily_stats_for_overview(&state, &current_date)?);
+                    daily_stats.push(load_daily_stats_for_overview(&state, &current_date, device_id)?);
                     current = current
                         .succ_opt()
                         .ok_or_else(|| AppError::Config("计算概览日期范围失败".to_string()))?;
@@ -3249,7 +3275,7 @@ pub(crate) fn get_overview_stats_inner(
             let mut current = start;
             while current <= end {
                 let current_date = current.format("%Y-%m-%d").to_string();
-                daily_stats.push(load_daily_stats_for_overview(&state, &current_date)?);
+                daily_stats.push(load_daily_stats_for_overview(&state, &current_date, device_id)?);
                 current = current
                     .succ_opt()
                     .ok_or_else(|| AppError::Config("计算周概览日期范围失败".to_string()))?;
@@ -3258,7 +3284,7 @@ pub(crate) fn get_overview_stats_inner(
         }
         _ => {
             let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-            load_daily_stats_for_overview(&state, &today)?
+            load_daily_stats_for_overview(&state, &today, device_id)?
         }
     };
 
@@ -3273,19 +3299,28 @@ pub async fn get_overview_stats(
     date: Option<String>,
     date_from: Option<String>,
     date_to: Option<String>,
+    device_id: Option<String>,
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<DailyStats, AppError> {
-    get_overview_stats_inner(mode, date, date_from, date_to, state.inner())
+    get_overview_stats_inner(
+        mode,
+        date,
+        date_from,
+        date_to,
+        device_id.as_deref().filter(|s| !s.is_empty()),
+        state.inner(),
+    )
 }
 
 /// 获取指定日期的统计 —— 内部复用版
 pub(crate) fn get_daily_stats_inner(
     date: &str,
+    device_id: Option<&str>,
     state: &Arc<Mutex<AppState>>,
 ) -> Result<DailyStats, AppError> {
     let s = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
     let segments = s.config.effective_work_segments();
-    let raw_stats = s.database.get_daily_stats_with_segments(date, &segments)?;
+    let raw_stats = s.database.get_daily_stats_with_segments(date, &segments, device_id)?;
     let (ignored_apps, excluded_domains) = collect_privacy_filters(&s);
     Ok(apply_excluded_domains_to_stats(
         apply_ignored_apps_to_stats(raw_stats, &ignored_apps),
@@ -3297,9 +3332,14 @@ pub(crate) fn get_daily_stats_inner(
 #[tauri::command]
 pub async fn get_daily_stats(
     date: String,
+    device_id: Option<String>,
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<DailyStats, AppError> {
-    get_daily_stats_inner(&date, state.inner())
+    get_daily_stats_inner(
+        &date,
+        device_id.as_deref().filter(|s| !s.is_empty()),
+        state.inner(),
+    )
 }
 
 /// 获取指定日期的时间线 —— 内部复用版（供 Tauri 命令与 localhost API 共用）
@@ -3307,10 +3347,13 @@ pub(crate) fn get_timeline_inner(
     date: String,
     limit: Option<u32>,
     offset: Option<u32>,
+    device_id: Option<&str>,
     state: &Arc<Mutex<AppState>>,
 ) -> Result<Vec<Activity>, AppError> {
     let state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
-    let activities = state.database.get_timeline(&date, limit, offset)?;
+    let activities = state
+        .database
+        .get_timeline_filtered(&date, limit, offset, device_id)?;
     let (ignored_apps, excluded_domains) = collect_privacy_filters(&state);
     let filtered = filter_activities_by_privacy(activities, &ignored_apps, &excluded_domains);
 
@@ -3332,9 +3375,16 @@ pub async fn get_timeline(
     date: String,
     limit: Option<u32>,
     offset: Option<u32>,
+    device_id: Option<String>,
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<Vec<Activity>, AppError> {
-    get_timeline_inner(date, limit, offset, state.inner())
+    get_timeline_inner(
+        date,
+        limit,
+        offset,
+        device_id.as_deref().filter(|s| !s.is_empty()),
+        state.inner(),
+    )
 }
 
 /// 获取每小时×应用的时长分布
@@ -3399,10 +3449,11 @@ pub(crate) fn load_filtered_activities_in_range(
     date_from: Option<&str>,
     date_to: Option<&str>,
     limit: usize,
+    device_id: Option<&str>,
 ) -> Result<Vec<Activity>, AppError> {
     let activities = state
         .database
-        .get_activities_in_range(date_from, date_to, limit)?;
+        .get_activities_in_range(date_from, date_to, limit, device_id)?;
     let (ignored_apps, excluded_domains) = collect_privacy_filters(state);
     Ok(filter_activities_by_privacy(
         activities,
@@ -3500,6 +3551,7 @@ pub async fn search_memory(
         date_from.as_deref(),
         date_to.as_deref(),
         limit.unwrap_or(20) as usize,
+        None,
     )
 }
 
@@ -3516,7 +3568,7 @@ pub async fn ask_memory(
         let references =
             state
                 .database
-                .search_memory(&question, date_from.as_deref(), date_to.as_deref(), 8)?;
+                .search_memory(&question, date_from.as_deref(), date_to.as_deref(), 8, None)?;
         (state.config.text_model.clone(), references)
     };
 
@@ -3598,6 +3650,7 @@ pub async fn chat_work_assistant(
             date_from.as_deref(),
             date_to.as_deref(),
             8,
+            None,
         )?;
 
         let needs_activity_data = tools.iter().any(|tool| {
@@ -3616,6 +3669,7 @@ pub async fn chat_work_assistant(
                 date_from.as_deref(),
                 date_to.as_deref(),
                 5000,
+                None,
             )?)
         } else {
             None
@@ -3743,6 +3797,7 @@ pub async fn get_work_sessions(
         date_from.as_deref(),
         date_to.as_deref(),
         limit.unwrap_or(5000) as usize,
+        None,
     )?;
 
     Ok(build_work_sessions(&activities))
@@ -3762,6 +3817,7 @@ pub async fn recognize_work_intents(
         date_from.as_deref(),
         date_to.as_deref(),
         limit.unwrap_or(5000) as usize,
+        None,
     )?;
 
     Ok(analyze_intents(&activities))
@@ -3780,6 +3836,7 @@ pub(crate) fn generate_weekly_review_inner(
         date_from.as_deref(),
         date_to.as_deref(),
         limit.unwrap_or(5000) as usize,
+        None,
     )?;
 
     Ok(build_weekly_review(
@@ -3814,6 +3871,7 @@ pub async fn extract_todo_items(
         date_from.as_deref(),
         date_to.as_deref(),
         limit.unwrap_or(5000) as usize,
+        None,
     )?;
 
     Ok(merge_manual_followups_into_todos(
@@ -3829,17 +3887,20 @@ pub(crate) async fn generate_report_inner(
     date: String,
     force: Option<bool>,
     locale: Option<String>,
+    device_id: Option<String>,
     app: &AppHandle,
     state: &Arc<Mutex<AppState>>,
 ) -> Result<String, AppError> {
     let report_locale = AppLocale::from_option(locale.as_deref());
     let report_locale_code = report_locale.as_code();
+    let report_device_id = normalize_report_device_id(device_id);
+    let report_device_filter = report_device_id.as_deref();
     // 如果不是强制重新生成，先检查缓存
     if !force.unwrap_or(false) {
         let state_guard = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
         if let Ok(Some(cached)) = state_guard
             .database
-            .get_report(&date, Some(report_locale_code))
+            .get_report(&date, Some(report_locale_code), report_device_filter)
         {
             log::info!("使用缓存日报: {date}");
             return Ok(cached.content);
@@ -3851,9 +3912,11 @@ pub(crate) async fn generate_report_inner(
         let segments = state.config.effective_work_segments();
         let raw_stats = state
             .database
-            .get_daily_stats_with_segments(&date, &segments)?;
+            .get_daily_stats_with_segments(&date, &segments, report_device_filter)?;
         // 生成日报时获取最多 2000 条记录
-        let raw_activities = state.database.get_timeline(&date, Some(2000), None)?;
+        let raw_activities = state
+            .database
+            .get_timeline_filtered(&date, Some(2000), None, report_device_filter)?;
         let (ignored_apps, excluded_domains) = collect_privacy_filters(&state);
         let stats = apply_excluded_domains_to_stats(
             apply_ignored_apps_to_stats(raw_stats, &ignored_apps),
@@ -4020,6 +4083,9 @@ pub(crate) async fn generate_report_inner(
     // 保存报告
     {
         let state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
+        let save_device_id = report_device_id
+            .clone()
+            .unwrap_or_else(|| state.config.sync.device_id.clone());
         let daily_report = DailyReport {
             date: date.clone(),
             locale: report_locale_code.to_string(),
@@ -4028,13 +4094,19 @@ pub(crate) async fn generate_report_inner(
             model_name: saved_model_name,
             fallback_reason: generated_report.fallback_reason.clone(),
             created_at: chrono::Utc::now().timestamp(),
+            device_id: save_device_id,
         };
         state.database.save_report(&daily_report)?;
     }
 
     if config.daily_report_auto_export {
         if let Some(export_dir) = config.daily_report_export_dir.as_deref() {
-            export_daily_report_markdown(Path::new(export_dir), &date, &report)?;
+            export_daily_report_markdown(
+                Path::new(export_dir),
+                &date,
+                report_device_filter,
+                &report,
+            )?;
         }
     }
 
@@ -4058,6 +4130,7 @@ pub async fn generate_report(
     date: String,
     force: Option<bool>,
     locale: Option<String>,
+    device_id: Option<String>,
     app: AppHandle,
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<String, AppError> {
@@ -4069,20 +4142,23 @@ pub async fn generate_report(
         s.generating_report = true;
     }
     let _guard = ReportGenerationGuard { state: state.inner().clone() };
-    generate_report_inner(date, force, locale, &app, state.inner()).await
+    generate_report_inner(date, force, locale, device_id, &app, state.inner()).await
 }
 
 /// 获取已保存的日报
 pub(crate) fn get_saved_report_inner(
     date: String,
     locale: Option<String>,
+    device_id: Option<String>,
     state: &Arc<Mutex<AppState>>,
 ) -> Result<Option<DailyReport>, AppError> {
     let report_locale = AppLocale::from_option(locale.as_deref());
+    let report_device_id = normalize_report_device_id(device_id);
+    let report_device_filter = report_device_id.as_deref();
     let state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
     let saved = state
         .database
-        .get_report(&date, Some(report_locale.as_code()))?;
+        .get_report(&date, Some(report_locale.as_code()), report_device_filter)?;
     let Some(mut report) = saved else {
         return Ok(None);
     };
@@ -4090,7 +4166,11 @@ pub(crate) fn get_saved_report_inner(
     // 用最新的 stats 重新渲染统计区块，解决 issue #80：保存的 markdown 里固化的时长
     // 数字会随着工作日继续推进而变得陈旧。老报告若没有占位符标记则原样返回。
     let segments = state.config.effective_work_segments();
-    if let Ok(raw_stats) = state.database.get_daily_stats_with_segments(&date, &segments) {
+    if let Ok(raw_stats) =
+        state
+            .database
+            .get_daily_stats_with_segments(&date, &segments, report_device_filter)
+    {
         let (ignored_apps, excluded_domains) = collect_privacy_filters(&state);
         let live_stats = apply_excluded_domains_to_stats(
             apply_ignored_apps_to_stats(raw_stats, &ignored_apps),
@@ -4124,9 +4204,10 @@ pub(crate) fn get_saved_report_inner(
 pub async fn get_saved_report(
     date: String,
     locale: Option<String>,
+    device_id: Option<String>,
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<Option<DailyReport>, AppError> {
-    get_saved_report_inner(date, locale, state.inner())
+    get_saved_report_inner(date, locale, device_id, state.inner())
 }
 
 /// 更新已保存日报的内容（用于结构化编辑）
@@ -4134,15 +4215,18 @@ pub async fn get_saved_report(
 pub async fn update_report_content(
     date: String,
     locale: Option<String>,
+    device_id: Option<String>,
     content: String,
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<(), AppError> {
     let report_locale = AppLocale::from_option(locale.as_deref());
     let locale_code = report_locale.as_code();
+    let report_device_id = normalize_report_device_id(device_id);
+    let report_device_filter = report_device_id.as_deref();
     let mut state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
     let existing = state
         .database
-        .get_report(&date, Some(locale_code))?
+        .get_report(&date, Some(locale_code), report_device_filter)?
         .ok_or_else(|| AppError::Database(rusqlite::Error::InvalidParameterName("报告不存在".to_string())))?;
     let updated = DailyReport {
         content,
@@ -4155,9 +4239,12 @@ pub async fn update_report_content(
 pub(crate) fn export_report_markdown_inner(
     date: String,
     content: Option<String>,
+    device_id: Option<String>,
     export_dir: Option<String>,
     state: &Arc<Mutex<AppState>>,
 ) -> Result<String, AppError> {
+    let report_device_id = normalize_report_device_id(device_id);
+    let report_device_filter = report_device_id.as_deref();
     let (export_dir, saved_content) = {
         let state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
         let requested_export_dir = export_dir
@@ -4184,7 +4271,7 @@ pub(crate) fn export_report_markdown_inner(
         } else {
             state
                 .database
-                .get_report(&date, Some("zh-CN"))?
+                .get_report(&date, Some("zh-CN"), report_device_filter)?
                 .ok_or_else(|| AppError::Config("未找到可导出的日报".to_string()))?
                 .content
         };
@@ -4192,8 +4279,8 @@ pub(crate) fn export_report_markdown_inner(
     };
 
     let export_dir_path = Path::new(&export_dir);
-    export_daily_report_markdown(export_dir_path, &date, &saved_content)?;
-    Ok(build_daily_report_export_path(export_dir_path, &date)
+    export_daily_report_markdown(export_dir_path, &date, report_device_filter, &saved_content)?;
+    Ok(build_daily_report_export_path(export_dir_path, &date, report_device_filter)
         .to_string_lossy()
         .to_string())
 }
@@ -4202,10 +4289,11 @@ pub(crate) fn export_report_markdown_inner(
 pub async fn export_report_markdown(
     date: String,
     content: Option<String>,
+    device_id: Option<String>,
     export_dir: Option<String>,
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<String, AppError> {
-    export_report_markdown_inner(date, content, export_dir, state.inner())
+    export_report_markdown_inner(date, content, device_id, export_dir, state.inner())
 }
 
 /// 获取配置
@@ -4256,6 +4344,26 @@ pub async fn rotate_localhost_api_token(
     let token = crate::localhost_api::rotate_localhost_api_token(state.inner())?;
     crate::localhost_api::sync_localhost_api_runtime(&app, state.inner())?;
     Ok(token)
+}
+
+#[tauri::command]
+pub async fn set_ui_selected_device_id(
+    device_id: Option<String>,
+    app: AppHandle,
+    state: State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), AppError> {
+    let config_snapshot = {
+        let mut guard = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
+        let normalized = device_id
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        guard.config.ui_selected_device_id = normalized;
+        let config_path = guard.config_path.clone();
+        guard.config.save(&config_path)?;
+        guard.config.clone()
+    };
+    crate::emit_config_changed(&app, &config_snapshot);
+    Ok(())
 }
 
 pub(crate) fn persist_app_config(
@@ -5862,7 +5970,7 @@ pub async fn change_data_dir(
         log::warn!("迁移后 FTS 索引重建失败: {e}");
     }
     state.privacy_filter = PrivacyFilter::from_config(&config.privacy);
-    state.screenshot_service = ScreenshotService::new(&target_dir, &config.storage);
+    state.screenshot_service = ScreenshotService::new(&target_dir, &config.storage, &config.sync.device_id);
     state.storage_manager = StorageManager::new(&target_dir, config.storage.clone());
     state.data_dir = target_dir.clone();
     state.config_path = config_path;
@@ -6340,8 +6448,10 @@ pub async fn take_screenshot(state: State<'_, Arc<Mutex<AppState>>>) -> Result<A
         semantic_confidence,
         relative_path,
         executable_path,
+        device_id,
     ) = {
         let state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
+        let device_id = state.config.sync.device_id.clone();
 
         // 获取当前活动窗口
         let active_window = crate::monitor::get_active_window().ok();
@@ -6411,6 +6521,7 @@ pub async fn take_screenshot(state: State<'_, Arc<Mutex<AppState>>>) -> Result<A
             classification.confidence,
             relative_path,
             executable_path,
+            device_id,
         )
     };
 
@@ -6429,6 +6540,8 @@ pub async fn take_screenshot(state: State<'_, Arc<Mutex<AppState>>>) -> Result<A
         semantic_category: Some(semantic_category),
         semantic_confidence: Some(i32::from(semantic_confidence)),
         screenshot_url: None,
+        uuid: None,
+        device_id,
     };
 
     // 保存到数据库
@@ -7106,6 +7219,7 @@ pub async fn get_storage_stats(
 /// 获取指定日期的小时摘要 —— 内部复用版
 pub(crate) fn get_hourly_summaries_inner(
     date: &str,
+    device_id: Option<&str>,
     state: &Arc<Mutex<AppState>>,
 ) -> Result<Vec<serde_json::Value>, AppError> {
     let app_state = state.clone();
@@ -7117,7 +7231,7 @@ pub(crate) fn get_hourly_summaries_inner(
     let s = app_state
         .lock()
         .map_err(|e| AppError::Unknown(e.to_string()))?;
-    let summaries = s.database.get_hourly_summaries(date)?;
+    let summaries = s.database.get_hourly_summaries(date, device_id)?;
 
     Ok(summaries
         .iter()
@@ -7137,9 +7251,14 @@ pub(crate) fn get_hourly_summaries_inner(
 #[tauri::command]
 pub async fn get_hourly_summaries(
     date: String,
+    device_id: Option<String>,
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<Vec<serde_json::Value>, AppError> {
-    get_hourly_summaries_inner(&date, state.inner())
+    get_hourly_summaries_inner(
+        &date,
+        device_id.as_deref().filter(|s| !s.is_empty()),
+        state.inner(),
+    )
 }
 
 /// 清理今天之前的所有活动记录
@@ -8363,6 +8482,361 @@ async fn get_app_icon_impl(
     Ok(String::new())
 }
 
+
+#[derive(serde::Serialize)]
+pub struct SyncNowResult {
+    pub pushed: usize,
+    pub pulled: usize,
+    pub screenshots_pushed: usize,
+    pub devices: Vec<crate::sync::DeviceInfo>,
+    pub error: Option<String>,
+}
+
+#[tauri::command]
+pub async fn sync_now(
+    state: tauri::State<'_, Arc<Mutex<crate::AppState>>>,
+) -> Result<SyncNowResult, AppError> {
+    let (sync_config, data_dir, config_path) = {
+        let guard = state
+            .lock()
+            .map_err(|e| AppError::Unknown(e.to_string()))?;
+        (
+            guard.config.sync.clone(),
+            guard.data_dir.clone(),
+            guard.config_path.clone(),
+        )
+    };
+
+    if !sync_config.enabled || sync_config.server_url.is_empty() {
+        return Err(AppError::Config("同步未启用或服务器地址为空".to_string()));
+    }
+
+    let service = SyncService::new(&sync_config, &data_dir);
+    let mut new_push_ts = sync_config.last_push_timestamp;
+    let mut new_pull_ts = sync_config.last_pull_timestamp;
+    log::info!(
+        "sync_now 开始: push_cursor={}, pull_cursor={}",
+        new_push_ts,
+        new_pull_ts
+    );
+    let mut result = SyncNowResult {
+        pushed: 0,
+        pulled: 0,
+        screenshots_pushed: 0,
+        devices: vec![],
+        error: None,
+    };
+
+    // Push
+    let (activities, reports, summaries, screenshot_paths) = {
+        let guard = state
+            .lock()
+            .map_err(|e| AppError::Unknown(e.to_string()))?;
+        let activities = guard
+            .database
+            .get_activities_since(sync_config.last_push_timestamp)
+            .unwrap_or_default();
+        let reports = guard
+            .database
+            .get_reports_since(sync_config.last_push_timestamp)
+            .unwrap_or_default();
+        let summaries = guard
+            .database
+            .get_hourly_summaries_since(sync_config.last_push_timestamp)
+            .unwrap_or_default();
+        let screenshot_paths: Vec<String> = activities
+            .iter()
+            .filter(|a| !a.screenshot_path.is_empty())
+            .map(|a| a.screenshot_path.clone())
+            .collect();
+        (activities, reports, summaries, screenshot_paths)
+    };
+
+    log::info!(
+        "sync_now 待上传: 活动 {} 条, 日报 {} 份, 摘要 {} 条, 截图 {} 张",
+        activities.len(),
+        reports.len(),
+        summaries.len(),
+        screenshot_paths.len()
+    );
+
+    let sync_activities = crate::sync::activities_to_sync(&activities);
+    let sync_reports = crate::sync::reports_to_sync(&reports);
+    let sync_summaries = crate::sync::summaries_to_sync(&summaries);
+
+    let push_empty =
+        activities.is_empty() && reports.is_empty() && summaries.is_empty();
+    match service
+        .push_data(sync_activities, sync_reports, sync_summaries)
+        .await
+    {
+        Ok(resp) => {
+            result.pushed = resp.accepted;
+            if !push_empty {
+                if let Some(m) = crate::sync::max_event_cursor_from_local_push(
+                    &activities,
+                    &reports,
+                    &summaries,
+                ) {
+                    new_push_ts = new_push_ts.max(m);
+                }
+            }
+        }
+        Err(e) => {
+            result.error = Some(format!("push: {e}"));
+            return Ok(result);
+        }
+    }
+
+    // 元数据推送成功后立即落盘推送游标，避免大量截图上传阻塞时 UI/下次同步仍显示旧时间
+    {
+        let mut guard = state
+            .lock()
+            .map_err(|e| AppError::Unknown(e.to_string()))?;
+        guard.config.sync.last_push_timestamp = new_push_ts;
+        let _ = guard.config.save(&config_path);
+    }
+    log::info!(
+        "sync_now 元数据推送完成: accepted={}, 游标已保存 last_push_timestamp={}",
+        result.pushed,
+        new_push_ts
+    );
+
+    // Push screenshots
+    if !screenshot_paths.is_empty() {
+        log::info!(
+            "sync_now 开始上传截图: {} 张, mode={:?}",
+            screenshot_paths.len(),
+            sync_config.sync_screenshots_mode
+        );
+    }
+    match service
+        .push_screenshots(&screenshot_paths, sync_config.sync_screenshots_mode)
+        .await
+    {
+        Ok(n) => result.screenshots_pushed = n,
+        Err(e) => log::warn!("push screenshots 失败: {e}"),
+    }
+
+    // Pull（分页与后台同步任务一致；游标为事件时间而非 server_timestamp）
+    let mut pull_session_max: Option<i64> = None;
+    let mut pull_page = 0u32;
+    loop {
+        pull_page += 1;
+        log::info!("sync_now 拉取第 {pull_page} 页: since={new_pull_ts}");
+        match service.pull_data(new_pull_ts).await {
+            Ok(pull) => {
+                let count =
+                    pull.activities.len() + pull.daily_reports.len() + pull.hourly_summaries.len();
+                result.pulled += count;
+                log::info!(
+                    "sync_now 拉取第 {pull_page} 页完成: {count} 条 (活动 {}, 日报 {}, 摘要 {}), has_more={}",
+                    pull.activities.len(),
+                    pull.daily_reports.len(),
+                    pull.hourly_summaries.len(),
+                    pull.has_more
+                );
+                if let Some(m) = crate::sync::max_event_cursor_from_pull(&pull) {
+                    pull_session_max = Some(pull_session_max.map_or(m, |x| x.max(m)));
+                }
+                if count > 0 {
+                    let guard = state
+                        .lock()
+                        .map_err(|e| AppError::Unknown(e.to_string()))?;
+                    crate::sync::upsert_pulled_data(&guard.database, &pull);
+                }
+                if !pull.has_more {
+                    break;
+                }
+                if let Some(last) = pull.activities.last() {
+                    new_pull_ts = last.timestamp;
+                } else {
+                    break;
+                }
+            }
+            Err(e) => {
+                result.error = Some(format!("pull: {e}"));
+                break;
+            }
+        }
+    }
+    new_pull_ts = match pull_session_max {
+        Some(m) => sync_config.last_pull_timestamp.max(m),
+        None => sync_config.last_pull_timestamp,
+    };
+
+    // Pull devices
+    match service.pull_devices().await {
+        Ok(devices) => result.devices = devices,
+        Err(e) => log::warn!("pull devices 失败: {e}"),
+    }
+
+    // Save timestamps
+    {
+        let mut guard = state
+            .lock()
+            .map_err(|e| AppError::Unknown(e.to_string()))?;
+        guard.config.sync.last_push_timestamp = new_push_ts;
+        guard.config.sync.last_pull_timestamp = new_pull_ts;
+        let _ = guard.config.save(&config_path);
+    }
+
+    log::info!(
+        "sync_now 完成: pushed={}, pulled={}, screenshots={}, error={:?}",
+        result.pushed,
+        result.pulled,
+        result.screenshots_pushed,
+        result.error
+    );
+
+    Ok(result)
+}
+
+#[derive(serde::Serialize)]
+pub struct SyncStatusInfo {
+    pub enabled: bool,
+    pub server_url: String,
+    pub device_id: String,
+    pub device_name: String,
+    pub last_push_timestamp: i64,
+    pub last_pull_timestamp: i64,
+    pub sync_interval_minutes: u32,
+    pub sync_screenshots_mode: String,
+}
+
+#[tauri::command]
+pub fn get_sync_status(
+    state: tauri::State<'_, Arc<Mutex<crate::AppState>>>,
+) -> Result<SyncStatusInfo, AppError> {
+    let guard = state
+        .lock()
+        .map_err(|e| AppError::Unknown(e.to_string()))?;
+    let sync = &guard.config.sync;
+
+    Ok(SyncStatusInfo {
+        enabled: sync.enabled,
+        server_url: sync.server_url.clone(),
+        device_id: sync.device_id.clone(),
+        device_name: sync.device_name.clone(),
+        last_push_timestamp: sync.last_push_timestamp,
+        last_pull_timestamp: sync.last_pull_timestamp,
+        sync_interval_minutes: sync.sync_interval_minutes,
+        sync_screenshots_mode: format!("{:?}", sync.sync_screenshots_mode).to_lowercase(),
+    })
+}
+
+#[tauri::command]
+pub async fn register_device(
+    state: tauri::State<'_, Arc<Mutex<crate::AppState>>>,
+) -> Result<String, AppError> {
+    let sync_config = {
+        let guard = state
+            .lock()
+            .map_err(|e| AppError::Unknown(e.to_string()))?;
+        guard.config.sync.clone()
+    };
+
+    if sync_config.server_url.is_empty() {
+        return Err(AppError::Config("服务器地址为空".to_string()));
+    }
+
+    let resp = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| AppError::Unknown(e.to_string()))?
+        .post(format!(
+            "{}/api/devices/register",
+            sync_config.server_url.trim_end_matches('/')
+        ))
+        .header("Authorization", format!("Bearer {}", sync_config.sync_token))
+        .json(&serde_json::json!({
+            "device_id": sync_config.device_id,
+            "device_name": sync_config.device_name,
+        }))
+        .send()
+        .await
+        .map_err(|e| AppError::Unknown(format!("注册失败: {e}")))?;
+
+    if resp.status().is_success() {
+        Ok(sync_config.device_id.clone())
+    } else {
+        Err(AppError::Unknown(format!(
+            "注册失败: {}",
+            resp.status()
+        )))
+    }
+}
+
+#[tauri::command]
+pub async fn get_known_devices(
+    state: tauri::State<'_, Arc<Mutex<crate::AppState>>>,
+) -> Result<Vec<crate::sync::DeviceInfo>, AppError> {
+    let (local_ids, sync_config, data_dir) = {
+        let guard = state
+            .lock()
+            .map_err(|e| AppError::Unknown(e.to_string()))?;
+        (
+            guard.database.get_known_device_ids()?,
+            guard.config.sync.clone(),
+            guard.data_dir.clone(),
+        )
+    };
+
+    let mut devices: Vec<crate::sync::DeviceInfo> = local_ids
+        .into_iter()
+        .map(|device_id| {
+            let device_name = if device_id == sync_config.device_id && !sync_config.device_name.is_empty()
+            {
+                sync_config.device_name.clone()
+            } else {
+                device_id.clone()
+            };
+            crate::sync::DeviceInfo {
+                device_id,
+                device_name,
+                last_seen: 0,
+            }
+        })
+        .collect();
+
+    if sync_config.enabled
+        && !sync_config.server_url.trim().is_empty()
+        && !sync_config.sync_token.trim().is_empty()
+    {
+        let service = crate::sync::SyncService::new(&sync_config, &data_dir);
+        if let Ok(remote_devices) = service.pull_devices().await {
+            for remote in remote_devices {
+                if let Some(existing) = devices.iter_mut().find(|d| d.device_id == remote.device_id) {
+                    if existing.device_name == existing.device_id && !remote.device_name.is_empty() {
+                        existing.device_name = remote.device_name;
+                    }
+                    existing.last_seen = existing.last_seen.max(remote.last_seen);
+                } else {
+                    devices.push(remote);
+                }
+            }
+        }
+    }
+
+    devices.sort_by(|a, b| a.device_name.cmp(&b.device_name).then(a.device_id.cmp(&b.device_id)));
+    Ok(devices)
+}
+
+#[tauri::command]
+pub async fn get_reports_by_date(
+    date: String,
+    locale: Option<String>,
+    device_id: Option<String>,
+    state: tauri::State<'_, Arc<Mutex<crate::AppState>>>,
+) -> Result<Vec<crate::database::DailyReport>, AppError> {
+    let guard = state
+        .lock()
+        .map_err(|e| AppError::Unknown(e.to_string()))?;
+    guard
+        .database
+        .get_reports_by_date(&date, locale.as_deref(), device_id.as_deref())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -8963,11 +9437,12 @@ mod tests {
 
     #[test]
     fn 日报导出路径应按日期生成_markdown_文件名() {
-        let export_path = build_daily_report_export_path(Path::new("/tmp/reports"), "2026-03-29");
+        let export_path =
+            build_daily_report_export_path(Path::new("/tmp/reports"), "2026-03-29", None);
 
         assert_eq!(
             export_path,
-            PathBuf::from("/tmp/reports").join("2026-03-29.md")
+            PathBuf::from("/tmp/reports").join("2026-03-29.all.md")
         );
     }
 
@@ -8975,10 +9450,10 @@ mod tests {
     fn 日报导出应写入_markdown_文件() {
         let temp_dir =
             std::env::temp_dir().join(format!("work-review-export-{}", uuid::Uuid::new_v4()));
-        export_daily_report_markdown(&temp_dir, "2026-03-29", "# 工作日报\n\n测试内容")
+        export_daily_report_markdown(&temp_dir, "2026-03-29", None, "# 工作日报\n\n测试内容")
             .expect("应能导出 Markdown");
 
-        let output_path = temp_dir.join("2026-03-29.md");
+        let output_path = temp_dir.join("2026-03-29.all.md");
         let content = std::fs::read_to_string(&output_path).expect("应能读取导出内容");
         assert_eq!(content, "# 工作日报\n\n测试内容");
 

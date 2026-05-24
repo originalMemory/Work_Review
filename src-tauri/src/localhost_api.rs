@@ -597,7 +597,7 @@ async fn route_request(
             if date.is_empty() {
                 Err(AppError::Config("date 参数不能为空".to_string()))
             } else {
-                commands::generate_report_inner(date, force, locale, app, state)
+                commands::generate_report_inner(date, force, locale, None, app, state)
                     .await
                     .map(|content| {
                         HttpResponse::json(200, &serde_json::json!({ "content": content }))
@@ -609,6 +609,7 @@ async fn route_request(
                 commands::export_report_markdown_inner(
                     body.date,
                     body.content,
+                    None,
                     body.export_dir,
                     state,
                 )
@@ -629,6 +630,7 @@ async fn route_request(
                 commands::get_saved_report_inner(
                     date.to_string(),
                     request.query.get("locale").cloned(),
+                    None,
                     state,
                 )
                 .and_then(|report| {
@@ -654,7 +656,7 @@ async fn route_request(
             }
         }
         ("GET", "/v1/stats/today") => {
-            commands::get_today_stats_inner(state)
+            commands::get_today_stats_inner(state, None)
                 .map(|stats| HttpResponse::json(200, &stats))
         }
         ("GET", "/v1/stats/overview") => {
@@ -662,7 +664,7 @@ async fn route_request(
             let date = request.query.get("date").cloned();
             let date_from = request.query.get("date_from").cloned();
             let date_to = request.query.get("date_to").cloned();
-            commands::get_overview_stats_inner(mode, date, date_from, date_to, state)
+            commands::get_overview_stats_inner(mode, date, date_from, date_to, None, state)
                 .map(|stats| HttpResponse::json(200, &stats))
         }
         _ if request.method == "GET" && request.path.starts_with("/v1/stats/daily/") => {
@@ -670,7 +672,7 @@ async fn route_request(
             if date.is_empty() {
                 Err(AppError::Config("日期不能为空".to_string()))
             } else {
-                commands::get_daily_stats_inner(date, state)
+                commands::get_daily_stats_inner(date, None, state)
                     .map(|stats| HttpResponse::json(200, &stats))
             }
         }
@@ -695,7 +697,7 @@ async fn route_request(
             if date.is_empty() {
                 Err(AppError::Config("日期不能为空".to_string()))
             } else {
-                commands::get_hourly_summaries_inner(date, state)
+                commands::get_hourly_summaries_inner(date, None, state)
                     .map(|summaries| HttpResponse::json(200, &summaries))
             }
         }
@@ -718,7 +720,7 @@ async fn route_request(
             } else {
                 let limit = request.query.get("limit").and_then(|v| v.parse().ok());
                 let offset = request.query.get("offset").and_then(|v| v.parse().ok());
-                commands::get_timeline_inner(date.to_string(), limit, offset, state)
+                commands::get_timeline_inner(date.to_string(), limit, offset, None, state)
                     .map(|activities| HttpResponse::json(200, &activities))
             }
         }
@@ -744,7 +746,7 @@ async fn route_request(
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(10000);
                 match state.lock() {
-                    Ok(s) => s.database.get_activities_in_range(Some(date), None, limit)
+                    Ok(s) => s.database.get_activities_in_range(Some(date), None, limit, None)
                         .map(|result| HttpResponse::json(200, &result)),
                     Err(e) => Err(AppError::Unknown(e.to_string())),
                 }

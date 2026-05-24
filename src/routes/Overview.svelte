@@ -20,6 +20,8 @@
   import { resolveAppIconSrc } from '../lib/utils/appVisuals.js';
   import { formatBrowserUrlForDisplay } from '../lib/utils/browserUrl.js';
   import { semanticCategoryStore } from '../lib/stores/categories.js';
+  import DeviceFilter from '../lib/components/DeviceFilter.svelte';
+  import { selectedDeviceId } from '../lib/stores/deviceFilter.js';
 
   function getLocalDateString() {
     const now = new Date();
@@ -214,6 +216,13 @@
   // 浏览器统计弹窗
   let selectedBrowser = null;
   $: currentLocale = $locale;
+  let prevDeviceId = undefined;
+  $: if ($selectedDeviceId !== prevDeviceId && prevDeviceId !== undefined) {
+    prevDeviceId = $selectedDeviceId;
+    refreshOverviewStats({ silent: true });
+  } else {
+    prevDeviceId = $selectedDeviceId;
+  }
   $: isSingleSelectedDate = selectedDateFrom === selectedDateTo;
   $: overviewSubtitle = overviewMode === 'date'
     ? getDateRangeLabel(selectedDateFrom, selectedDateTo)
@@ -501,6 +510,7 @@
       mode: overviewMode,
       dateFrom: overviewMode === 'date' ? selectedDateFrom : undefined,
       dateTo: overviewMode === 'date' ? selectedDateTo : undefined,
+      deviceId: $selectedDeviceId,
     })
       .then((newStats) => {
         if (requestId !== overviewRequestId) {
@@ -669,9 +679,12 @@
         </p>
       </div>
     </div>
-    <div class="page-status-chip {overviewIsLive ? 'text-emerald-600 dark:text-emerald-400' : 'text-slate-500 dark:text-slate-400'}">
-      <span class="w-1.5 h-1.5 rounded-full {overviewIsLive ? 'bg-emerald-500 animate-pulse' : 'bg-slate-400'}"></span>
-      {overviewStatusLabel}
+    <div class="flex items-center gap-3">
+      <DeviceFilter />
+      <div class="page-status-chip {overviewIsLive ? 'text-emerald-600 dark:text-emerald-400' : 'text-slate-500 dark:text-slate-400'}">
+        <span class="w-1.5 h-1.5 rounded-full {overviewIsLive ? 'bg-emerald-500 animate-pulse' : 'bg-slate-400'}"></span>
+        {overviewStatusLabel}
+      </div>
     </div>
   </div>
 

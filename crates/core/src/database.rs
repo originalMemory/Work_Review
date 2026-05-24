@@ -29,6 +29,29 @@ fn category_counts_toward_work_time(category: &str) -> bool {
     crate::categorize::normalize_category_key(category) != "entertainment"
 }
 
+const ACTIVITY_COLUMNS: &str = "id, timestamp, app_name, window_title, screenshot_path, ocr_text, category, duration, browser_url, executable_path, semantic_category, semantic_confidence, screenshot_url, uuid, device_id";
+
+fn activity_from_row(row: &rusqlite::Row) -> rusqlite::Result<Activity> {
+    Ok(Activity {
+        id: Some(row.get(0)?),
+        timestamp: row.get(1)?,
+        app_name: row.get(2)?,
+        window_title: row.get(3)?,
+        screenshot_path: row.get(4)?,
+        ocr_text: row.get(5)?,
+        category: row.get(6)?,
+        duration: row.get(7)?,
+        browser_url: row.get(8)?,
+        executable_path: row.get(9)?,
+        semantic_category: row.get(10)?,
+        semantic_confidence: row.get(11)?,
+        screenshot_url: row.get(12)?,
+        uuid: row.get(13)?,
+        device_id: row.get::<_, Option<String>>(14)?.unwrap_or_default(),
+    })
+}
+
+
 const UNRESOLVED_BROWSER_DOMAIN_LABEL: &str = "未识别页面";
 const UNRESOLVED_BROWSER_URL_LABEL: &str = "未识别 URL";
 
@@ -58,6 +81,12 @@ pub struct Activity {
     /// 远程截图 URL（上传成功后填充）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub screenshot_url: Option<String>,
+    /// 全局唯一标识（UUID v7，用于跨设备同步去重）
+    #[serde(default)]
+    pub uuid: Option<String>,
+    /// 来源设备标识
+    #[serde(default)]
+    pub device_id: String,
 }
 
 /// 每日报告
@@ -72,6 +101,9 @@ pub struct DailyReport {
     #[serde(default)]
     pub fallback_reason: Option<String>,
     pub created_at: i64,
+    /// 来源设备标识
+    #[serde(default)]
+    pub device_id: String,
 }
 
 fn default_report_locale() -> String {
@@ -145,6 +177,9 @@ pub struct HourlySummary {
     pub representative_screenshots: Option<String>,
     /// 创建时间
     pub created_at: i64,
+    /// 来源设备标识
+    #[serde(default)]
+    pub device_id: String,
 }
 
 /// 每日统计
@@ -535,6 +570,24 @@ impl Database {
             [],
         );
 
+        // 迁移：同步相关列
+        let _ = conn.execute(
+            "ALTER TABLE activities ADD COLUMN uuid TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE activities ADD COLUMN device_id TEXT DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_activities_uuid ON activities (uuid) WHERE uuid IS NOT NULL",
+            [],
+        );
+        self.migrate_daily_reports_pk(&conn);
+        self.migrate_hourly_summaries_pk(&conn);
+        self.backfill_activity_uuids(&conn);
+
+
         // === FTS5 全文检索索引 ===
         // activities FTS: 索引窗口标题、OCR 文本、应用名、浏览器 URL
         conn.execute_batch(
@@ -623,6 +676,213 @@ impl Database {
         Ok(())
     }
 
+
+    /// 为 device_id 为空的旧记录回填当前设备 ID
+    pub fn backfill_device_id(&self, device_id: &str) {
+        if device_id.is_empty() {
+            return;
+        }
+        let conn = match self.conn.lock() {
+            Ok(c) => c,
+            Err(e) => e.into_inner(),
+        };
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM activities WHERE device_id = '' OR device_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if count == 0 {
+            return;
+        }
+        log::info!("回填 {count} 条旧活动记录的 device_id 为 {device_id}");
+        let _ = conn.execute(
+            "UPDATE activities SET device_id = ?1 WHERE device_id = '' OR device_id IS NULL",
+            params![device_id],
+        );
+        let _ = conn.execute(
+            "UPDATE hourly_summaries SET device_id = ?1 WHERE device_id = '' OR device_id IS NULL",
+            params![device_id],
+        );
+        let _ = conn.execute(
+            "UPDATE daily_reports_localized SET device_id = ?1 WHERE device_id = '' OR device_id IS NULL",
+            params![device_id],
+        );
+        log::info!("device_id 回填完成");
+    }
+
+    fn backfill_activity_uuids(&self, conn: &Connection) {
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM activities WHERE uuid IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if count == 0 {
+            return;
+        }
+        log::info!("回填 {count} 条活动记录的 UUID...");
+        let Ok(mut stmt) = conn.prepare("SELECT id FROM activities WHERE uuid IS NULL") else {
+            log::warn!("回填 UUID 查询准备失败");
+            return;
+        };
+        let ids: Vec<i64> = match stmt.query_map([], |row| row.get(0)) {
+            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+            Err(e) => {
+                log::warn!("回填 UUID 查询执行失败: {e}");
+                return;
+            }
+        };
+        for id in ids {
+            let new_uuid = uuid::Uuid::now_v7().to_string();
+            let _ = conn.execute(
+                "UPDATE activities SET uuid = ?1 WHERE id = ?2 AND uuid IS NULL",
+                params![new_uuid, id],
+            );
+        }
+        log::info!("UUID 回填完成");
+    }
+
+    pub fn migrate_screenshots_to_device_dir(&self, data_dir: &std::path::Path, device_id: &str) {
+        if device_id.is_empty() {
+            return;
+        }
+        let screenshots_dir = data_dir.join("screenshots");
+        if !screenshots_dir.exists() {
+            return;
+        }
+        let target_dir = screenshots_dir.join(device_id);
+        let mut migrated_dirs = 0u32;
+        let entries = match std::fs::read_dir(&screenshots_dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if !entry.path().is_dir() || name_str.len() != 10 {
+                continue;
+            }
+            if chrono::NaiveDate::parse_from_str(&name_str, "%Y-%m-%d").is_err() {
+                continue;
+            }
+            if name_str == device_id {
+                continue;
+            }
+            let dest = target_dir.join(&*name_str);
+            if dest.exists() {
+                if let Ok(files) = std::fs::read_dir(entry.path()) {
+                    for f in files.flatten() {
+                        let target_file = dest.join(f.file_name());
+                        if !target_file.exists() {
+                            let _ = std::fs::rename(f.path(), target_file);
+                        }
+                    }
+                }
+                let _ = std::fs::remove_dir(entry.path());
+            } else {
+                let _ = std::fs::create_dir_all(&target_dir);
+                if std::fs::rename(entry.path(), &dest).is_err() {
+                    continue;
+                }
+            }
+            migrated_dirs += 1;
+        }
+        if migrated_dirs == 0 {
+            return;
+        }
+        log::info!("迁移 {migrated_dirs} 个截图目录到 screenshots/{device_id}/");
+        let conn = match self.conn.lock() {
+            Ok(c) => c,
+            Err(e) => e.into_inner(),
+        };
+        let old_prefix = "screenshots/";
+        let new_prefix = format!("screenshots/{device_id}/");
+        let pattern = format!("screenshots/20%");
+        match conn.execute(
+            "UPDATE activities SET screenshot_path = ?1 || substr(screenshot_path, ?2)
+             WHERE screenshot_path LIKE ?3
+               AND screenshot_path NOT LIKE ?4",
+            params![
+                new_prefix,
+                old_prefix.len() as i64 + 1,
+                pattern,
+                format!("screenshots/{device_id}/%"),
+            ],
+        ) {
+            Ok(n) => log::info!("更新 {n} 条活动记录的截图路径"),
+            Err(e) => log::warn!("更新截图路径失败: {e}"),
+        }
+    }
+
+    fn migrate_daily_reports_pk(&self, conn: &Connection) {
+        let has_device_id: bool = conn
+            .prepare("SELECT device_id FROM daily_reports_localized LIMIT 0")
+            .is_ok();
+        if has_device_id {
+            return;
+        }
+        log::info!("迁移 daily_reports_localized 添加 device_id...");
+        let result = conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS daily_reports_localized_v2 (
+                date TEXT NOT NULL,
+                locale TEXT NOT NULL,
+                device_id TEXT NOT NULL DEFAULT '',
+                content TEXT NOT NULL,
+                ai_mode TEXT NOT NULL,
+                model_name TEXT,
+                fallback_reason TEXT,
+                created_at INTEGER NOT NULL,
+                UNIQUE(date, locale, device_id)
+            );
+            INSERT OR IGNORE INTO daily_reports_localized_v2 (date, locale, device_id, content, ai_mode, model_name, fallback_reason, created_at)
+                SELECT date, locale, '', content, ai_mode, model_name, fallback_reason, created_at FROM daily_reports_localized;
+            DROP TABLE daily_reports_localized;
+            ALTER TABLE daily_reports_localized_v2 RENAME TO daily_reports_localized;",
+        );
+        match result {
+            Ok(_) => log::info!("daily_reports_localized 迁移完成"),
+            Err(e) => log::warn!("daily_reports_localized 迁移失败（可能已完成）: {e}"),
+        }
+    }
+
+    fn migrate_hourly_summaries_pk(&self, conn: &Connection) {
+        let has_device_id: bool = conn
+            .prepare("SELECT device_id FROM hourly_summaries LIMIT 0")
+            .is_ok();
+        if has_device_id {
+            return;
+        }
+        log::info!("迁移 hourly_summaries 表结构...");
+        let result = conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS hourly_summaries_v2 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL,
+                hour INTEGER NOT NULL,
+                summary TEXT NOT NULL,
+                main_apps TEXT NOT NULL,
+                activity_count INTEGER NOT NULL,
+                total_duration INTEGER NOT NULL,
+                representative_screenshots TEXT,
+                created_at INTEGER NOT NULL,
+                device_id TEXT NOT NULL DEFAULT '',
+                UNIQUE(date, hour, device_id)
+            );
+            INSERT OR IGNORE INTO hourly_summaries_v2 (date, hour, summary, main_apps, activity_count, total_duration, representative_screenshots, created_at, device_id)
+                SELECT date, hour, summary, main_apps, activity_count, total_duration, representative_screenshots, created_at, '' FROM hourly_summaries;
+            DROP TABLE hourly_summaries;
+            ALTER TABLE hourly_summaries_v2 RENAME TO hourly_summaries;
+            CREATE INDEX IF NOT EXISTS idx_hourly_summaries_date ON hourly_summaries (date);",
+        );
+        match result {
+            Ok(_) => log::info!("hourly_summaries 迁移完成"),
+            Err(e) => log::warn!("hourly_summaries 迁移失败（可能已完成）: {e}"),
+        }
+    }
+
+
     /// 重建 FTS 索引（用于首次迁移或修复）
     pub fn rebuild_fts_index(&self) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| {
@@ -648,9 +908,14 @@ impl Database {
             .map(normalize_url)
             .filter(|url| !url.is_empty());
 
+        let activity_uuid = activity
+            .uuid
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+
         conn.execute(
-            "INSERT INTO activities (timestamp, app_name, window_title, screenshot_path, ocr_text, category, duration, browser_url, executable_path, semantic_category, semantic_confidence, screenshot_url)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO activities (timestamp, app_name, window_title, screenshot_path, ocr_text, category, duration, browser_url, executable_path, semantic_category, semantic_confidence, screenshot_url, uuid, device_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 activity.timestamp,
                 activity.app_name,
@@ -664,6 +929,8 @@ impl Database {
                 activity.semantic_category,
                 activity.semantic_confidence,
                 activity.screenshot_url,
+                activity_uuid,
+                activity.device_id,
             ],
         )?;
 
@@ -703,6 +970,8 @@ impl Database {
                 semantic_category: row.get(10)?,
                 semantic_confidence: row.get(11)?,
                 screenshot_url: None,
+                uuid: None,
+                device_id: String::new(),
             }))
         } else {
             Ok(None)
@@ -746,6 +1015,8 @@ impl Database {
                 semantic_category: row.get(10)?,
                 semantic_confidence: row.get(11)?,
                 screenshot_url: None,
+                uuid: None,
+                device_id: String::new(),
             }))
         } else {
             Ok(None)
@@ -793,6 +1064,8 @@ impl Database {
                 semantic_category: row.get(10)?,
                 semantic_confidence: row.get(11)?,
                 screenshot_url: None,
+                uuid: None,
+                device_id: String::new(),
             }))
         } else {
             Ok(None)
@@ -841,6 +1114,8 @@ impl Database {
                 semantic_category: row.get(10)?,
                 semantic_confidence: row.get(11)?,
                 screenshot_url: None,
+                uuid: None,
+                device_id: String::new(),
             }))
         } else {
             Ok(None)
@@ -874,6 +1149,8 @@ impl Database {
                 semantic_category: row.get(10)?,
                 semantic_confidence: row.get(11)?,
                 screenshot_url: None,
+                uuid: None,
+                device_id: String::new(),
             }))
         } else {
             Ok(None)
@@ -1130,6 +1407,7 @@ impl Database {
         &self,
         date: &str,
         segments: &[crate::config::WorkTimeSegment],
+        device_id: Option<&str>,
     ) -> Result<DailyStats> {
         let conn = self.conn.lock().map_err(|e| {
             AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
@@ -1155,14 +1433,20 @@ impl Database {
             })
             .collect();
 
+        let device_filter = if device_id.is_some() { " AND device_id = ?3" } else { "" };
+
         let screenshot_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM activities WHERE timestamp >= ?1 AND timestamp < ?2",
-            params![start_ts, end_ts],
+            &format!("SELECT COUNT(*) FROM activities WHERE timestamp >= ?1 AND timestamp < ?2{device_filter}"),
+            rusqlite::params_from_iter(
+                [Some(start_ts.to_string()), Some(end_ts.to_string()), device_id.map(|s| s.to_string())]
+                    .into_iter()
+                    .flatten()
+            ),
             |row| row.get(0),
         )?;
 
         let mut stmt = conn.prepare(
-            "SELECT timestamp,
+            &format!("SELECT timestamp,
                     app_name,
                     window_title,
                     ocr_text,
@@ -1172,11 +1456,15 @@ impl Database {
                     executable_path,
                     semantic_category
              FROM activities
-             WHERE timestamp > ?1 AND (timestamp - duration) < ?2
-             ORDER BY timestamp ASC",
+             WHERE timestamp > ?1 AND (timestamp - duration) < ?2{device_filter}
+             ORDER BY timestamp ASC"),
         )?;
 
-        let activity_rows = stmt.query_map(params![start_ts, end_ts], |row| {
+        let activity_rows = stmt.query_map(rusqlite::params_from_iter(
+                [Some(start_ts.to_string()), Some(end_ts.to_string()), device_id.map(|s| s.to_string())]
+                    .into_iter()
+                    .flatten()
+            ), |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
@@ -1517,7 +1805,7 @@ impl Database {
             end_hour: work_end_hour,
             end_minute: work_end_minute,
         }];
-        self.get_daily_stats_with_segments(date, &segments)
+        self.get_daily_stats_with_segments(date, &segments, None)
     }
 
     /// 获取指定日期的统计数据（使用默认工作时间 9:00-18:00）
@@ -1533,6 +1821,16 @@ impl Database {
         limit: Option<u32>,
         offset: Option<u32>,
     ) -> Result<Vec<Activity>> {
+        self.get_timeline_filtered(date, limit, offset, None)
+    }
+
+    pub fn get_timeline_filtered(
+        &self,
+        date: &str,
+        limit: Option<u32>,
+        offset: Option<u32>,
+        device_id: Option<&str>,
+    ) -> Result<Vec<Activity>> {
         let conn = self.conn.lock().map_err(|e| {
             AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
         })?;
@@ -1544,9 +1842,10 @@ impl Database {
 
         let limit_val = limit.unwrap_or(1000);
         let offset_val = offset.unwrap_or(0);
+        let device_filter = if device_id.is_some() { " AND device_id = ?5" } else { "" };
 
         let mut stmt = conn.prepare(
-            "WITH ranked AS (
+            &format!("WITH ranked AS (
                 SELECT
                     id,
                     timestamp,
@@ -1561,6 +1860,8 @@ impl Database {
                     semantic_category,
                     semantic_confidence,
                     screenshot_url,
+                    uuid,
+                    device_id,
                     ROW_NUMBER() OVER (
                         PARTITION BY
                             app_name,
@@ -1579,7 +1880,7 @@ impl Database {
                             END
                     ) as total_duration
                 FROM activities
-                WHERE timestamp >= ?1 AND timestamp < ?2
+                WHERE timestamp >= ?1 AND timestamp < ?2{device_filter}
              )
              SELECT
                 id,
@@ -1594,16 +1895,25 @@ impl Database {
                 executable_path,
                 semantic_category,
                 semantic_confidence,
-                screenshot_url
+                screenshot_url,
+                uuid,
+                device_id
              FROM ranked
              WHERE rn = 1
              ORDER BY timestamp DESC, id DESC
-             LIMIT ?3 OFFSET ?4",
+             LIMIT ?3 OFFSET ?4"),
         )?;
 
         let activities: Vec<Activity> = stmt
-            .query_map(params![start_ts, end_ts, limit_val, offset_val], |row| {
-                let browser_url: String = row.get(8)?;
+            .query_map(rusqlite::params_from_iter(
+                [
+                    Some(start_ts.to_string()),
+                    Some(end_ts.to_string()),
+                    Some(limit_val.to_string()),
+                    Some(offset_val.to_string()),
+                    device_id.map(|s| s.to_string()),
+                ].into_iter().flatten()
+            ), |row| {
                 Ok(Activity {
                     id: Some(row.get(0)?),
                     timestamp: row.get(1)?,
@@ -1613,15 +1923,16 @@ impl Database {
                     ocr_text: row.get(5)?,
                     category: row.get(6)?,
                     duration: row.get(7)?,
-                    browser_url: if browser_url.is_empty() {
-                        None
-                    } else {
-                        Some(browser_url)
+                    browser_url: {
+                        let browser_url: String = row.get(8)?;
+                        if browser_url.is_empty() { None } else { Some(browser_url) }
                     },
                     executable_path: row.get(9)?,
                     semantic_category: row.get(10)?,
                     semantic_confidence: row.get(11)?,
                     screenshot_url: row.get(12)?,
+                    uuid: row.get(13)?,
+                    device_id: row.get::<_, Option<String>>(14)?.unwrap_or_default(),
                 })
             })?
             .filter_map(|r| r.ok())
@@ -1688,6 +1999,7 @@ impl Database {
         date_from: Option<&str>,
         date_to: Option<&str>,
         limit: usize,
+        device_id: Option<&str>,
     ) -> Result<Vec<Activity>> {
         let conn = self.conn.lock().map_err(|e| {
             AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
@@ -1696,38 +2008,179 @@ impl Database {
         let limit = limit.clamp(1, 10_000) as i64;
         let (start_ts, end_ts) = parse_date_bounds(date_from, date_to);
 
+        let did = device_id.filter(|s| !s.is_empty());
+
         let mut stmt = conn.prepare(
-            "SELECT id, timestamp, app_name, window_title, screenshot_path, ocr_text, category, duration, browser_url, executable_path, semantic_category, semantic_confidence
-             FROM activities
-             WHERE (?1 IS NULL OR timestamp >= ?1)
-               AND (?2 IS NULL OR timestamp < ?2)
-             ORDER BY timestamp ASC, id ASC
-             LIMIT ?3",
+            &format!(
+                "SELECT {ACTIVITY_COLUMNS}
+                 FROM activities
+                 WHERE (?1 IS NULL OR timestamp >= ?1)
+                   AND (?2 IS NULL OR timestamp < ?2)
+                   AND (?4 IS NULL OR device_id = ?4)
+                 ORDER BY timestamp ASC, id ASC
+                 LIMIT ?3"
+            ),
         )?;
 
         let activities = stmt
-            .query_map(params![start_ts, end_ts, limit], |row| {
-                Ok(Activity {
-                    id: Some(row.get(0)?),
-                    timestamp: row.get(1)?,
-                    app_name: row.get(2)?,
-                    window_title: row.get(3)?,
-                    screenshot_path: row.get(4)?,
-                    ocr_text: row.get(5)?,
-                    category: row.get(6)?,
-                    duration: row.get(7)?,
-                    browser_url: row.get(8)?,
-                    executable_path: row.get(9)?,
-                    semantic_category: row.get(10)?,
-                    semantic_confidence: row.get(11)?,
-                    screenshot_url: None,
-                })
-            })?
+            .query_map(params![start_ts, end_ts, limit, did], activity_from_row)?
             .filter_map(|row| row.ok())
             .collect();
 
         Ok(activities)
     }
+
+
+    /// 按 uuid UPSERT 活动记录（同步拉取时使用）
+    pub fn upsert_activity_by_uuid(&self, activity: &Activity) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| {
+            AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
+        })?;
+
+        let Some(ref activity_uuid) = activity.uuid else {
+            return Err(AppError::Unknown("upsert 需要 uuid".to_string()));
+        };
+
+        let existing_ts: Option<i64> = conn
+            .query_row(
+                "SELECT timestamp FROM activities WHERE uuid = ?1",
+                params![activity_uuid],
+                |row| row.get(0),
+            )
+            .ok();
+
+        match existing_ts {
+            Some(ts) if activity.timestamp <= ts => Ok(()),
+            Some(_) => {
+                conn.execute(
+                    "UPDATE activities SET timestamp=?1, app_name=?2, window_title=?3, screenshot_path=?4, ocr_text=?5, category=?6, duration=?7, browser_url=?8, executable_path=?9, semantic_category=?10, semantic_confidence=?11, screenshot_url=?12, device_id=?13 WHERE uuid=?14",
+                    params![
+                        activity.timestamp,
+                        activity.app_name,
+                        activity.window_title,
+                        activity.screenshot_path,
+                        activity.ocr_text,
+                        activity.category,
+                        activity.duration,
+                        activity.browser_url,
+                        activity.executable_path,
+                        activity.semantic_category,
+                        activity.semantic_confidence,
+                        activity.screenshot_url,
+                        activity.device_id,
+                        activity_uuid,
+                    ],
+                )?;
+                Ok(())
+            }
+            None => {
+                conn.execute(
+                    "INSERT INTO activities (timestamp, app_name, window_title, screenshot_path, ocr_text, category, duration, browser_url, executable_path, semantic_category, semantic_confidence, screenshot_url, uuid, device_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                    params![
+                        activity.timestamp,
+                        activity.app_name,
+                        activity.window_title,
+                        activity.screenshot_path,
+                        activity.ocr_text,
+                        activity.category,
+                        activity.duration,
+                        activity.browser_url,
+                        activity.executable_path,
+                        activity.semantic_category,
+                        activity.semantic_confidence,
+                        activity.screenshot_url,
+                        activity_uuid,
+                        activity.device_id,
+                    ],
+                )?;
+                Ok(())
+            }
+        }
+    }
+
+    pub fn get_known_device_ids(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().map_err(|e| {
+            AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
+        })?;
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT device_id FROM activities WHERE device_id != '' ORDER BY device_id",
+        )?;
+        let ids: Vec<String> = stmt
+            .query_map([], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(ids)
+    }
+
+    pub fn get_activities_since(&self, since: i64) -> Result<Vec<Activity>> {
+        let conn = self.conn.lock().map_err(|e| {
+            AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
+        })?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {ACTIVITY_COLUMNS} FROM activities WHERE timestamp > ?1 ORDER BY timestamp ASC"
+        ))?;
+        let activities = stmt
+            .query_map(params![since], activity_from_row)?
+            .filter_map(|row| row.ok())
+            .collect();
+        Ok(activities)
+    }
+
+    pub fn get_reports_since(&self, since: i64) -> Result<Vec<DailyReport>> {
+        let conn = self.conn.lock().map_err(|e| {
+            AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
+        })?;
+        let mut stmt = conn.prepare(
+            "SELECT date, locale, device_id, content, ai_mode, model_name, fallback_reason, created_at
+             FROM daily_reports_localized WHERE created_at > ?1 ORDER BY created_at ASC",
+        )?;
+        let reports = stmt
+            .query_map(params![since], |row| {
+                Ok(DailyReport {
+                    date: row.get(0)?,
+                    locale: row.get(1)?,
+                    device_id: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    content: row.get(3)?,
+                    ai_mode: row.get(4)?,
+                    model_name: row.get(5)?,
+                    fallback_reason: row.get(6)?,
+                    created_at: row.get(7)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(reports)
+    }
+
+    pub fn get_hourly_summaries_since(&self, since: i64) -> Result<Vec<HourlySummary>> {
+        let conn = self.conn.lock().map_err(|e| {
+            AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
+        })?;
+        let mut stmt = conn.prepare(
+            "SELECT id, date, hour, summary, main_apps, activity_count, total_duration, representative_screenshots, created_at, device_id
+             FROM hourly_summaries WHERE created_at > ?1 ORDER BY created_at ASC",
+        )?;
+        let summaries = stmt
+            .query_map(params![since], |row| {
+                Ok(HourlySummary {
+                    id: Some(row.get(0)?),
+                    date: row.get(1)?,
+                    hour: row.get(2)?,
+                    summary: row.get(3)?,
+                    main_apps: row.get(4)?,
+                    activity_count: row.get(5)?,
+                    total_duration: row.get(6)?,
+                    representative_screenshots: row.get(7)?,
+                    created_at: row.get(8)?,
+                    device_id: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(summaries)
+    }
+
 
     /// 保存每日报告
     pub fn save_report(&self, report: &DailyReport) -> Result<()> {
@@ -1736,11 +2189,12 @@ impl Database {
         })?;
 
         conn.execute(
-            "INSERT OR REPLACE INTO daily_reports_localized (date, locale, content, ai_mode, model_name, fallback_reason, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT OR REPLACE INTO daily_reports_localized (date, locale, device_id, content, ai_mode, model_name, fallback_reason, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 report.date,
                 report.locale,
+                report.device_id,
                 report.content,
                 report.ai_mode,
                 report.model_name,
@@ -1753,26 +2207,33 @@ impl Database {
     }
 
     /// 获取每日报告
-    pub fn get_report(&self, date: &str, locale: Option<&str>) -> Result<Option<DailyReport>> {
+    pub fn get_report(
+        &self,
+        date: &str,
+        locale: Option<&str>,
+        device_id: Option<&str>,
+    ) -> Result<Option<DailyReport>> {
         let conn = self.conn.lock().map_err(|e| {
             AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
         })?;
         let locale = locale.unwrap_or("zh-CN");
+        let normalized_device_id = device_id.unwrap_or("");
 
         let result = conn.query_row(
-            "SELECT date, locale, content, ai_mode, model_name, fallback_reason, created_at
+            "SELECT date, locale, device_id, content, ai_mode, model_name, fallback_reason, created_at
              FROM daily_reports_localized
-             WHERE date = ?1 AND locale = ?2",
-            params![date, locale],
+             WHERE date = ?1 AND locale = ?2 AND device_id = ?3",
+            params![date, locale, normalized_device_id],
             |row| {
                 Ok(DailyReport {
                     date: row.get(0)?,
                     locale: row.get(1)?,
-                    content: row.get(2)?,
-                    ai_mode: row.get(3)?,
-                    model_name: row.get(4)?,
-                    fallback_reason: row.get(5)?,
-                    created_at: row.get(6)?,
+                    device_id: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    content: row.get(3)?,
+                    ai_mode: row.get(4)?,
+                    model_name: row.get(5)?,
+                    fallback_reason: row.get(6)?,
+                    created_at: row.get(7)?,
                 })
             },
         );
@@ -1782,6 +2243,61 @@ impl Database {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(AppError::Database(e)),
         }
+    }
+
+    pub fn get_reports_by_date(
+        &self,
+        date: &str,
+        locale: Option<&str>,
+        device_id: Option<&str>,
+    ) -> Result<Vec<DailyReport>> {
+        let conn = self.conn.lock().map_err(|e| {
+            AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
+        })?;
+        let locale = locale.unwrap_or("zh-CN");
+        let reports = if let Some(device_id) = device_id {
+            let mut stmt = conn.prepare(
+                "SELECT date, locale, device_id, content, ai_mode, model_name, fallback_reason, created_at
+                 FROM daily_reports_localized
+                 WHERE date = ?1 AND locale = ?2 AND device_id = ?3
+                 ORDER BY device_id",
+            )?;
+            let rows = stmt.query_map(params![date, locale, device_id], |row| {
+                Ok(DailyReport {
+                    date: row.get(0)?,
+                    locale: row.get(1)?,
+                    device_id: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    content: row.get(3)?,
+                    ai_mode: row.get(4)?,
+                    model_name: row.get(5)?,
+                    fallback_reason: row.get(6)?,
+                    created_at: row.get(7)?,
+                })
+            })?;
+            rows.filter_map(|r| r.ok()).collect()
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT date, locale, device_id, content, ai_mode, model_name, fallback_reason, created_at
+                 FROM daily_reports_localized
+                 WHERE date = ?1 AND locale = ?2
+                 ORDER BY device_id",
+            )?;
+            let rows = stmt.query_map(params![date, locale], |row| {
+                Ok(DailyReport {
+                    date: row.get(0)?,
+                    locale: row.get(1)?,
+                    device_id: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    content: row.get(3)?,
+                    ai_mode: row.get(4)?,
+                    model_name: row.get(5)?,
+                    fallback_reason: row.get(6)?,
+                    created_at: row.get(7)?,
+                })
+            })?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+
+        Ok(reports)
     }
 
     /// 列出所有可用日报日期
@@ -1807,8 +2323,8 @@ impl Database {
 
         conn.execute(
             "INSERT OR REPLACE INTO hourly_summaries 
-             (date, hour, summary, main_apps, activity_count, total_duration, representative_screenshots, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             (date, hour, summary, main_apps, activity_count, total_duration, representative_screenshots, created_at, device_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 summary.date,
                 summary.hour,
@@ -1818,6 +2334,7 @@ impl Database {
                 summary.total_duration,
                 summary.representative_screenshots,
                 summary.created_at,
+                summary.device_id,
             ],
         )?;
 
@@ -1825,20 +2342,24 @@ impl Database {
     }
 
     /// 获取指定日期的所有小时摘要
-    pub fn get_hourly_summaries(&self, date: &str) -> Result<Vec<HourlySummary>> {
+    pub fn get_hourly_summaries(&self, date: &str, device_id: Option<&str>) -> Result<Vec<HourlySummary>> {
         let conn = self.conn.lock().map_err(|e| {
             AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
         })?;
+        let did = device_id.filter(|s| !s.is_empty());
+        let device_filter = if did.is_some() { " AND device_id = ?2" } else { "" };
 
         let mut stmt = conn.prepare(
-            "SELECT id, date, hour, summary, main_apps, activity_count, total_duration, representative_screenshots, created_at 
-             FROM hourly_summaries 
-             WHERE date = ?1 
-             ORDER BY hour ASC"
+            &format!(
+                "SELECT id, date, hour, summary, main_apps, activity_count, total_duration, representative_screenshots, created_at, device_id
+                 FROM hourly_summaries
+                 WHERE date = ?1{device_filter}
+                 ORDER BY hour ASC"
+            ),
         )?;
 
-        let summaries: Vec<HourlySummary> = stmt
-            .query_map(params![date], |row| {
+        let summaries: Vec<HourlySummary> = if let Some(did) = did {
+            stmt.query_map(params![date, did], |row| {
                 Ok(HourlySummary {
                     id: Some(row.get(0)?),
                     date: row.get(1)?,
@@ -1849,10 +2370,29 @@ impl Database {
                     total_duration: row.get(6)?,
                     representative_screenshots: row.get(7)?,
                     created_at: row.get(8)?,
+                    device_id: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
                 })
             })?
             .filter_map(|r| r.ok())
-            .collect();
+            .collect()
+        } else {
+            stmt.query_map(params![date], |row| {
+                Ok(HourlySummary {
+                    id: Some(row.get(0)?),
+                    date: row.get(1)?,
+                    hour: row.get(2)?,
+                    summary: row.get(3)?,
+                    main_apps: row.get(4)?,
+                    activity_count: row.get(5)?,
+                    total_duration: row.get(6)?,
+                    representative_screenshots: row.get(7)?,
+                    created_at: row.get(8)?,
+                    device_id: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect()
+        };
 
         Ok(summaries)
     }
@@ -1892,6 +2432,8 @@ impl Database {
                     semantic_category: row.get(10)?,
                     semantic_confidence: row.get(11)?,
                     screenshot_url: None,
+                uuid: None,
+                device_id: String::new(),
                 })
             })?
             .filter_map(|r| r.ok())
@@ -2073,6 +2615,8 @@ impl Database {
                     semantic_category: row.get(10)?,
                     semantic_confidence: row.get(11)?,
                     screenshot_url: None,
+                uuid: None,
+                device_id: String::new(),
                 })
             })?
             .filter_map(|row| row.ok())
@@ -2118,6 +2662,8 @@ impl Database {
                     semantic_category: row.get(10)?,
                     semantic_confidence: row.get(11)?,
                     screenshot_url: None,
+                uuid: None,
+                device_id: String::new(),
                 })
             })?
             .filter_map(|row| row.ok())
@@ -2326,6 +2872,7 @@ impl Database {
         date_from: Option<&str>,
         date_to: Option<&str>,
         limit: usize,
+        device_id: Option<&str>,
     ) -> Result<Vec<MemorySearchItem>> {
         let trimmed_query = query.trim();
         if trimmed_query.is_empty() {
@@ -2437,7 +2984,27 @@ impl Database {
                 &report_date_from,
                 &report_date_to,
                 limit,
+                device_id,
             );
+        }
+
+        if let Some(did) = device_id.filter(|s| !s.is_empty()) {
+            let conn = self.conn.lock().map_err(|e| {
+                AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
+            })?;
+            items.retain(|item| {
+                if item.source_type != "activity" {
+                    return true;
+                }
+                let Some(id) = item.source_id else { return false };
+                conn.query_row(
+                    "SELECT device_id FROM activities WHERE id = ?1",
+                    params![id],
+                    |row| row.get::<_, String>(0),
+                )
+                .map(|stored| stored == did)
+                .unwrap_or(false)
+            });
         }
 
         items.sort_by(|a, b| {
@@ -2460,6 +3027,7 @@ impl Database {
         date_from: &Option<String>,
         date_to: &Option<String>,
         limit: usize,
+        device_id: Option<&str>,
     ) -> Result<Vec<MemorySearchItem>> {
         let conn = self.conn.lock().map_err(|e| {
             AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
@@ -2469,11 +3037,13 @@ impl Database {
         let mut items = Vec::new();
 
         // 回退：activities
+        let did = device_id.filter(|s| !s.is_empty());
         let mut stmt = conn.prepare(
             "SELECT id, timestamp, app_name, window_title, ocr_text, browser_url, duration
              FROM activities
              WHERE (?1 IS NULL OR timestamp >= ?1)
                AND (?2 IS NULL OR timestamp < ?2)
+               AND (?4 IS NULL OR device_id = ?4)
              ORDER BY timestamp DESC
              LIMIT ?3",
         )?;
@@ -2487,7 +3057,7 @@ impl Database {
             Option<String>,
             i64,
         )> = stmt
-            .query_map(params![start_ts, end_ts, fetch_limit], |row| {
+            .query_map(params![start_ts, end_ts, fetch_limit, did], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, i64>(1)?,
@@ -2694,6 +3264,8 @@ mod tests {
                 semantic_category: None,
                 semantic_confidence: None,
                 screenshot_url: None,
+                uuid: None,
+                device_id: String::new(),
             },
             Activity {
                 id: None,
@@ -2709,6 +3281,8 @@ mod tests {
                 semantic_category: None,
                 semantic_confidence: None,
                 screenshot_url: None,
+                uuid: None,
+                device_id: String::new(),
             },
             Activity {
                 id: None,
@@ -2724,6 +3298,8 @@ mod tests {
                 semantic_category: None,
                 semantic_confidence: None,
                 screenshot_url: None,
+                uuid: None,
+                device_id: String::new(),
             },
         ];
 
@@ -2770,6 +3346,8 @@ mod tests {
             semantic_category: None,
             semantic_confidence: None,
             screenshot_url: None,
+                uuid: None,
+                device_id: String::new(),
         };
 
         let inserted_id = db.insert_activity(&activity).expect("插入测试数据失败");
@@ -2811,6 +3389,8 @@ mod tests {
                 semantic_category: None,
                 semantic_confidence: None,
                 screenshot_url: None,
+                uuid: None,
+                device_id: String::new(),
             },
             Activity {
                 id: None,
@@ -2826,6 +3406,8 @@ mod tests {
                 semantic_category: None,
                 semantic_confidence: None,
                 screenshot_url: None,
+                uuid: None,
+                device_id: String::new(),
             },
             Activity {
                 id: None,
@@ -2841,6 +3423,8 @@ mod tests {
                 semantic_category: None,
                 semantic_confidence: None,
                 screenshot_url: None,
+                uuid: None,
+                device_id: String::new(),
             },
         ];
 
@@ -2894,6 +3478,8 @@ mod tests {
                 semantic_category: None,
                 semantic_confidence: None,
                 screenshot_url: None,
+                uuid: None,
+                device_id: String::new(),
             },
             Activity {
                 id: None,
@@ -2909,6 +3495,8 @@ mod tests {
                 semantic_category: Some("资料阅读".to_string()),
                 semantic_confidence: Some(80),
                 screenshot_url: None,
+                uuid: None,
+                device_id: String::new(),
             },
         ];
 
@@ -2961,6 +3549,8 @@ mod tests {
                 semantic_category: Some("资料阅读".to_string()),
                 semantic_confidence: Some(80),
                 screenshot_url: None,
+                uuid: None,
+                device_id: String::new(),
             },
             Activity {
                 id: None,
@@ -2976,6 +3566,8 @@ mod tests {
                 semantic_category: Some("资料阅读".to_string()),
                 semantic_confidence: Some(80),
                 screenshot_url: None,
+                uuid: None,
+                device_id: String::new(),
             },
         ];
 
@@ -3031,6 +3623,8 @@ mod tests {
                 semantic_category: None,
                 semantic_confidence: None,
                 screenshot_url: None,
+                uuid: None,
+                device_id: String::new(),
             },
             Activity {
                 id: None,
@@ -3046,6 +3640,8 @@ mod tests {
                 semantic_category: None,
                 semantic_confidence: None,
                 screenshot_url: None,
+                uuid: None,
+                device_id: String::new(),
             },
         ];
 
@@ -3092,6 +3688,8 @@ mod tests {
                 semantic_category: Some("资料阅读".to_string()),
                 semantic_confidence: Some(80),
                 screenshot_url: None,
+                uuid: None,
+                device_id: String::new(),
             },
             Activity {
                 id: None,
@@ -3107,6 +3705,8 @@ mod tests {
                 semantic_category: Some("即时聊天".to_string()),
                 semantic_confidence: Some(80),
                 screenshot_url: None,
+                uuid: None,
+                device_id: String::new(),
             },
         ];
 
@@ -3143,6 +3743,8 @@ mod tests {
             semantic_category: Some("资料阅读".to_string()),
             semantic_confidence: Some(80),
             screenshot_url: None,
+                uuid: None,
+                device_id: String::new(),
         };
 
         db.insert_activity(&activity).expect("插入测试数据失败");
@@ -3182,6 +3784,8 @@ mod tests {
             semantic_category: None,
             semantic_confidence: None,
             screenshot_url: None,
+                uuid: None,
+                device_id: String::new(),
         };
 
         db.insert_activity(&activity).expect("插入测试数据失败");
@@ -3216,6 +3820,8 @@ mod tests {
             semantic_category: None,
             semantic_confidence: None,
             screenshot_url: None,
+                uuid: None,
+                device_id: String::new(),
         };
 
         db.insert_activity(&activity).expect("插入测试数据失败");
@@ -3250,6 +3856,8 @@ mod tests {
             semantic_category: None,
             semantic_confidence: None,
             screenshot_url: None,
+                uuid: None,
+                device_id: String::new(),
         };
 
         db.insert_activity(&activity).expect("插入测试数据失败");
@@ -3285,6 +3893,8 @@ mod tests {
                 semantic_category: None,
                 semantic_confidence: None,
                 screenshot_url: None,
+                uuid: None,
+                device_id: String::new(),
             },
             Activity {
                 id: None,
@@ -3300,6 +3910,8 @@ mod tests {
                 semantic_category: None,
                 semantic_confidence: None,
                 screenshot_url: None,
+                uuid: None,
+                device_id: String::new(),
             },
         ];
 
@@ -3338,6 +3950,8 @@ mod tests {
                 semantic_category: Some("休息娱乐".to_string()),
                 semantic_confidence: Some(100),
                 screenshot_url: None,
+                uuid: None,
+                device_id: String::new(),
             },
             Activity {
                 id: None,
@@ -3353,6 +3967,8 @@ mod tests {
                 semantic_category: Some("编码开发".to_string()),
                 semantic_confidence: Some(100),
                 screenshot_url: None,
+                uuid: None,
+                device_id: String::new(),
             },
         ];
 
@@ -3394,6 +4010,8 @@ mod tests {
                 semantic_category: None,
                 semantic_confidence: None,
                 screenshot_url: None,
+                uuid: None,
+                device_id: String::new(),
             },
             Activity {
                 id: None,
@@ -3409,6 +4027,8 @@ mod tests {
                 semantic_category: None,
                 semantic_confidence: None,
                 screenshot_url: None,
+                uuid: None,
+                device_id: String::new(),
             },
         ];
 
@@ -3450,6 +4070,8 @@ mod tests {
             semantic_confidence: Some(86),
             executable_path: None,
             screenshot_url: None,
+                uuid: None,
+                device_id: String::new(),
         };
 
         db.insert_activity(&activity).expect("插入测试数据失败");
@@ -3486,6 +4108,8 @@ mod tests {
                 semantic_category: Some("设计创作".to_string()),
                 semantic_confidence: Some(75),
                 screenshot_url: None,
+                uuid: None,
+                device_id: String::new(),
             },
             Activity {
                 id: None,
@@ -3501,6 +4125,8 @@ mod tests {
                 semantic_category: Some("设计创作".to_string()),
                 semantic_confidence: Some(70),
                 screenshot_url: None,
+                uuid: None,
+                device_id: String::new(),
             },
         ];
 
@@ -3561,6 +4187,8 @@ mod tests {
                 semantic_category: Some("编码开发".to_string()),
                 semantic_confidence: Some(82),
                 screenshot_url: None,
+                uuid: None,
+                device_id: String::new(),
             },
             Activity {
                 id: None,
@@ -3576,6 +4204,8 @@ mod tests {
                 semantic_category: Some("编码开发".to_string()),
                 semantic_confidence: Some(80),
                 screenshot_url: None,
+                uuid: None,
+                device_id: String::new(),
             },
             Activity {
                 id: None,
@@ -3591,6 +4221,8 @@ mod tests {
                 semantic_category: Some("资料阅读".to_string()),
                 semantic_confidence: Some(76),
                 screenshot_url: None,
+                uuid: None,
+                device_id: String::new(),
             },
         ];
 
@@ -3628,6 +4260,7 @@ mod tests {
             model_name: Some("gemma3:270m".to_string()),
             fallback_reason: Some("请求失败，已回退到基础模板".to_string()),
             created_at: now,
+            device_id: String::new(),
         })
         .expect("保存中文日报失败");
 
@@ -3639,15 +4272,16 @@ mod tests {
             model_name: Some("gemma3:270m".to_string()),
             fallback_reason: None,
             created_at: now + 1,
+            device_id: String::new(),
         })
         .expect("保存英文日报失败");
 
         let zh_report = db
-            .get_report(&date, Some("zh-CN"))
+            .get_report(&date, Some("zh-CN"), None)
             .expect("读取中文日报失败")
             .expect("未找到中文日报");
         let en_report = db
-            .get_report(&date, Some("en"))
+            .get_report(&date, Some("en"), None)
             .expect("读取英文日报失败")
             .expect("未找到英文日报");
 
@@ -3686,6 +4320,8 @@ mod tests {
             semantic_category: Some("编码开发".to_string()),
             semantic_confidence: Some(88),
             screenshot_url: None,
+                uuid: None,
+                device_id: String::new(),
         })
         .expect("插入活动失败");
 
@@ -3697,6 +4333,7 @@ mod tests {
             model_name: Some("gpt-4.1".to_string()),
             fallback_reason: Some("返回空内容，已回退到基础模板".to_string()),
             created_at: now,
+            device_id: String::new(),
         })
         .expect("保存日报失败");
 
@@ -3708,7 +4345,7 @@ mod tests {
             .expect("读取备份活动失败")
             .expect("备份后未找到活动");
         let report = restored
-            .get_report(&date, Some("zh-CN"))
+            .get_report(&date, Some("zh-CN"), None)
             .expect("读取备份日报失败")
             .expect("备份后未找到日报");
 

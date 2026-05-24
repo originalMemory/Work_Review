@@ -193,19 +193,33 @@ impl From<&StorageConfig> for ScreenshotConfig {
 pub struct ScreenshotService {
     data_dir: PathBuf,
     config: ScreenshotConfig,
+    device_id: String,
 }
 
 impl ScreenshotService {
-    pub fn new(data_dir: &Path, storage_config: &StorageConfig) -> Self {
+    pub fn new(data_dir: &Path, storage_config: &StorageConfig, device_id: &str) -> Self {
         let _ = cleanup_stale_ocr_temp_dir(data_dir);
         Self {
             data_dir: data_dir.to_path_buf(),
             config: ScreenshotConfig::from(storage_config),
+            device_id: device_id.to_string(),
         }
     }
 
     pub fn update_config(&mut self, storage_config: &StorageConfig) {
         self.config = ScreenshotConfig::from(storage_config);
+    }
+
+    /// 构建截图目录：screenshots/{device_id}/YYYY-MM-DD/
+    fn screenshots_dir(&self, date_str: &str) -> PathBuf {
+        if self.device_id.is_empty() {
+            self.data_dir.join("screenshots").join(date_str)
+        } else {
+            self.data_dir
+                .join("screenshots")
+                .join(&self.device_id)
+                .join(date_str)
+        }
     }
 
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
@@ -241,7 +255,7 @@ impl ScreenshotService {
         let date_str = now.format("%Y-%m-%d").to_string();
         let time_str = now.format("%H%M%S_%3f").to_string();
 
-        let screenshots_dir = self.data_dir.join("screenshots").join(&date_str);
+        let screenshots_dir = self.screenshots_dir(&date_str);
         std::fs::create_dir_all(&screenshots_dir)?;
 
         if should_capture_all_displays(&self.config) {
@@ -724,7 +738,7 @@ impl ScreenshotService {
         let date_str = now.format("%Y-%m-%d").to_string();
         let time_str = now.format("%H%M%S_%3f").to_string();
 
-        let screenshots_dir = self.data_dir.join("screenshots").join(&date_str);
+        let screenshots_dir = self.screenshots_dir(&date_str);
         std::fs::create_dir_all(&screenshots_dir)?;
 
         let dynamic_image = if should_capture_all_displays(&self.config) {
@@ -911,7 +925,7 @@ impl ScreenshotService {
         let date_str = now.format("%Y-%m-%d").to_string();
         let time_str = now.format("%H%M%S_%3f").to_string();
 
-        let screenshots_dir = self.data_dir.join("screenshots").join(&date_str);
+        let screenshots_dir = self.screenshots_dir(&date_str);
         std::fs::create_dir_all(&screenshots_dir)?;
 
         let session = current_linux_desktop_session();
@@ -1742,7 +1756,7 @@ mod tests {
             ..StorageConfig::default()
         };
 
-        let service = ScreenshotService::new(Path::new("."), &storage);
+        let service = ScreenshotService::new(Path::new("."), &storage, "");
 
         assert_eq!(service.config.jpeg_quality, 92);
         assert_eq!(service.config.max_width, 2048);
@@ -1751,7 +1765,7 @@ mod tests {
 
     #[test]
     fn 更新截图配置后应切换显示模式() {
-        let mut service = ScreenshotService::new(Path::new("."), &StorageConfig::default());
+        let mut service = ScreenshotService::new(Path::new("."), &StorageConfig::default(), "");
         let updated_storage = StorageConfig {
             screenshot_display_mode: ScreenshotDisplayMode::All,
             ..StorageConfig::default()
@@ -1864,7 +1878,7 @@ Monitors: 2
             screenshot_width_mode: ScreenshotWidthMode::Fixed,
             ..StorageConfig::default()
         };
-        let service = ScreenshotService::new(&data_dir, &storage);
+        let service = ScreenshotService::new(&data_dir, &storage, "");
         let image =
             DynamicImage::ImageRgba8(RgbaImage::from_pixel(3024, 1964, Rgba([24, 48, 96, 255])));
 
@@ -1902,7 +1916,7 @@ Monitors: 2
             screenshot_width_mode: ScreenshotWidthMode::Fixed,
             ..StorageConfig::default()
         };
-        let service = ScreenshotService::new(&data_dir, &storage);
+        let service = ScreenshotService::new(&data_dir, &storage, "");
         let image =
             DynamicImage::ImageRgba8(RgbaImage::from_pixel(1920, 1080, Rgba([12, 34, 56, 255])));
 

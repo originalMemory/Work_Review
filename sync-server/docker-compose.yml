@@ -1,0 +1,16 @@
+services:
+  sync-server:
+    build: .
+    container_name: workreview-sync
+    # Unraid 默认 nobody 多为 99:100；可通过 PUID/PGID 环境变量覆盖
+    user: "${PUID:-99}:${PGID:-100}"
+    labels:
+      net.unraid.docker.icon: "https://raw.githubusercontent.com/wm94i/Work_Review/main/src-tauri/icons/icon.png"
+    restart: unless-stopped
+    ports:
+      - "${SYNC_PORT:-8080}:8080"
+    volumes:
+      - ${SYNC_DATA_DIR:-./data}:/data
+    environment:
+      - SYNC_TOKEN=${SYNC_TOKEN:-changeme}
+      - RUST_LOG=sync_server=info

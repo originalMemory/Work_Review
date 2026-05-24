@@ -204,6 +204,57 @@
     }
   }
 
+  let isSyncing = false;
+  let syncIntervalLabel = '';
+  const syncScreenshotsModes = [
+    { value: 'full', labelKey: 'settingsStorage.syncScreenshotsFull', descKey: 'settingsStorage.syncScreenshotsFullDesc' },
+    { value: 'thumbnail', labelKey: 'settingsStorage.syncScreenshotsThumbnail', descKey: 'settingsStorage.syncScreenshotsThumbnailDesc' },
+    { value: 'none', labelKey: 'settingsStorage.syncScreenshotsNone', descKey: 'settingsStorage.syncScreenshotsNoneDesc' },
+  ];
+  $: {
+    currentLocale;
+    syncIntervalLabel = t('settingsStorage.syncIntervalValue', { count: config?.sync?.sync_interval_minutes ?? 5 });
+  }
+
+  function formatSyncTime(ts) {
+    if (!ts || ts <= 0) return t('settingsStorage.syncNever');
+    return new Date(ts * 1000).toLocaleString();
+  }
+
+  async function refreshSyncConfigFromBackend() {
+    try {
+      const latest = await invoke('get_config');
+      config = latest;
+      cache.setConfig(latest);
+    } catch (e) {
+      console.warn('刷新同步状态失败:', e);
+    }
+  }
+
+  async function triggerSyncNow() {
+    isSyncing = true;
+    try {
+      const result = await invoke('sync_now');
+      await refreshSyncConfigFromBackend();
+      if (result.error) {
+        showToast(t('settingsStorage.syncFailed', { error: result.error }), 'error');
+      } else {
+        const extra =
+          result.screenshots_pushed > 0
+            ? t('settingsStorage.syncScreenshotsUploaded', { count: result.screenshots_pushed })
+            : '';
+        showToast(
+          t('settingsStorage.syncSuccess', { pushed: result.pushed, pulled: result.pulled }) + extra,
+          'success',
+        );
+      }
+    } catch (e) {
+      showToast(t('settingsStorage.syncFailed', { error: e }), 'error');
+    } finally {
+      isSyncing = false;
+    }
+  }
+
   // 计算存储使用百分比
   $: usagePercent = storageStats 
     ? Math.min(Math.round((storageStats.total_size_mb / storageStats.storage_limit_mb) * 100), 100) 
@@ -226,6 +277,19 @@
     if (!config.remote_storage) config.remote_storage = { provider: 'none', s3: {}, webdav: {} };
     if (!config.remote_storage.s3) config.remote_storage.s3 = {};
     if (!config.remote_storage.webdav) config.remote_storage.webdav = {};
+    if (!config.sync) {
+      config.sync = {
+        enabled: false,
+        server_url: '',
+        sync_token: '',
+        device_id: '',
+        device_name: '',
+        sync_interval_minutes: 5,
+        sync_screenshots_mode: 'none',
+        last_push_timestamp: 0,
+        last_pull_timestamp: 0,
+      };
+    }
   }
 </script>
 
@@ -798,6 +862,145 @@
         </div>
       </div>
     {/if}
+  </div>
+</div>
+
+<!-- 多设备同步 -->
+<div class="settings-card mb-5" data-locale={currentLocale}>
+  <h3 class="settings-card-title">{t('settingsStorage.syncTitle')}</h3>
+  <p class="settings-card-desc">{t('settingsStorage.syncDesc')}</p>
+
+  <div class="settings-section">
+    <div class="settings-row">
+      <div>
+        <span class="settings-text">{t('settingsStorage.syncEnabled')}</span>
+        <p class="settings-muted mt-0.5">{t('settingsStorage.syncEnabledHint')}</p>
+      </div>
+      <button
+        type="button"
+        on:click={() => {
+          config.sync.enabled = !config.sync.enabled;
+          handleChange();
+        }}
+        class="switch-track {config.sync.enabled ? 'bg-emerald-500' : 'bg-slate-300 dark:bg-slate-600'}"
+        aria-pressed={config.sync.enabled}
+      >
+        <span class="switch-thumb {config.sync.enabled ? 'translate-x-5' : 'translate-x-0'}"></span>
+      </button>
+    </div>
+
+    <div class="settings-block">
+      <label for="sync-server-url" class="settings-text">{t('settingsStorage.syncServerUrl')}</label>
+      <input
+        id="sync-server-url"
+        type="text"
+        bind:value={config.sync.server_url}
+        on:change={handleChange}
+        placeholder={t('settingsStorage.syncServerUrlPlaceholder')}
+        class="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm dark:border-slate-600 dark:bg-slate-800 dark:text-white"
+      />
+    </div>
+
+    <div class="settings-block">
+      <label for="sync-token" class="settings-text">{t('settingsStorage.syncToken')}</label>
+      <input
+        id="sync-token"
+        type="password"
+        bind:value={config.sync.sync_token}
+        on:change={handleChange}
+        placeholder={t('settingsStorage.syncTokenPlaceholder')}
+        class="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm dark:border-slate-600 dark:bg-slate-800 dark:text-white"
+      />
+    </div>
+
+    <div class="settings-block">
+      <div class="grid gap-3 sm:grid-cols-2">
+        <div>
+          <p class="settings-text">{t('settingsStorage.syncDeviceId')}</p>
+          <p class="settings-muted mt-1 break-all text-xs">{config.sync.device_id || '—'}</p>
+        </div>
+        <div>
+          <label for="sync-device-name" class="settings-text">{t('settingsStorage.syncDeviceName')}</label>
+          <input
+            id="sync-device-name"
+            type="text"
+            bind:value={config.sync.device_name}
+            on:change={handleChange}
+            placeholder={t('settingsStorage.syncDeviceNamePlaceholder')}
+            class="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm dark:border-slate-600 dark:bg-slate-800 dark:text-white"
+          />
+        </div>
+      </div>
+    </div>
+
+    <div class="settings-block">
+      <div class="flex items-center justify-between">
+        <label for="sync-interval" class="settings-text">{t('settingsStorage.syncInterval')}</label>
+        <span class="settings-value">{syncIntervalLabel}</span>
+      </div>
+      <input
+        id="sync-interval"
+        type="range"
+        bind:value={config.sync.sync_interval_minutes}
+        on:change={handleChange}
+        min="1"
+        max="60"
+        step="1"
+        class="range-input"
+      />
+    </div>
+
+    <div class="settings-block">
+      <p class="settings-text mb-2">{t('settingsStorage.syncScreenshotsMode')}</p>
+      <div class="flex gap-2">
+        {#each syncScreenshotsModes as mode}
+          <button
+            type="button"
+            on:click={() => {
+              config.sync.sync_screenshots_mode = mode.value;
+              handleChange();
+            }}
+            class="flex-1 min-h-16 px-3 py-2.5 rounded-lg text-sm font-medium leading-none transition-all duration-150
+                   {config.sync.sync_screenshots_mode === mode.value
+                     ? 'settings-segment-active'
+                     : 'settings-segment-base'}"
+          >
+            <div class="flex h-full flex-col items-center justify-center gap-1 text-center">
+              <div class="leading-none">{t(mode.labelKey)}</div>
+              <div class="text-[10px] leading-snug {config.sync.sync_screenshots_mode === mode.value ? 'text-white/70' : 'settings-subtle'}">
+                {t(mode.descKey)}
+              </div>
+            </div>
+          </button>
+        {/each}
+      </div>
+    </div>
+
+    <div class="settings-block">
+      <div class="rounded-2xl border border-slate-200/80 bg-slate-50/90 p-4 dark:border-slate-700/80 dark:bg-slate-800/40">
+        <div class="grid gap-3 sm:grid-cols-2 mb-4">
+          <div>
+            <p class="settings-text">{t('settingsStorage.syncLastPush')}</p>
+            <p class="settings-muted mt-1 text-xs">{formatSyncTime(config.sync.last_push_timestamp)}</p>
+          </div>
+          <div>
+            <p class="settings-text">{t('settingsStorage.syncLastPull')}</p>
+            <p class="settings-muted mt-1 text-xs">{formatSyncTime(config.sync.last_pull_timestamp)}</p>
+          </div>
+        </div>
+        <button
+          on:click={triggerSyncNow}
+          disabled={isSyncing || !config.sync.enabled || !config.sync.server_url}
+          class="settings-action-secondary"
+        >
+          {#if isSyncing}
+            {t('settingsStorage.syncSyncing')}
+          {:else}
+            {t('settingsStorage.syncNow')}
+          {/if}
+        </button>
+      </div>
+    </div>
   </div>
 </div>
 

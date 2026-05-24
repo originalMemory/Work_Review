@@ -19,6 +19,7 @@
   import { applyLocaleToDocument, initializeLocale, locale } from '$lib/i18n/index.js';
   import { preloadAppIcons } from './lib/stores/iconCache.js';
   import { runUpdateFlow } from './lib/utils/updater.js';
+  import { selectedDeviceId } from './lib/stores/deviceFilter.js';
 
   const appWindow = getCurrentWebviewWindow();
   const currentWindowLabel = appWindow.label;
@@ -269,6 +270,7 @@
         config = await invoke('get_config');
         runtimeConfig = config;
         cache.setConfig(config);
+        selectedDeviceId.set(config.ui_selected_device_id ?? null);
         applyTheme(config.theme || 'system');
       } catch (e) {
         console.error('加载配置失败:', e);
@@ -317,6 +319,9 @@
       const unlistenConfigChanged = await listen('config-changed', (event) => {
         runtimeConfig = event.payload;
         cache.setConfig(event.payload);
+        if (Object.prototype.hasOwnProperty.call(event.payload, 'ui_selected_device_id')) {
+          selectedDeviceId.set(event.payload.ui_selected_device_id ?? null);
+        }
       });
       if (disposed) return;
       pendingCleanup.push(unlistenConfigChanged);

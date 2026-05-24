@@ -458,6 +458,95 @@ impl PrivacyConfig {
     }
 }
 
+/// 截图同步模式
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+#[serde(rename_all = "snake_case")]
+#[derive(Default)]
+pub enum SyncScreenshotsMode {
+    /// 上传原始截图
+    #[default]
+    Full,
+    /// 缩小后上传
+    Thumbnail,
+    /// 不上传截图
+    None,
+}
+
+/// 同步配置
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SyncConfig {
+    /// 是否启用同步
+    #[serde(default)]
+    pub enabled: bool,
+    /// 同步服务器地址
+    #[serde(default)]
+    pub server_url: String,
+    /// 同步认证 Token
+    #[serde(default)]
+    pub sync_token: String,
+    /// 设备唯一标识（自动生成，不可修改）
+    #[serde(default)]
+    pub device_id: String,
+    /// 设备显示名称（用户可修改）
+    #[serde(default)]
+    pub device_name: String,
+    /// 同步间隔（分钟）
+    #[serde(default = "default_sync_interval")]
+    pub sync_interval_minutes: u32,
+    /// 截图同步模式
+    #[serde(default)]
+    pub sync_screenshots_mode: SyncScreenshotsMode,
+    /// 推送增量游标：本地已推送过的最大「事件时间」
+    #[serde(default)]
+    pub last_push_timestamp: i64,
+    /// 拉取增量游标：已从服务端合并进本地的最大「事件时间」
+    #[serde(default)]
+    pub last_pull_timestamp: i64,
+}
+
+fn default_sync_interval() -> u32 {
+    5
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            server_url: String::new(),
+            sync_token: String::new(),
+            device_id: String::new(),
+            device_name: String::new(),
+            sync_interval_minutes: default_sync_interval(),
+            sync_screenshots_mode: SyncScreenshotsMode::default(),
+            last_push_timestamp: 0,
+            last_pull_timestamp: 0,
+        }
+    }
+}
+
+impl SyncConfig {
+    /// 首次启动时自动生成 device_id（格式: {hostname}-{random4}）
+    pub fn ensure_device_id(&mut self) {
+        if !self.device_id.is_empty() {
+            return;
+        }
+        let host = hostname::get()
+            .ok()
+            .and_then(|h| h.into_string().ok())
+            .unwrap_or_else(|| "unknown".to_string());
+        let host_clean: String = host
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '-')
+            .take(32)
+            .collect();
+        let suffix = &uuid::Uuid::new_v4().to_string()[..4];
+        self.device_id = format!("{host_clean}-{suffix}");
+        if self.device_name.is_empty() {
+            self.device_name = host;
+        }
+    }
+}
+
 /// 存储配置
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -669,6 +758,9 @@ pub struct AppConfig {
     /// 远程存储配置（S3/MinIO 或 WebDAV）
     #[serde(default)]
     pub remote_storage: RemoteStorageConfig,
+    /// 同步配置
+    #[serde(default)]
+    pub sync: SyncConfig,
     /// 日报附加提示词
     #[serde(default)]
     pub daily_report_custom_prompt: String,
@@ -822,6 +914,12 @@ pub struct AppConfig {
     /// 背景图片模糊程度 (0 = 清晰, 1 = 轻微, 2 = 中等)
     #[serde(default = "default_bg_blur")]
     pub background_blur: u8,
+    /// 概览 / 时间线 / 日报 的设备筛选（`None` 表示「全部设备」）
+    #[serde(default)]
+    pub ui_selected_device_id: Option<String>,
+    /// 空闲检测豁免应用：应用名须与活动记录落库的 `app_name` 一致
+    #[serde(default)]
+    pub idle_exempt_app_names: Vec<String>,
 }
 
 fn default_work_start() -> u8 {
@@ -870,6 +968,7 @@ impl Default for AppConfig {
             deleted_default_semantic_categories: Vec::new(),
             storage: StorageConfig::default(),
             remote_storage: RemoteStorageConfig::default(),
+            sync: SyncConfig::default(),
             daily_report_custom_prompt: String::new(),
             daily_report_prompt_presets: Vec::new(),
             daily_report_export_dir: None,
@@ -936,6 +1035,8 @@ impl Default for AppConfig {
             background_image: None,
             background_opacity: 0.25,
             background_blur: 1,
+            ui_selected_device_id: None,
+            idle_exempt_app_names: Vec::new(),
         }
     }
 }
@@ -971,7 +1072,31 @@ impl AppConfig {
         self.localhost_api_host = normalize_optional_string(self.localhost_api_host.take());
         self.node_gateway.device_name =
             normalize_optional_string(self.node_gateway.device_name.take());
+        self.ui_selected_device_id = self
+            .ui_selected_device_id
+            .take()
+            .and_then(|s| normalize_optional_string(Some(s)));
+        self.normalize_idle_exempt_app_names();
         self.sync_text_model_profiles();
+        self.sync.ensure_device_id();
+    }
+
+    fn normalize_idle_exempt_app_names(&mut self) {
+        use std::collections::HashSet;
+        self.idle_exempt_app_names = self
+            .idle_exempt_app_names
+            .iter()
+            .map(|n| n.trim().to_string())
+            .filter(|n| !n.is_empty())
+            .collect();
+        let mut seen = HashSet::new();
+        self.idle_exempt_app_names.retain(|n| seen.insert(n.clone()));
+        self.idle_exempt_app_names.sort();
+    }
+
+    /// 应用是否豁免空闲检测（与 `idle_exempt_app_names` 精确匹配，同活动记录 `app_name`）
+    pub fn is_idle_exempt_app(&self, app_name: &str) -> bool {
+        self.idle_exempt_app_names.iter().any(|n| n == app_name)
     }
 
     /// 从文件加载配置

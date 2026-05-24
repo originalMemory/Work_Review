@@ -11,6 +11,8 @@
   import { shouldShowPromptAppliedToast } from './reportPromptFeedback.js';
   import { resolveReportMeta } from './reportMeta.js';
   import LocalizedDatePicker from '../../lib/components/LocalizedDatePicker.svelte';
+  import DeviceFilter from '../../lib/components/DeviceFilter.svelte';
+  import { selectedDeviceId } from '../../lib/stores/deviceFilter.js';
 
   function getLocalDateString() {
     const now = new Date();
@@ -24,6 +26,7 @@
   }
 
   let report = null;
+  let allDeviceReports = [];
   let loading = false;
   let generating = false;
   let error = null;
@@ -55,7 +58,7 @@
   $: generating = cacheData?.reportGenerating ?? false;
   $: generating = cacheData?.reportGenerating ?? false;
   $: currentLocale = $locale;
-  $: currentReportCacheKey = `${selectedDate}:${currentLocale}`;
+  $: currentReportCacheKey = `${selectedDate}:${currentLocale}:${$selectedDeviceId ?? 'all'}`;
 
   // 获取 AI 模式显示名称
   function getAiModeName(mode) {
@@ -102,12 +105,25 @@
       
       // 缓存有效则直接返回
       if (cache.isValid(cacheData.reports[currentReportCacheKey], 'reports')) {
+        try {
+          allDeviceReports = await invoke('get_reports_by_date', {
+            date: selectedDate,
+            locale: currentLocale,
+            deviceId: $selectedDeviceId ?? null,
+          });
+        } catch (e) {
+          allDeviceReports = [];
+        }
         return;
       }
       
       // 后台静默刷新
       try {
-        const savedReport = await invoke('get_saved_report', { date: selectedDate, locale: currentLocale });
+        const savedReport = await invoke('get_saved_report', {
+          date: selectedDate,
+          locale: currentLocale,
+          deviceId: $selectedDeviceId ?? null,
+        });
         if (requestId !== reportRequestId) return;
         if (savedReport) {
           report = savedReport;
@@ -121,7 +137,11 @@
       loading = true;
       error = null;
       try {
-        const savedReport = await invoke('get_saved_report', { date: selectedDate, locale: currentLocale });
+        const savedReport = await invoke('get_saved_report', {
+          date: selectedDate,
+          locale: currentLocale,
+          deviceId: $selectedDeviceId ?? null,
+        });
         if (requestId !== reportRequestId) return;
         if (savedReport) {
           report = savedReport;
@@ -130,8 +150,17 @@
         } else {
           if (!savedReport && previousReport?.date === selectedDate && previousReport?.content) {
             generating = true;
-            await invoke('generate_report', { date: selectedDate, force: false, locale: currentLocale });
-            const localizedReport = await invoke('get_saved_report', { date: selectedDate, locale: currentLocale });
+            await invoke('generate_report', {
+              date: selectedDate,
+              force: false,
+              locale: currentLocale,
+              deviceId: $selectedDeviceId ?? null,
+            });
+            const localizedReport = await invoke('get_saved_report', {
+              date: selectedDate,
+              locale: currentLocale,
+              deviceId: $selectedDeviceId ?? null,
+            });
 
             if (localizedReport) {
               report = localizedReport;
@@ -142,9 +171,13 @@
           }
 
           // 如果选择今天且今天无日报，尝试加载昨日日报
-          if (selectedDate === getLocalDateString()) {
+          if (!$selectedDeviceId && selectedDate === getLocalDateString()) {
             const yesterday = getYesterdayDateString();
-            const yesterdayReport = await invoke('get_saved_report', { date: yesterday, locale: currentLocale });
+            const yesterdayReport = await invoke('get_saved_report', {
+              date: yesterday,
+              locale: currentLocale,
+              deviceId: null,
+            });
             if (yesterdayReport) {
               report = yesterdayReport;
               isYesterdayReport = true;
@@ -164,6 +197,16 @@
         loading = false;
       }
     }
+
+    try {
+      allDeviceReports = await invoke('get_reports_by_date', {
+        date: selectedDate,
+        locale: currentLocale,
+        deviceId: $selectedDeviceId ?? null,
+      });
+    } catch (e) {
+      allDeviceReports = [];
+    }
   }
 
   function selectDate(date) {
@@ -178,8 +221,17 @@
       if (config?.ai_mode === 'summary') {
         await persistReportPrompt();
       }
-      await invoke('generate_report', { date: selectedDate, force, locale: currentLocale });
-      const savedReport = await invoke('get_saved_report', { date: selectedDate, locale: currentLocale });
+      await invoke('generate_report', {
+        date: selectedDate,
+        force,
+        locale: currentLocale,
+        deviceId: $selectedDeviceId ?? null,
+      });
+      const savedReport = await invoke('get_saved_report', {
+        date: selectedDate,
+        locale: currentLocale,
+        deviceId: $selectedDeviceId ?? null,
+      });
       report = savedReport || { date: selectedDate, content: '', created_at: Date.now() / 1000 };
       isYesterdayReport = false;
       cache.setReport(currentReportCacheKey, report);
@@ -256,6 +308,7 @@
       const exportPath = await invoke('export_report_markdown', {
         date: report.date || selectedDate,
         content: report.content,
+        deviceId: report.device_id ?? null,
         exportDir,
       });
       showToast(t('report.exportSuccess', { path: exportPath }), 'success');
@@ -443,6 +496,7 @@
     </div>
       <div class="report-hero-actions">
       <div class="page-toolbar-end">
+        <DeviceFilter />
         <button
           class="page-control-btn {selectedDate === getLocalDateString() ? 'page-control-btn-active' : ''}"
           on:click={() => selectDate(getLocalDateString())}
@@ -668,6 +722,29 @@
         </div>
       </div>
     {/if}
+    {#if allDeviceReports.length > 1}
+      {#each allDeviceReports as deviceReport}
+        <div class="page-card report-sheet report-article-card mb-4">
+          <div class="report-sheet-content">
+            <div class="report-sheet-meta text-xs text-slate-400 mb-4 flex flex-wrap items-center gap-2">
+              <div class="w-1.5 h-1.5 rounded-full bg-emerald-500 shrink-0"></div>
+              <span class="text-sm font-medium text-slate-600 dark:text-slate-300">
+                {t('report.deviceSection', { device: deviceReport.device_id || t('deviceFilter.allDevices') })}
+              </span>
+              <span class="text-slate-400 ml-auto">
+                {t('report.generatedAt', { time: formatLocalizedDate(new Date(deviceReport.created_at * 1000), { year: 'numeric', month: '2-digit', day: '2-digit' }) + ' ' + formatLocalizedTime(new Date(deviceReport.created_at * 1000), { hour: '2-digit', minute: '2-digit', second: '2-digit' }) })}
+              </span>
+            </div>
+            <div
+              use:interceptReportLinks
+              class="markdown-body report-sheet-body prose prose-slate dark:prose-invert max-w-none"
+            >
+              {@html renderMarkdown(deviceReport.content)}
+            </div>
+          </div>
+        </div>
+      {/each}
+    {:else}
     <div class="page-card report-sheet report-article-card">
       <div class="report-sheet-content">
         <div class="report-sheet-meta text-xs text-slate-400 mb-4 flex items-center gap-2">
@@ -719,6 +796,7 @@
         </div>
       </div>
     </div>
+    {/if}
     {:else}
     <div class="empty-state-lg">
       <div class="empty-state-icon !w-16 !h-16 !mb-5 bg-amber-50 dark:bg-amber-950/30">

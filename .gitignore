@@ -32,15 +32,6 @@ data/
 *.db-journal
 screenshots/
 
-# Live2D SDK / local experiment files (not shipped in release)
-public/js/CubismSdkForWeb-*/
-public/js/*.zip
-src-tauri/assets/live2d-models/
-public/js/live2dcubismcore.min.js
-public/live2d-models/
-src/lib/components/Avatar/AvatarCanvasLive2D.svelte
-src/lib/components/Avatar/live2dRenderer.js
-
 # Tauri
 src-tauri/target/
 src-tauri/WixTools/
@@ -53,8 +44,8 @@ __pycache__/
 env/
 venv/
 
-# Bot config
-bots/config.json
+# Sync server
+sync-server/target/
 
 # Project docs (local only)
 plan-*.md
@@ -62,4 +53,3 @@ TEST_REPORT_*.md
 src-tauri/icons.backup/
 .worktrees/
 .superpowers/
-target/

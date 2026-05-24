@@ -11,6 +11,6 @@ test('日报手动导出在未设置默认目录时应允许临时选择目录',
   assert.match(source, /import \{ open as openDialog \} from '@tauri-apps\/plugin-dialog';/);
   assert.match(source, /const selected = await openDialog\(\{\s*directory: true,\s*multiple: false,/s);
   assert.match(source, /exportDir = selected;/);
-  assert.match(source, /invoke\('export_report_markdown', \{\s*date: report\.date \|\| selectedDate,\s*content: report\.content,\s*exportDir,/s);
+  assert.match(source, /invoke\('export_report_markdown', \{\s*date: report\.date \|\| selectedDate,\s*content: report\.content,\s*deviceId: report\.device_id \?\? null,\s*exportDir,/s);
   assert.doesNotMatch(source, /disabled=\{exportInProgress \|\| !config\?\.daily_report_export_dir\}/);
 });

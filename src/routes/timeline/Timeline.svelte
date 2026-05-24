@@ -22,6 +22,8 @@
   import { formatBrowserUrlForDisplay } from '../../lib/utils/browserUrl.js';
   import { prepareTimelineActivities, upsertTimelineActivity } from './timelineData.js';
   import LocalizedDatePicker from '../../lib/components/LocalizedDatePicker.svelte';
+  import DeviceFilter from '../../lib/components/DeviceFilter.svelte';
+  import { selectedDeviceId } from '../../lib/stores/deviceFilter.js';
 
   // 获取本地日期（避免 UTC 时区问题）
   function getLocalDateString() {
@@ -55,6 +57,13 @@
   let fullImageCache = {};
   let fullImageKeys = [];
   $: currentLocale = $locale;
+  let prevDeviceId = undefined;
+  $: if ($selectedDeviceId !== prevDeviceId && prevDeviceId !== undefined) {
+    prevDeviceId = $selectedDeviceId;
+    loadTimeline();
+  } else {
+    prevDeviceId = $selectedDeviceId;
+  }
 
   // 向 LRU 缓存中写入，超出上限时淘汰最旧条目释放内存
   function lruSet(cache, keys, limit, key, value) {
@@ -600,8 +609,8 @@
 
     try {
       const [activitiesData, summariesData] = await Promise.all([
-        invoke('get_timeline', { date: selectedDate, limit: PAGE_SIZE, offset: 0 }),
-        invoke('get_hourly_summaries', { date: selectedDate }),
+        invoke('get_timeline', { date: selectedDate, limit: PAGE_SIZE, offset: 0, deviceId: $selectedDeviceId }),
+        invoke('get_hourly_summaries', { date: selectedDate, deviceId: $selectedDeviceId }),
       ]);
 
       if (requestId !== loadTimelineRequestId) return;
@@ -652,7 +661,8 @@
       const moreActivities = await invoke('get_timeline', { 
         date: selectedDate, 
         limit: PAGE_SIZE, 
-        offset: offset 
+        offset: offset,
+        deviceId: $selectedDeviceId,
       });
 
       if (moreActivities.length > 0) {
@@ -874,6 +884,7 @@
       </div>
     </div>
     <div class="page-toolbar">
+      <DeviceFilter />
       {#key `timeline-date-${currentLocale}`}
         <LocalizedDatePicker
           bind:value={selectedDate}

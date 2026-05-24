@@ -980,6 +980,8 @@ mod tests {
             semantic_category: None,
             semantic_confidence: None,
             screenshot_url: None,
+            uuid: None,
+            device_id: String::new(),
         }
     }
 

@@ -10,6 +10,9 @@
   $: currentLocale = $locale;
   let workHours = '—';
   let autoStartEnabled = false;
+  /** @type {string[]} */
+  let recordedAppNames = [];
+  let addIdleExemptSelection = '';
   const MAX_WORK_SEGMENTS = 8;
 
   onMount(async () => {
@@ -27,8 +30,38 @@
     } catch (e) {
       console.error('查询自启动状态失败:', e);
     }
+    try {
+      recordedAppNames = await invoke('get_recorded_app_names');
+    } catch (e) {
+      console.error('加载已记录应用列表失败:', e);
+      recordedAppNames = [];
+    }
   });
 
+  $: idleExemptList = config.idle_exempt_app_names ?? [];
+  $: idleExemptAddOptions = (() => {
+    const sel = new Set(idleExemptList);
+    const merged = [...new Set([...recordedAppNames, ...idleExemptList])];
+    return merged.filter((n) => !sel.has(n)).sort((a, b) => a.localeCompare(b));
+  })();
+
+  function removeIdleExempt(name) {
+    if (!config.idle_exempt_app_names) config.idle_exempt_app_names = [];
+    config.idle_exempt_app_names = config.idle_exempt_app_names.filter((n) => n !== name);
+    dispatch('change', config);
+  }
+
+  function addIdleExemptFromSelect() {
+    const name = addIdleExemptSelection;
+    if (!name) return;
+    if (!config.idle_exempt_app_names) config.idle_exempt_app_names = [];
+    if (config.idle_exempt_app_names.includes(name)) return;
+    config.idle_exempt_app_names = [...config.idle_exempt_app_names, name];
+    addIdleExemptSelection = '';
+    dispatch('change', config);
+  }
+
+  // 小时选项 (0-23)
   function normalizeHour(value) {
     const parsed = Number.parseInt(value, 10);
     if (!Number.isFinite(parsed)) return 0;
@@ -307,6 +340,59 @@
           />
           <span class="text-xs settings-subtle">{t('settingsGeneral.minutesUnit')}</span>
         </div>
+      </div>
+
+      <!-- 空闲检测豁免应用 -->
+      <div class="settings-block mt-4 pt-4 border-t border-slate-200 dark:border-slate-700">
+        <div class="settings-text">{t('settingsGeneral.idleExemptTitle')}</div>
+        <p class="settings-muted mt-1 text-sm leading-relaxed">
+          {t('settingsGeneral.idleExemptDescription')}
+        </p>
+
+        <div class="mt-3 flex min-h-[2rem] flex-wrap gap-2">
+          {#if idleExemptList.length === 0}
+            <span class="settings-subtle">{t('settingsGeneral.idleExemptEmpty')}</span>
+          {:else}
+            {#each idleExemptList as name (name)}
+              <span
+                class="inline-flex items-center gap-1 rounded-full bg-slate-200 px-2.5 py-0.5 text-sm text-slate-800 dark:bg-slate-700 dark:text-slate-100"
+              >
+                {name}
+                <button
+                  type="button"
+                  class="rounded p-0.5 text-slate-500 hover:bg-slate-300 hover:text-slate-800 dark:hover:bg-slate-600 dark:hover:text-white"
+                  aria-label={t('settingsGeneral.idleExemptRemoveAria', { name })}
+                  on:click={() => removeIdleExempt(name)}
+                >
+                  ×
+                </button>
+              </span>
+            {/each}
+          {/if}
+        </div>
+
+        <div class="mt-3 flex flex-wrap items-center gap-2">
+          <select
+            bind:value={addIdleExemptSelection}
+            class="min-w-[12rem] rounded-md border border-slate-200 bg-white px-2 py-1.5 text-sm text-slate-800 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100"
+          >
+            <option value="">{t('settingsGeneral.idleExemptAddPlaceholder')}</option>
+            {#each idleExemptAddOptions as opt (opt)}
+              <option value={opt}>{opt}</option>
+            {/each}
+          </select>
+          <button
+            type="button"
+            disabled={!addIdleExemptSelection}
+            class="rounded-md bg-primary-500 px-3 py-1.5 text-sm text-white disabled:cursor-not-allowed disabled:opacity-40"
+            on:click={addIdleExemptFromSelect}
+          >
+            {t('settingsGeneral.idleExemptAdd')}
+          </button>
+        </div>
+        {#if recordedAppNames.length === 0}
+          <p class="settings-note mt-2">{t('settingsGeneral.idleExemptNoCandidates')}</p>
+        {/if}
       </div>
     </div>
 

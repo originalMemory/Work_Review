@@ -455,6 +455,8 @@ mod tests {
             semantic_category: Some("编码开发".to_string()),
             semantic_confidence: Some(90),
             screenshot_url: None,
+            uuid: None,
+            device_id: String::new(),
         }
     }
 
