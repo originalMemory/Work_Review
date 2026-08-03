@@ -22,6 +22,8 @@
 - `assistant_conversations` / `assistant_messages`：待补 UUID、墓碑与冲突规则后再做
 - `AppConfig`：含模型 Key、Bot 凭据等敏感信息，禁止整份上传
 
+因此 `AppConfig.idle_exempt_app_names` 也仅保存在本机。空闲豁免应用的当前实现、行为边界和验收清单见 [`archive/2026-08-03-idle-exempt-apps.md`](archive/2026-08-03-idle-exempt-apps.md)。
+
 ## 实现约束
 
 - `Activity` 等现有业务 DTO 不新增同步字段；同步层使用专用记录 DTO
