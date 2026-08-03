@@ -175,9 +175,22 @@ fn handle_request(request: &Value, state: &Arc<Mutex<AppState>>) -> Value {
         "initialize" => {
             // 版本协商：接受客户端请求的版本（如果在支持列表里），否则回退到最新。
             // Cherry Studio / Claude Code 等客户端会校验返回的 protocolVersion。
-            const SUPPORTED: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05", "2024-10-07"];
-            let client_version = params.get("protocolVersion").and_then(|v| v.as_str()).unwrap_or("2024-11-05");
-            let negotiated = if SUPPORTED.contains(&client_version) { client_version } else { "2025-11-25" };
+            const SUPPORTED: &[&str] = &[
+                "2025-11-25",
+                "2025-06-18",
+                "2025-03-26",
+                "2024-11-05",
+                "2024-10-07",
+            ];
+            let client_version = params
+                .get("protocolVersion")
+                .and_then(|v| v.as_str())
+                .unwrap_or("2024-11-05");
+            let negotiated = if SUPPORTED.contains(&client_version) {
+                client_version
+            } else {
+                "2025-11-25"
+            };
             json!({
                 "jsonrpc": "2.0",
                 "id": id,
@@ -777,9 +790,18 @@ fn handle_tool_call(name: &str, args: &Value, state: &Arc<Mutex<AppState>>) -> V
             if let Some(ctx) =
                 try_localhost_get(&s.config, &s.localhost_api_token_path, "/v1/context")
             {
-                let primary_app = ctx.get("primary_app").and_then(|v| v.as_str()).unwrap_or("");
-                let window_title = ctx.get("window_title").and_then(|v| v.as_str()).unwrap_or("");
-                let is_live = ctx.get("is_live").and_then(|v| v.as_bool()).unwrap_or(false);
+                let primary_app = ctx
+                    .get("primary_app")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let window_title = ctx
+                    .get("window_title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let is_live = ctx
+                    .get("is_live")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 if !primary_app.is_empty() {
                     let context = json!({
                         "primary_app": primary_app,
@@ -1080,10 +1102,8 @@ mod tests {
     use super::*;
     use work_review_core::privacy::{apply_excluded_domains_to_stats, apply_ignored_apps_to_stats};
 
-    const TEST_LOCALHOST_API_TOKEN: &str =
-        "wr-local-0123456789abcdef0123456789abcdef";
-    const ROTATED_LOCALHOST_API_TOKEN: &str =
-        "wr-local-fedcba9876543210fedcba9876543210";
+    const TEST_LOCALHOST_API_TOKEN: &str = "wr-local-0123456789abcdef0123456789abcdef";
+    const ROTATED_LOCALHOST_API_TOKEN: &str = "wr-local-fedcba9876543210fedcba9876543210";
 
     fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
         let unique = std::time::SystemTime::now()

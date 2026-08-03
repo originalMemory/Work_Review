@@ -851,7 +851,9 @@ impl OpenAiStreamAssembler {
         let delta = &choice["delta"];
         if let Some(tcs) = delta["tool_calls"].as_array() {
             for tc in tcs {
-                let idx = tc["index"].as_u64().unwrap_or(self.partial_calls.len() as u64) as usize;
+                let idx = tc["index"]
+                    .as_u64()
+                    .unwrap_or(self.partial_calls.len() as u64) as usize;
                 while self.partial_calls.len() <= idx {
                     self.partial_calls
                         .push((String::new(), String::new(), String::new()));
@@ -1073,7 +1075,8 @@ async fn chat_ollama_streaming(
         body["tools"] = json!(tools);
     }
 
-    let response = ensure_stream_status(client.post(&url).json(&body).send().await?, "Ollama").await?;
+    let response =
+        ensure_stream_status(client.post(&url).json(&body).send().await?, "Ollama").await?;
 
     let mut assembler = OllamaStreamAssembler::default();
     drive_stream(response, |line| {
@@ -1135,7 +1138,8 @@ impl ClaudeStreamAssembler {
                     Some("input_json_delta") => {
                         let index = payload["index"].as_u64().unwrap_or(0);
                         if let Some(slot) = self.tools.get_mut(&index) {
-                            slot.2.push_str(delta["partial_json"].as_str().unwrap_or(""));
+                            slot.2
+                                .push_str(delta["partial_json"].as_str().unwrap_or(""));
                         }
                         None
                     }
@@ -1216,7 +1220,8 @@ async fn chat_claude_streaming(
         format!("{endpoint}/messages")
     };
 
-    let (claude_messages, system_content, claude_tools) = build_claude_request_parts(messages, tools);
+    let (claude_messages, system_content, claude_tools) =
+        build_claude_request_parts(messages, tools);
 
     let mut body = json!({
         "model": model_config.model,
@@ -1326,11 +1331,7 @@ impl GeminiStreamAssembler {
             } else {
                 Some(self.text)
             },
-            tool_calls: if has_tools {
-                Some(tool_calls)
-            } else {
-                None
-            },
+            tool_calls: if has_tools { Some(tool_calls) } else { None },
             stop_reason,
         }
     }

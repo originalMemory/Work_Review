@@ -642,6 +642,124 @@ pub struct RemoteStorageConfig {
     pub webdav: WebDavConfig,
 }
 
+/// 跨设备同步时的截图传输策略。
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncScreenshotsMode {
+    #[default]
+    Full,
+    Thumbnail,
+    None,
+}
+
+/// 多设备同步配置。模型密钥、Bot 凭据等其它配置不属于同步负载。
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SyncConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub server_url: String,
+    #[serde(default)]
+    pub sync_token: String,
+    #[serde(default)]
+    pub device_id: String,
+    #[serde(default)]
+    pub device_name: String,
+    #[serde(default = "default_sync_interval_minutes")]
+    pub sync_interval_minutes: u32,
+    #[serde(default)]
+    pub sync_screenshots_mode: SyncScreenshotsMode,
+    #[serde(default)]
+    pub last_push_timestamp: i64,
+    #[serde(default)]
+    pub last_pull_timestamp: i64,
+    #[serde(default)]
+    pub activity_push_cursor: i64,
+    #[serde(default)]
+    pub activity_pull_cursor: i64,
+    #[serde(default)]
+    pub report_pull_cursor: i64,
+    #[serde(default)]
+    pub summary_pull_cursor: i64,
+    #[serde(default)]
+    pub category_pull_cursor: i64,
+    #[serde(default)]
+    pub screenshot_push_cursor: i64,
+    #[serde(default)]
+    pub pending_screenshot_uploads: Vec<String>,
+    #[serde(default)]
+    pub pending_screenshot_downloads: Vec<String>,
+}
+
+fn default_sync_interval_minutes() -> u32 {
+    5
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            server_url: String::new(),
+            sync_token: String::new(),
+            device_id: String::new(),
+            device_name: String::new(),
+            sync_interval_minutes: default_sync_interval_minutes(),
+            sync_screenshots_mode: SyncScreenshotsMode::Full,
+            last_push_timestamp: 0,
+            last_pull_timestamp: 0,
+            activity_push_cursor: 0,
+            activity_pull_cursor: 0,
+            report_pull_cursor: 0,
+            summary_pull_cursor: 0,
+            category_pull_cursor: 0,
+            screenshot_push_cursor: 0,
+            pending_screenshot_uploads: Vec::new(),
+            pending_screenshot_downloads: Vec::new(),
+        }
+    }
+}
+
+impl SyncConfig {
+    /// 补齐不可变设备标识。调用方负责确认当前配置状态允许写盘。
+    pub fn ensure_device_identity(&mut self) -> bool {
+        if !self.device_id.trim().is_empty() {
+            if self.device_name.trim().is_empty() {
+                self.device_name = self.device_id.clone();
+                return true;
+            }
+            return false;
+        }
+
+        let hostname = hostname::get()
+            .ok()
+            .and_then(|value| value.into_string().ok())
+            .unwrap_or_else(|| "device".to_string());
+        let normalized: String = hostname
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-')
+            .take(32)
+            .collect();
+        let prefix = if normalized.is_empty() {
+            "device"
+        } else {
+            normalized.as_str()
+        };
+        let suffix = &uuid::Uuid::new_v4().simple().to_string()[..4];
+        self.device_id = format!("{prefix}-{suffix}");
+        if self.device_name.trim().is_empty() {
+            self.device_name = hostname;
+        }
+        true
+    }
+
+    pub fn normalize(&mut self) {
+        self.server_url = self.server_url.trim().trim_end_matches('/').to_string();
+        self.sync_token = self.sync_token.trim().to_string();
+        self.device_name = self.device_name.trim().to_string();
+        self.sync_interval_minutes = self.sync_interval_minutes.clamp(1, 1440);
+    }
+}
+
 pub const DEFAULT_LOCALHOST_API_PORT: u16 = 47_831;
 
 fn default_localhost_api_port() -> u16 {
@@ -928,6 +1046,12 @@ pub struct AppConfig {
     /// 远程存储配置（S3/MinIO 或 WebDAV）
     #[serde(default)]
     pub remote_storage: RemoteStorageConfig,
+    /// 自托管多设备同步配置
+    #[serde(default)]
+    pub sync: SyncConfig,
+    /// 概览、时间线与日报共用的设备筛选；None 表示全部设备
+    #[serde(default)]
+    pub ui_selected_device_id: Option<String>,
     /// 日报附加提示词
     #[serde(default)]
     pub daily_report_custom_prompt: String,
@@ -1252,6 +1376,8 @@ impl Default for AppConfig {
             deleted_default_semantic_categories: Vec::new(),
             storage: StorageConfig::default(),
             remote_storage: RemoteStorageConfig::default(),
+            sync: SyncConfig::default(),
+            ui_selected_device_id: None,
             daily_report_custom_prompt: String::new(),
             daily_report_prompt_presets: Vec::new(),
             daily_report_system_prompt_override: None,
@@ -1397,6 +1523,8 @@ impl AppConfig {
             normalize_optional_string(self.remote_storage.s3.public_url_base.take());
         self.remote_storage.webdav.public_url_base =
             normalize_optional_string(self.remote_storage.webdav.public_url_base.take());
+        self.sync.normalize();
+        self.ui_selected_device_id = normalize_optional_string(self.ui_selected_device_id.take());
         self.node_gateway.device_name =
             normalize_optional_string(self.node_gateway.device_name.take());
         self.sync_text_model_profiles();
@@ -2297,9 +2425,8 @@ mod tests {
         let original_bytes = b"old-config";
         std::fs::write(&path, original_bytes).expect("应写入原主配置");
 
-        let result = update_config_backup_with_sync(&path, |_| {
-            Err(io::Error::other("模拟父目录同步失败"))
-        });
+        let result =
+            update_config_backup_with_sync(&path, |_| Err(io::Error::other("模拟父目录同步失败")));
 
         assert!(result.is_ok());
         assert_eq!(

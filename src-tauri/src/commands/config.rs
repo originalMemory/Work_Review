@@ -278,11 +278,13 @@ pub async fn change_data_dir(
     // 重新获取锁，仅做轻量状态更新
     let mut state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
     state.database = Database::new(&target_dir.join("workreview.db"))?;
+    state.database.set_local_device_id(&config.sync.device_id);
     if let Err(e) = state.database.rebuild_fts_index() {
         log::warn!("迁移后 FTS 索引重建失败: {e}");
     }
     state.privacy_filter = PrivacyFilter::from_config(&config.privacy);
-    state.screenshot_service = ScreenshotService::new(&target_dir, &config.storage);
+    state.screenshot_service =
+        ScreenshotService::new(&target_dir, &config.storage, &config.sync.device_id);
     state.storage_manager = StorageManager::new(&target_dir, config.storage.clone());
     state.data_dir = target_dir.clone();
     state.config_path = config_path;
@@ -410,4 +412,3 @@ pub async fn open_data_dir(state: State<'_, Arc<Mutex<AppState>>>) -> Result<(),
 
     Ok(())
 }
-

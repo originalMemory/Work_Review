@@ -10,6 +10,7 @@
   import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
   import { cache, getLocalDate } from './lib/stores/cache.js';
   import { recordingStore } from './lib/stores/recording.js';
+  import { selectedDeviceId } from './lib/stores/deviceFilter.js';
   import { applyLocaleToDocument, initializeLocale, locale, t } from '$lib/i18n/index.js';
   import { preloadAppIcons } from './lib/stores/iconCache.js';
   import { runUpdateFlow } from './lib/utils/updater.js';
@@ -350,6 +351,7 @@
       try {
         config = await invoke('get_config');
         runtimeConfig = config;
+        selectedDeviceId.set(config.ui_selected_device_id || null);
         cache.setConfig(config);
         applyTheme(config.theme || 'system');
         applyUiVisualStyle(config.ui_visual_style || 'c');

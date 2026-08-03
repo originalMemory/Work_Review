@@ -343,14 +343,20 @@ mod tests {
             Some(("browser", "资料阅读"))
         );
         // 未知域名与带端口的本地地址不给出结论
-        assert_eq!(builtin_domain_category("https://unknown-site.example"), None);
+        assert_eq!(
+            builtin_domain_category("https://unknown-site.example"),
+            None
+        );
         assert_eq!(builtin_domain_category("http://localhost:5173/app"), None);
     }
 
     #[test]
     fn 应用知识库应覆盖硬编码链之外的常见应用() {
         assert_eq!(builtin_app_category("腾讯会议"), Some("communication"));
-        assert_eq!(builtin_app_category("jupyter notebook"), Some("development"));
+        assert_eq!(
+            builtin_app_category("jupyter notebook"),
+            Some("development")
+        );
         assert_eq!(builtin_app_category("剪映专业版"), Some("design"));
         assert_eq!(builtin_app_category("微信读书"), Some("entertainment"));
         assert_eq!(builtin_app_category("some unknown app"), None);

@@ -6,6 +6,8 @@
   import AppUsageChart from '../lib/components/AppUsageChart.svelte';
   import ActivityHourlyChart from '../lib/components/ActivityHourlyChart.svelte';
   import LocalizedDatePicker from '../lib/components/LocalizedDatePicker.svelte';
+  import DeviceFilter from '../lib/components/DeviceFilter.svelte';
+  import { selectedDeviceId } from '../lib/stores/deviceFilter.js';
   import { cache } from '../lib/stores/cache.js';
   import { recordingStore, isActiveRecording } from '../lib/stores/recording.js';
   import { confirm } from '../lib/stores/confirm.js';
@@ -181,6 +183,7 @@
         date: range.dateTo,
         dateFrom: range.dateFrom,
         dateTo: range.dateTo,
+        deviceId: $selectedDeviceId,
       });
       if (requestId === hourlyBreakdownRequestId) {
         hourlyAppBreakdown = breakdown;
@@ -207,6 +210,7 @@
       const totals = await invoke('get_range_daily_totals', {
         dateFrom: range.dateFrom,
         dateTo: range.dateTo,
+        deviceId: $selectedDeviceId,
       });
       if (requestId === rangeDailyRequestId) {
         rangeDailyTotals = totals;
@@ -240,6 +244,7 @@
       mode: 'date',
       dateFrom: baselineDate,
       dateTo: baselineDate,
+      deviceId: $selectedDeviceId,
     })
       .then((baseline) => {
         lastWeekStats = baseline;
@@ -824,6 +829,7 @@
       date: range.dateTo,
       dateFrom: range.dateFrom,
       dateTo: range.dateTo,
+      deviceId: $selectedDeviceId,
     };
   }
 
@@ -938,7 +944,7 @@
   }
 
   function shouldUseOverviewCache() {
-    return overviewMode === 'today';
+    return overviewMode === 'today' && !$selectedDeviceId;
   }
 
   function shouldAutoRefreshOverview() {
@@ -1066,8 +1072,9 @@
       mode: overviewMode,
       dateFrom: overviewMode === 'date' ? selectedDateFrom : undefined,
       dateTo: overviewMode === 'date' ? selectedDateTo : undefined,
+      deviceId: $selectedDeviceId,
     };
-    const paramsKey = `${params.mode}|${params.dateFrom || ''}|${params.dateTo || ''}`;
+    const paramsKey = `${params.mode}|${params.dateFrom || ''}|${params.dateTo || ''}|${params.deviceId || ''}`;
     // 仅当在途请求与当前模式/日期完全一致时才复用，避免切换模式后拿到旧模式数据
     if (overviewRefreshPromise && overviewRefreshKey === paramsKey) {
       return overviewRefreshPromise;
@@ -1228,6 +1235,18 @@
     window.addEventListener('activity-added', handleActivityAdded);
   });
 
+  let overviewDeviceReady = false;
+  $: if (overviewDeviceReady) {
+    $selectedDeviceId;
+    lastWeekStatsDate = null;
+    loadHourlyBreakdown();
+    loadRangeDailyTotals();
+    loadStats(true);
+  } else {
+    $selectedDeviceId;
+    overviewDeviceReady = true;
+  }
+
   $: if (overviewViewModeReady) {
     persistOverviewViewMode(APP_USAGE_VIEW_MODE_KEY, appUsageViewMode);
   }
@@ -1284,6 +1303,7 @@
     </div>
     <!-- 改版：原 overview-lead-card 模式切换整卡删除，分段切换（今天/本周/自定义）并入页头右侧一行 -->
     <div class="overview-command-deck">
+      <DeviceFilter />
       <button
         type="button"
         class="page-control-btn {overviewMode === 'today' ? 'page-control-btn-active' : ''}"

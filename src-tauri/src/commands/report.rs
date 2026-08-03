@@ -113,15 +113,27 @@ pub(crate) async fn generate_report_inner(
     app: &AppHandle,
     state: &Arc<Mutex<AppState>>,
 ) -> Result<String, AppError> {
+    generate_report_for_device_inner(date, force, locale, None, app, state).await
+}
+
+async fn generate_report_for_device_inner(
+    date: String,
+    force: Option<bool>,
+    locale: Option<String>,
+    device_id: Option<String>,
+    app: &AppHandle,
+    state: &Arc<Mutex<AppState>>,
+) -> Result<String, AppError> {
     let report_locale = AppLocale::from_option(locale.as_deref());
     let report_locale_code = report_locale.as_code();
     // 如果不是强制重新生成，先检查缓存
     if !force.unwrap_or(false) {
         let state_guard = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
-        if let Ok(Some(cached)) = state_guard
-            .database
-            .get_report(&date, Some(report_locale_code))
-        {
+        if let Ok(Some(cached)) = state_guard.database.get_report_for_device(
+            &date,
+            Some(report_locale_code),
+            device_id.as_deref(),
+        ) {
             log::info!("使用缓存日报: {date}");
             return Ok(cached.content);
         }
@@ -130,9 +142,16 @@ pub(crate) async fn generate_report_inner(
     let (config, stats, activities, data_dir) = {
         let state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
         let (ignored_apps, excluded_domains) = collect_privacy_filters(&state);
-        let stats = super::stats::load_daily_stats_for_overview(&state, &date)?;
+        let stats = super::stats::load_daily_stats_for_overview_device(
+            &state,
+            &date,
+            device_id.as_deref(),
+        )?;
         // 生成日报时获取最多 2000 条记录
-        let raw_activities = state.database.get_timeline(&date, Some(2000), None)?;
+        let raw_activities =
+            state
+                .database
+                .get_timeline_filtered(&date, Some(2000), None, device_id.as_deref())?;
         let activities =
             filter_activities_by_privacy(raw_activities, &ignored_apps, &excluded_domains);
         (
@@ -319,7 +338,9 @@ pub(crate) async fn generate_report_inner(
             fallback_reason: generated_report.fallback_reason.clone(),
             created_at: chrono::Utc::now().timestamp(),
         };
-        state.database.save_report(&daily_report)?;
+        state
+            .database
+            .save_report_for_device(&daily_report, device_id.as_deref().unwrap_or(""))?;
     }
 
     if let Some(ai_order) = generated_report.ai_order.clone() {
@@ -370,6 +391,7 @@ pub async fn generate_report(
     date: String,
     force: Option<bool>,
     locale: Option<String>,
+    device_id: Option<String>,
     app: AppHandle,
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<String, AppError> {
@@ -383,7 +405,7 @@ pub async fn generate_report(
     let _guard = ReportGenerationGuard {
         state: state.inner().clone(),
     };
-    generate_report_inner(date, force, locale, &app, state.inner()).await
+    generate_report_for_device_inner(date, force, locale, device_id, &app, state.inner()).await
 }
 
 /// 获取已保存的日报
@@ -392,18 +414,31 @@ pub(crate) fn get_saved_report_inner(
     locale: Option<String>,
     state: &Arc<Mutex<AppState>>,
 ) -> Result<Option<DailyReport>, AppError> {
+    get_saved_report_for_device_inner(date, locale, None, state)
+}
+
+fn get_saved_report_for_device_inner(
+    date: String,
+    locale: Option<String>,
+    device_id: Option<String>,
+    state: &Arc<Mutex<AppState>>,
+) -> Result<Option<DailyReport>, AppError> {
     let report_locale = AppLocale::from_option(locale.as_deref());
     let state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
-    let saved = state
-        .database
-        .get_report(&date, Some(report_locale.as_code()))?;
+    let saved = state.database.get_report_for_device(
+        &date,
+        Some(report_locale.as_code()),
+        device_id.as_deref(),
+    )?;
     let Some(mut report) = saved else {
         return Ok(None);
     };
 
     // 用最新的 stats 重新渲染统计区块，解决 issue #80：保存的 markdown 里固化的时长
     // 数字会随着工作日继续推进而变得陈旧。老报告若没有占位符标记则原样返回。
-    if let Ok(live_stats) = super::stats::load_daily_stats_for_overview(&state, &date) {
+    if let Ok(live_stats) =
+        super::stats::load_daily_stats_for_overview_device(&state, &date, device_id.as_deref())
+    {
         let category_name_overrides: std::collections::HashMap<String, String> = state
             .config
             .custom_categories
@@ -432,9 +467,10 @@ pub(crate) fn get_saved_report_inner(
 pub async fn get_saved_report(
     date: String,
     locale: Option<String>,
+    device_id: Option<String>,
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<Option<DailyReport>, AppError> {
-    get_saved_report_inner(date, locale, state.inner())
+    get_saved_report_for_device_inner(date, locale, device_id, state.inner())
 }
 
 /// 更新已保存日报的内容（用于结构化编辑）
@@ -443,6 +479,7 @@ pub async fn update_report_content(
     date: String,
     locale: Option<String>,
     content: String,
+    device_id: Option<String>,
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<(), AppError> {
     let report_locale = AppLocale::from_option(locale.as_deref());
@@ -450,7 +487,7 @@ pub async fn update_report_content(
     let state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
     let existing = state
         .database
-        .get_report(&date, Some(locale_code))?
+        .get_report_for_device(&date, Some(locale_code), device_id.as_deref())?
         .ok_or_else(|| {
             AppError::Database(rusqlite::Error::InvalidParameterName(
                 "报告不存在".to_string(),
@@ -460,7 +497,9 @@ pub async fn update_report_content(
         content,
         ..existing
     };
-    state.database.save_report(&updated)?;
+    state
+        .database
+        .save_report_for_device(&updated, device_id.as_deref().unwrap_or(""))?;
     Ok(())
 }
 
@@ -516,9 +555,9 @@ fn ensure_export_dir_components_safe(canonical: &Path) -> Result<(), AppError> {
 /// 导出目录可由本地 API 请求方或前端传入，写入前必须校验，防止向 .ssh、
 /// LaunchAgents 等位置写文件。返回规范化（已解析符号链接）后的路径。
 pub(crate) fn validate_export_dir(dir: &Path) -> Result<PathBuf, AppError> {
-    let canonical = dir.canonicalize().map_err(|_| {
-        AppError::Config("导出目录不存在或无法访问，请先创建该目录".to_string())
-    })?;
+    let canonical = dir
+        .canonicalize()
+        .map_err(|_| AppError::Config("导出目录不存在或无法访问，请先创建该目录".to_string()))?;
     if !canonical.is_dir() {
         return Err(AppError::Config("导出路径必须是已存在的目录".to_string()));
     }
@@ -597,8 +636,22 @@ fn ensure_iso_date(value: &str, field: &str) -> Result<(), AppError> {
 /// [标题, 日期范围, 导出时间, 日报数量, 语言, 冒号]
 fn range_export_scaffold_labels(locale: AppLocale) -> [&'static str; 6] {
     match locale {
-        AppLocale::ZhCn => ["工作日报合并导出", "日期范围", "导出时间", "日报数量", "语言", "："],
-        AppLocale::ZhTw => ["工作日報合併導出", "日期範圍", "導出時間", "日報數量", "語言", "："],
+        AppLocale::ZhCn => [
+            "工作日报合并导出",
+            "日期范围",
+            "导出时间",
+            "日报数量",
+            "语言",
+            "：",
+        ],
+        AppLocale::ZhTw => [
+            "工作日報合併導出",
+            "日期範圍",
+            "導出時間",
+            "日報數量",
+            "語言",
+            "：",
+        ],
         AppLocale::En => [
             "Merged Daily Reports Export",
             "Date range",
@@ -645,12 +698,8 @@ pub(crate) fn export_reports_range_inner(
         return Err(AppError::Config("起始日期不能晚于结束日期".to_string()));
     }
 
-    let report_locale = AppLocale::from_option(
-        locale
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty()),
-    );
+    let report_locale =
+        AppLocale::from_option(locale.as_deref().map(str::trim).filter(|s| !s.is_empty()));
     let locale_code = report_locale.as_code();
 
     let reports = {
@@ -715,8 +764,6 @@ pub struct ExportReportsRangeResult {
     pub path: String,
     pub count: usize,
 }
-
-
 
 #[cfg(test)]
 mod tests {
@@ -804,16 +851,17 @@ mod tests {
     fn 导出目录组件校验应拦截隐藏目录与自启动目录() {
         use super::ensure_export_dir_components_safe;
 
-        assert!(ensure_export_dir_components_safe(Path::new("/Users/demo/Documents/reports"))
-            .is_ok());
+        assert!(
+            ensure_export_dir_components_safe(Path::new("/Users/demo/Documents/reports")).is_ok()
+        );
         assert!(ensure_export_dir_components_safe(Path::new("/Users/demo/.ssh")).is_err());
         assert!(
             ensure_export_dir_components_safe(Path::new("/home/demo/.config/autostart")).is_err()
         );
-        assert!(ensure_export_dir_components_safe(Path::new(
-            "/Users/demo/Library/LaunchAgents"
-        ))
-        .is_err());
+        assert!(
+            ensure_export_dir_components_safe(Path::new("/Users/demo/Library/LaunchAgents"))
+                .is_err()
+        );
         assert!(ensure_export_dir_components_safe(Path::new(
             "/Users/demo/Library/LaunchDaemons/sub"
         ))
@@ -829,10 +877,8 @@ mod tests {
     fn 导出目录必须已存在() {
         use super::validate_export_dir;
 
-        assert!(validate_export_dir(Path::new(
-            "/nonexistent-work-review-export-dir-a1b2c3"
-        ))
-        .is_err());
+        assert!(
+            validate_export_dir(Path::new("/nonexistent-work-review-export-dir-a1b2c3")).is_err()
+        );
     }
-
 }

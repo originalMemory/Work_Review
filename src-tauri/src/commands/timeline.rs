@@ -16,8 +16,21 @@ pub(crate) fn get_timeline_inner(
     offset: Option<u32>,
     state: &Arc<Mutex<AppState>>,
 ) -> Result<Vec<Activity>, AppError> {
+    get_timeline_filtered_inner(date, limit, offset, None, state)
+}
+
+fn get_timeline_filtered_inner(
+    date: String,
+    limit: Option<u32>,
+    offset: Option<u32>,
+    device_id: Option<String>,
+    state: &Arc<Mutex<AppState>>,
+) -> Result<Vec<Activity>, AppError> {
     let state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
-    let activities = state.database.get_timeline(&date, limit, offset)?;
+    let activities =
+        state
+            .database
+            .get_timeline_filtered(&date, limit, offset, device_id.as_deref())?;
     let (ignored_apps, excluded_domains) = collect_privacy_filters(&state);
     let filtered = filter_activities_by_privacy(activities, &ignored_apps, &excluded_domains);
 
@@ -39,9 +52,10 @@ pub async fn get_timeline(
     date: String,
     limit: Option<u32>,
     offset: Option<u32>,
+    device_id: Option<String>,
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<Vec<Activity>, AppError> {
-    get_timeline_inner(date, limit, offset, state.inner())
+    get_timeline_filtered_inner(date, limit, offset, device_id, state.inner())
 }
 
 /// 获取单个活动（用于刷新详情页，获取最新 OCR 结果）
@@ -142,5 +156,3 @@ pub async fn get_screenshot_full(
         .screenshot_service
         .generate_full_image_base64(&full_path)
 }
-
-

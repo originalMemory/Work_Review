@@ -3985,9 +3985,10 @@ fn find_focused_sway_node(value: &Value) -> Option<&Value> {
         .get("focused")
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
-        && (value.get("pid").is_some() || value.get("app_id").is_some()) {
-            return Some(value);
-        }
+        && (value.get("pid").is_some() || value.get("app_id").is_some())
+    {
+        return Some(value);
+    }
 
     for key in ["nodes", "floating_nodes"] {
         if let Some(nodes) = value.get(key).and_then(|v| v.as_array()) {

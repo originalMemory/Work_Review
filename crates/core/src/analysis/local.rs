@@ -44,7 +44,13 @@ fn empty_value(locale: AppLocale) -> &'static str {
 }
 
 fn join_list(locale: AppLocale, items: Vec<String>) -> String {
-    items.join(if locale == AppLocale::En { ", " } else if locale == AppLocale::Ar { "، " } else { "、" })
+    items.join(if locale == AppLocale::En {
+        ", "
+    } else if locale == AppLocale::Ar {
+        "، "
+    } else {
+        "、"
+    })
 }
 
 /// 本地多模态分析器
@@ -359,9 +365,7 @@ Do not add any extra preface or explanation."#,
             AppLocale::En => {
                 "Briefly describe what work is shown in this screenshot in under 50 words."
             }
-            AppLocale::Ar => {
-                "صف بإيجاز العمل الموضح في هذه اللقطة في أقل من 50 كلمة."
-            }
+            AppLocale::Ar => "صف بإيجاز العمل الموضح في هذه اللقطة في أقل من 50 كلمة.",
         };
 
         let response = self
@@ -436,8 +440,7 @@ impl Analyzer for LocalAnalyzer {
                             .to_string()
                     }
                     AppLocale::Ar => {
-                        "فشل طلب الذكاء الاصطناعي، لذا رجع التقرير إلى القالب الأساسي"
-                            .to_string()
+                        "فشل طلب الذكاء الاصطناعي، لذا رجع التقرير إلى القالب الأساسي".to_string()
                     }
                 });
                 let apps_list = join_list(
@@ -570,7 +573,9 @@ impl Analyzer for LocalAnalyzer {
                             section_count,
                             "تقييم التركيز",
                         ));
-                        report.push_str("يبدو الإيقاع العام مستقراً اليوم، وظل سير العمل متسقاً بشكل معقول.\n");
+                        report.push_str(
+                            "يبدو الإيقاع العام مستقراً اليوم، وظل سير العمل متسقاً بشكل معقول.\n",
+                        );
                         section_count += 1;
                         report.push('\n');
                         report.push_str(&format_section_heading(

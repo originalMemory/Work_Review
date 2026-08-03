@@ -27,6 +27,13 @@
   let s3SecretKeyVisible = false;
   let s3AccessKeyVisible = false;
   let webdavPasswordVisible = false;
+  let isSyncing = false;
+  let syncIntervalLabel = '';
+  const syncScreenshotsModes = [
+    { value: 'full', labelKey: 'settingsStorage.syncScreenshotsFull' },
+    { value: 'thumbnail', labelKey: 'settingsStorage.syncScreenshotsThumbnail' },
+    { value: 'none', labelKey: 'settingsStorage.syncScreenshotsNone' },
+  ];
   const screenshotModes = [
     {
       value: 'active_window',
@@ -209,6 +216,25 @@
     }
   }
 
+  function formatSyncTime(timestamp) {
+    return timestamp > 0 ? new Date(timestamp * 1000).toLocaleString() : t('settingsStorage.syncNever');
+  }
+
+  async function triggerSyncNow() {
+    isSyncing = true;
+    try {
+      const result = await invoke('sync_now');
+      const latest = await invoke('get_config');
+      config = latest;
+      cache.setConfig(latest);
+      showToast(t('settingsStorage.syncSuccess', { pushed: result.pushed, pulled: result.pulled }), 'success');
+    } catch (e) {
+      showToast(t('settingsStorage.syncFailed', { error: e }), 'error');
+    } finally {
+      isSyncing = false;
+    }
+  }
+
   // 计算存储使用百分比
   $: usagePercent = storageStats 
     ? Math.min(Math.round((storageStats.total_size_mb / storageStats.storage_limit_mb) * 100), 100) 
@@ -223,6 +249,7 @@
     retentionDaysLabel = t('settingsStorage.daysValue', { count: config?.storage?.screenshot_retention_days ?? 0 });
     keepForever = config?.storage?.screenshot_retention_days === 0;
     storageRetentionLabel = t('settingsStorage.daysValue', { count: storageStats?.retention_days ?? 0 });
+    syncIntervalLabel = t('settingsStorage.syncIntervalValue', { count: config?.sync?.sync_interval_minutes ?? 5 });
   }
   $: if (cleanupCandidateDir && cleanupCandidateDir === dataDir) {
     cleanupCandidateDir = '';
@@ -231,6 +258,27 @@
     if (!config.remote_storage) config.remote_storage = { provider: 'none', s3: {}, webdav: {} };
     if (!config.remote_storage.s3) config.remote_storage.s3 = {};
     if (!config.remote_storage.webdav) config.remote_storage.webdav = {};
+    if (!config.sync) {
+      config.sync = {
+        enabled: false,
+        server_url: '',
+        sync_token: '',
+        device_id: '',
+        device_name: '',
+        sync_interval_minutes: 5,
+        sync_screenshots_mode: 'full',
+        last_push_timestamp: 0,
+        last_pull_timestamp: 0,
+        activity_push_cursor: 0,
+        activity_pull_cursor: 0,
+        report_pull_cursor: 0,
+        summary_pull_cursor: 0,
+        category_pull_cursor: 0,
+        screenshot_push_cursor: 0,
+        pending_screenshot_uploads: [],
+        pending_screenshot_downloads: [],
+      };
+    }
   }
 </script>
 
@@ -816,6 +864,72 @@
     {/if}
   </div>
 </CollapsibleSection>
+
+<!-- 多设备同步 -->
+<div class="settings-card mb-5" data-locale={currentLocale}>
+  <h3 class="settings-card-title">{t('settingsStorage.syncTitle')}</h3>
+  <p class="settings-card-desc">{t('settingsStorage.syncDesc')}</p>
+
+  <div class="settings-section">
+    <div class="settings-row">
+      <div>
+        <span class="settings-text">{t('settingsStorage.syncEnabled')}</span>
+        <p class="settings-muted mt-0.5">{t('settingsStorage.syncEnabledHint')}</p>
+      </div>
+      <button type="button" class="switch-track {config.sync.enabled ? 'bg-emerald-500' : 'bg-slate-300 dark:bg-[#484f58]'}" role="switch" aria-checked={config.sync.enabled} on:click={() => { config.sync.enabled = !config.sync.enabled; handleChange(); }}>
+        <span class="switch-thumb {config.sync.enabled ? 'translate-x-5' : 'translate-x-0'}"></span>
+      </button>
+    </div>
+
+    <div class="settings-block grid gap-3 sm:grid-cols-2">
+      <label class="settings-text">{t('settingsStorage.syncServerUrl')}
+        <input type="url" bind:value={config.sync.server_url} on:change={handleChange} placeholder="https://sync.example.com" class="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm dark:border-[#484f58] dark:bg-[#21262d] dark:text-white" />
+      </label>
+      <label class="settings-text">{t('settingsStorage.syncToken')}
+        <input type="password" bind:value={config.sync.sync_token} on:change={handleChange} class="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm dark:border-[#484f58] dark:bg-[#21262d] dark:text-white" />
+      </label>
+    </div>
+
+    <div class="settings-block grid gap-3 sm:grid-cols-2">
+      <div>
+        <p class="settings-text">{t('settingsStorage.syncDeviceId')}</p>
+        <p class="settings-muted mt-1 break-all text-xs">{config.sync.device_id || '—'}</p>
+      </div>
+      <label class="settings-text">{t('settingsStorage.syncDeviceName')}
+        <input type="text" bind:value={config.sync.device_name} on:change={handleChange} class="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm dark:border-[#484f58] dark:bg-[#21262d] dark:text-white" />
+      </label>
+    </div>
+
+    <div class="settings-block">
+      <div class="flex items-center justify-between">
+        <label for="sync-interval" class="settings-text">{t('settingsStorage.syncInterval')}</label>
+        <span class="settings-value">{syncIntervalLabel}</span>
+      </div>
+      <input id="sync-interval" type="range" min="1" max="60" step="1" bind:value={config.sync.sync_interval_minutes} on:change={handleChange} class="range-input" />
+    </div>
+
+    <div class="settings-block">
+      <p class="settings-text mb-2">{t('settingsStorage.syncScreenshotsMode')}</p>
+      <div class="flex gap-2">
+        {#each syncScreenshotsModes as mode}
+          <button type="button" class="flex-1 rounded-lg px-3 py-2 text-sm {config.sync.sync_screenshots_mode === mode.value ? 'settings-segment-active' : 'settings-segment-base'}" on:click={() => { config.sync.sync_screenshots_mode = mode.value; handleChange(); }}>
+            {t(mode.labelKey)}
+          </button>
+        {/each}
+      </div>
+    </div>
+
+    <div class="settings-block rounded-2xl border border-slate-200/80 bg-slate-50/90 p-4 dark:border-[#30363d]/80 dark:bg-[#21262d]/40">
+      <div class="mb-4 grid gap-3 sm:grid-cols-2">
+        <p class="settings-muted">{t('settingsStorage.syncLastPush')}: {formatSyncTime(config.sync.last_push_timestamp)}</p>
+        <p class="settings-muted">{t('settingsStorage.syncLastPull')}: {formatSyncTime(config.sync.last_pull_timestamp)}</p>
+      </div>
+      <button type="button" class="settings-action-secondary" disabled={isSyncing || !config.sync.enabled || !config.sync.server_url} on:click={triggerSyncNow}>
+        {isSyncing ? t('settingsStorage.syncSyncing') : t('settingsStorage.syncNow')}
+      </button>
+    </div>
+  </div>
+</div>
 
 <div class="settings-card mb-5" data-locale={currentLocale}>
   <h3 class="settings-card-title">{t('settingsStorage.dataDirTitle')}</h3>

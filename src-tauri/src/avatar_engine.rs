@@ -195,7 +195,7 @@ pub fn derive_avatar_state_with_rules(
             avatar_opacity: AVATAR_OPACITY_DEFAULT,
             avatar_preset: AVATAR_PRESET_DEFAULT.to_string(),
             avatar_persona: "assistant".to_string(),
-        avatar_body_hidden: false,
+            avatar_body_hidden: false,
         };
     }
 
@@ -210,7 +210,7 @@ pub fn derive_avatar_state_with_rules(
             avatar_opacity: AVATAR_OPACITY_DEFAULT,
             avatar_preset: AVATAR_PRESET_DEFAULT.to_string(),
             avatar_persona: "assistant".to_string(),
-        avatar_body_hidden: false,
+            avatar_body_hidden: false,
         };
     }
 
@@ -430,7 +430,8 @@ pub fn sync_avatar_window(
             };
             let effective_position =
                 remembered_avatar_position(had_existing_window, current_position, saved_position);
-            let (x, y) = default_avatar_position(app, normalized_scale, effective_position, body_hidden);
+            let (x, y) =
+                default_avatar_position(app, normalized_scale, effective_position, body_hidden);
             resize_avatar_window(&window, normalized_scale, expanded, body_hidden);
             let _ = window.set_always_on_top(true);
             let _ = window.set_visible_on_all_workspaces(true);
@@ -663,7 +664,14 @@ fn monitor_bounds_for_point(app: &AppHandle, x: i32, y: i32) -> Option<Rect> {
             width: size.width as i32,
             height: size.height as i32,
         };
-        if point_in_rect(x as i64, y as i64, bounds.x as i64, bounds.y as i64, bounds.width as i64, bounds.height as i64) {
+        if point_in_rect(
+            x as i64,
+            y as i64,
+            bounds.x as i64,
+            bounds.y as i64,
+            bounds.width as i64,
+            bounds.height as i64,
+        ) {
             let work_area = monitor.work_area();
             return Some(Rect {
                 x: work_area.position.x,
@@ -1174,8 +1182,13 @@ mod tests {
         let saved = (2200, 800);
         let (compact_w, compact_h) = avatar_window_size(0.9, false, false);
 
-        let (x, y) =
-            clamp_avatar_position_with_size(secondary_bounds, saved.0, saved.1, compact_w, compact_h);
+        let (x, y) = clamp_avatar_position_with_size(
+            secondary_bounds,
+            saved.0,
+            saved.1,
+            compact_w,
+            compact_h,
+        );
 
         // 仍在副屏内（x >= 1440），且未被错误地拉回主屏原点附近
         assert!(
@@ -1203,7 +1216,10 @@ mod tests {
             clamp_avatar_position_with_size(primary_bounds, saved.0, saved.1, compact_w, compact_h);
 
         // 用主屏 bounds 时副屏 x=2200 会被钳到主屏右边缘 —— 这是要避免的行为
-        assert_eq!(x, primary_bounds.x + primary_bounds.width - compact_w as i32);
+        assert_eq!(
+            x,
+            primary_bounds.x + primary_bounds.width - compact_w as i32
+        );
         assert_ne!((x, y), saved);
     }
 
@@ -1222,6 +1238,12 @@ mod tests {
         let (x, y) = resolve_avatar_position(fallback_bounds, None, Some(orphan_saved), 0.9, false);
 
         let (w, h) = avatar_window_size(0.9, false, false);
-        assert_eq!((x, y), (fallback_bounds.x + fallback_bounds.width - w as i32, fallback_bounds.y + fallback_bounds.height - h as i32));
+        assert_eq!(
+            (x, y),
+            (
+                fallback_bounds.x + fallback_bounds.width - w as i32,
+                fallback_bounds.y + fallback_bounds.height - h as i32
+            )
+        );
     }
 }

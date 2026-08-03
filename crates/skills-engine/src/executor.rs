@@ -88,14 +88,18 @@ impl SkillExecutor {
             .iter()
             .any(|t| matches!(t, TransformStep::Script { .. }));
         if has_script_step && !ctx.allow_script_skills {
-            log::warn!("技能 {skill_id} 包含 Script 步骤，未获得 allow_script_skills 授权，已拒绝执行");
+            log::warn!(
+                "技能 {skill_id} 包含 Script 步骤，未获得 allow_script_skills 授权，已拒绝执行"
+            );
             return ExecutionResult {
                 skill_id: skill_id.to_string(),
                 output: String::new(),
                 content_type: OutputContentType::Text,
                 duration_ms: start.elapsed().as_millis() as u64,
                 success: false,
-                error: Some(format!("技能包含未授权的 Script 步骤，已拒绝执行: {skill_id}")),
+                error: Some(format!(
+                    "技能包含未授权的 Script 步骤，已拒绝执行: {skill_id}"
+                )),
             };
         }
 

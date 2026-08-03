@@ -401,7 +401,13 @@ pub fn generate_hourly_activity_summary_for_locale(
     });
 
     let (peak_hour, peak_duration) = active_buckets[0];
-    let separator = if locale == AppLocale::En { ", " } else if locale == AppLocale::Ar { "، " } else { "、" };
+    let separator = if locale == AppLocale::En {
+        ", "
+    } else if locale == AppLocale::Ar {
+        "، "
+    } else {
+        "、"
+    };
     let top_ranges = active_buckets
         .iter()
         .take(3)
@@ -492,7 +498,10 @@ pub fn generate_stats_summary_for_locale(
                 "- إجمالي وقت العمل: {}\n",
                 format_duration_for_locale(stats.total_duration, locale)
             ));
-            summary.push_str(&format!("- عدد لقطات الشاشة: {}\n\n", stats.screenshot_count));
+            summary.push_str(&format!(
+                "- عدد لقطات الشاشة: {}\n\n",
+                stats.screenshot_count
+            ));
             summary.push_str("### استخدام التطبيقات\n\n");
         }
     }

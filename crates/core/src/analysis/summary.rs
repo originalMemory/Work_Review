@@ -51,7 +51,13 @@ fn empty_value(locale: AppLocale) -> &'static str {
 }
 
 fn join_list(locale: AppLocale, items: Vec<String>) -> String {
-    items.join(if locale == AppLocale::En { ", " } else if locale == AppLocale::Ar { "، " } else { "、" })
+    items.join(if locale == AppLocale::En {
+        ", "
+    } else if locale == AppLocale::Ar {
+        "، "
+    } else {
+        "、"
+    })
 }
 
 fn ai_system_prompt(locale: AppLocale) -> &'static str {
@@ -79,10 +85,7 @@ fn empty_ai_fallback_reason(locale: AppLocale) -> String {
             "the model returned empty content, so the report fell back to the base template"
                 .to_string()
         }
-        AppLocale::Ar => {
-            "عاد النموذج بمحتوى فارغ، لذا رجع التقرير إلى القالب الأساسي"
-                .to_string()
-        }
+        AppLocale::Ar => "عاد النموذج بمحتوى فارغ، لذا رجع التقرير إلى القالب الأساسي".to_string(),
     }
 }
 

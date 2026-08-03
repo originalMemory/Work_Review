@@ -20,6 +20,40 @@ fn walk_dir_recursive(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// 同时兼容旧的 screenshots/{date} 与多设备 screenshots/{device}/{date}。
+fn screenshot_date_dirs(root: &Path) -> Result<Vec<(NaiveDate, PathBuf)>> {
+    let mut result = Vec::new();
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        if let Some(date) = name
+            .to_str()
+            .and_then(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d").ok())
+        {
+            result.push((date, path));
+            continue;
+        }
+        for child in fs::read_dir(&path)? {
+            let child = child?;
+            if !child.path().is_dir() {
+                continue;
+            }
+            if let Some(date) = child
+                .file_name()
+                .to_str()
+                .and_then(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d").ok())
+            {
+                result.push((date, child.path()));
+            }
+        }
+    }
+    Ok(result)
+}
+
 /// 存储管理器
 /// 负责清理过期的截图和数据
 pub struct StorageManager {
@@ -86,29 +120,14 @@ impl StorageManager {
             - Duration::days(self.config.screenshot_retention_days as i64);
         let mut deleted_count = 0u32;
 
-        // 遍历日期目录
-        for entry in fs::read_dir(&screenshots_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-
-            if path.is_dir() {
-                // 目录名格式: YYYY-MM-DD
-                if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
-                    if let Ok(date) = NaiveDate::parse_from_str(dir_name, "%Y-%m-%d") {
-                        if date < cutoff_date {
-                            // 删除整个目录
-                            match fs::remove_dir_all(&path) {
-                                Ok(_) => {
-                                    // 统计删除的文件数
-                                    deleted_count += 1;
-                                    log::info!("已删除过期截图目录: {dir_name}");
-                                }
-                                Err(e) => {
-                                    log::warn!("删除目录失败 {dir_name}: {e}");
-                                }
-                            }
-                        }
+        for (date, path) in screenshot_date_dirs(&screenshots_dir)? {
+            if date < cutoff_date {
+                match fs::remove_dir_all(&path) {
+                    Ok(_) => {
+                        deleted_count += 1;
+                        log::info!("已删除过期截图目录: {}", path.display());
                     }
+                    Err(e) => log::warn!("删除目录失败 {}: {e}", path.display()),
                 }
             }
         }
@@ -171,17 +190,7 @@ impl StorageManager {
         let mut deleted_count = 0u32;
 
         // 收集所有日期目录并排序
-        let mut date_dirs: Vec<_> = fs::read_dir(&screenshots_dir)?
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().is_dir())
-            .filter_map(|e| {
-                e.path()
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
-                    .map(|date| (date, e.path()))
-            })
-            .collect();
+        let mut date_dirs = screenshot_date_dirs(&screenshots_dir)?;
 
         // 按日期升序排序（最旧的在前）
         date_dirs.sort_by_key(|(date, _)| *date);
@@ -274,4 +283,26 @@ pub struct StorageStats {
     pub total_size_mb: f64,
     pub storage_limit_mb: u32,
     pub retention_days: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::screenshot_date_dirs;
+
+    #[test]
+    fn screenshot_date_dirs_supports_legacy_and_device_layouts() {
+        let root =
+            std::env::temp_dir().join(format!("work-review-storage-layout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("2026-08-02")).expect("创建旧目录失败");
+        std::fs::create_dir_all(root.join("device-a").join("2026-08-03"))
+            .expect("创建设备目录失败");
+
+        let mut dates = screenshot_date_dirs(&root).expect("读取截图日期目录失败");
+        dates.sort_by_key(|(date, _)| *date);
+        assert_eq!(dates.len(), 2);
+        assert_eq!(dates[0].0.to_string(), "2026-08-02");
+        assert_eq!(dates[1].0.to_string(), "2026-08-03");
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

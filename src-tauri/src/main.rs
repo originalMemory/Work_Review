@@ -33,6 +33,7 @@ mod remote_upload;
 mod screen_lock;
 mod screenshot;
 mod storage;
+mod sync;
 mod telegram_bot;
 mod wecom_bot;
 mod work_intelligence;
@@ -321,7 +322,11 @@ pub(crate) fn refresh_tray_menu(app: &AppHandle) {
     let _ = tray_menu.show.set_text(tray_label("show", &locale));
     let _ = tray_menu
         .recording_toggle
-        .set_text(tray_recording_toggle_label(is_recording, is_paused, &locale));
+        .set_text(tray_recording_toggle_label(
+            is_recording,
+            is_paused,
+            &locale,
+        ));
     let _ = tray_menu
         .lightweight_mode
         .set_text(tray_label("lightweight", &locale));
@@ -346,7 +351,9 @@ async fn set_app_locale(
         _ => "zh-CN",
     };
     let config = {
-        let mut s = state.lock().map_err(|e| crate::error::AppError::Unknown(e.to_string()))?;
+        let mut s = state
+            .lock()
+            .map_err(|e| crate::error::AppError::Unknown(e.to_string()))?;
         s.config.locale = normalized.to_string();
         s.config.clone()
     };
@@ -1081,7 +1088,11 @@ pub(crate) fn resolve_activity_classification(
             .ok()
             .and_then(|m| m.get(&cache_key).cloned());
         if let Some((cached_base, semantic)) = cached {
-            if config.custom_categories.iter().any(|c| c.key == cached_base) {
+            if config
+                .custom_categories
+                .iter()
+                .any(|c| c.key == cached_base)
+            {
                 base_category = cached_base;
                 cached_semantic = Some(semantic);
             }
@@ -3526,8 +3537,7 @@ async fn remote_upload_backfill_task(state: Arc<Mutex<AppState>>) {
             if !local_path.exists() {
                 continue; // 本地文件已被保留策略清理，无从补传
             }
-            match remote_upload::upload_screenshot(&remote_cfg, &local_path, &relative_path).await
-            {
+            match remote_upload::upload_screenshot(&remote_cfg, &local_path, &relative_path).await {
                 Ok(url) => {
                     let updated = {
                         let guard = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -3537,9 +3547,9 @@ async fn remote_upload_backfill_task(state: Arc<Mutex<AppState>>) {
                     };
                     match updated {
                         Ok(()) => uploaded += 1,
-                        Err(e) => log::warn!(
-                            "补传后写回 screenshot_url 失败（活动 {activity_id}）: {e}"
-                        ),
+                        Err(e) => {
+                            log::warn!("补传后写回 screenshot_url 失败（活动 {activity_id}）: {e}")
+                        }
                     }
                 }
                 Err(e) => log::warn!("补传截图失败（活动 {activity_id}）: {e}"),
@@ -3560,9 +3570,8 @@ async fn remote_upload_backfill_task(state: Arc<Mutex<AppState>>) {
 /// 采集循环里的 resolve_activity_classification 只读查询。
 pub(crate) fn entity_category_cache(
 ) -> &'static std::sync::RwLock<std::collections::HashMap<String, (String, String)>> {
-    static CACHE: OnceCell<
-        std::sync::RwLock<std::collections::HashMap<String, (String, String)>>,
-    > = OnceCell::new();
+    static CACHE: OnceCell<std::sync::RwLock<std::collections::HashMap<String, (String, String)>>> =
+        OnceCell::new();
     CACHE.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
 }
 
@@ -3744,7 +3753,9 @@ async fn entity_classify_task(state: Arc<Mutex<AppState>>) {
             let app_lower = app.to_lowercase();
             let key = format!("app:{app_lower}");
             if cached_keys.contains(&key)
-                || app_rule_names.iter().any(|r| app_lower.contains(r.as_str()))
+                || app_rule_names
+                    .iter()
+                    .any(|r| app_lower.contains(r.as_str()))
             {
                 continue;
             }
@@ -3814,7 +3825,9 @@ async fn entity_classify_task(state: Arc<Mutex<AppState>>) {
 
             let persisted = {
                 let guard = state.lock().unwrap_or_else(|e| e.into_inner());
-                guard.database.upsert_entity_category(&key, &base, &semantic)
+                guard
+                    .database
+                    .upsert_entity_category(&key, &base, &semantic)
             };
             if let Err(e) = persisted {
                 log::warn!("写入实体分类缓存失败({key}): {e}");
@@ -3969,6 +3982,13 @@ async fn main() {
     #[allow(unused_mut)]
     let mut config = load_result.config;
 
+    // 设备标识会进入数据库与截图路径。故障恢复模式禁止自动写盘，避免覆盖现场。
+    if config_load_status.allows_automatic_save() && config.sync.ensure_device_identity() {
+        if let Err(e) = config.save(&config_path) {
+            log::warn!("保存首次生成的设备标识失败: {e}");
+        }
+    }
+
     // 清理历史遗留的钥匙串占位符（该机制已移除）
     clear_legacy_keychain_placeholders(&mut config);
 
@@ -3985,6 +4005,13 @@ async fn main() {
     // 初始化数据库
     let db_path = data_dir.join("workreview.db");
     let database = Database::new(&db_path).expect("初始化数据库失败");
+    database.set_local_device_id(&config.sync.device_id);
+    if let Err(e) = database.backfill_local_device_id(&config.sync.device_id) {
+        log::warn!("回填历史数据设备标识失败: {e}");
+    }
+    if let Err(e) = database.migrate_screenshots_to_device_dir(&data_dir, &config.sync.device_id) {
+        log::warn!("迁移历史截图目录失败: {e}");
+    }
 
     // 版本变化检测（首次启动同样视为变化）：FTS 重建门控与下方录屏权限引导复用
     let current_version = env!("CARGO_PKG_VERSION").to_string();
@@ -4017,7 +4044,8 @@ async fn main() {
     let privacy_filter = PrivacyFilter::from_config(&config.privacy);
 
     // 初始化截屏服务
-    let screenshot_service = ScreenshotService::new(&data_dir, &config.storage);
+    let screenshot_service =
+        ScreenshotService::new(&data_dir, &config.storage, &config.sync.device_id);
 
     // 版本更新后重置 macOS 录屏权限引导标记，确保更新后能重新弹窗
     if is_version_changed {
@@ -4237,6 +4265,7 @@ async fn main() {
             let state_clone4 = state.inner().clone();
             let state_clone5 = state.inner().clone();
             let state_clone6 = state.inner().clone();
+            let state_clone7 = state.inner().clone();
             let state_for_tray = state.inner().clone();
             let app_handle = app.handle().clone();
             let screenshot_app_handle = app.handle().clone();
@@ -4311,14 +4340,18 @@ async fn main() {
                 tray_recording_toggle_label(true, false, &tray_locale),
             )
             .build(app)?;
-            let lightweight_mode =
-                CheckMenuItemBuilder::with_id(TRAY_MENU_LIGHTWEIGHT_MODE_ID, tray_label("lightweight", &tray_locale))
-                    .checked(false)
-                    .build(app)?;
-            let avatar_toggle =
-                CheckMenuItemBuilder::with_id(TRAY_MENU_AVATAR_TOGGLE_ID, tray_label("avatar", &tray_locale))
-                    .checked(avatar_enabled)
-                    .build(app)?;
+            let lightweight_mode = CheckMenuItemBuilder::with_id(
+                TRAY_MENU_LIGHTWEIGHT_MODE_ID,
+                tray_label("lightweight", &tray_locale),
+            )
+            .checked(false)
+            .build(app)?;
+            let avatar_toggle = CheckMenuItemBuilder::with_id(
+                TRAY_MENU_AVATAR_TOGGLE_ID,
+                tray_label("avatar", &tray_locale),
+            )
+            .checked(avatar_enabled)
+            .build(app)?;
             let quit =
                 MenuItemBuilder::with_id(TRAY_MENU_QUIT_ID, tray_label("quit", &tray_locale))
                     .build(app)?;
@@ -4466,6 +4499,10 @@ async fn main() {
                 entity_classify_task(state_clone6).await;
             });
 
+            tauri::async_runtime::spawn(async move {
+                sync::sync_background_task(state_clone7).await;
+            });
+
             sync_effective_dock_visibility(app.handle());
 
             // 保存 AppHandle 到全局变量，用于从 macOS Dock 点击恢复窗口
@@ -4545,6 +4582,11 @@ async fn main() {
             commands::delete_custom_semantic_category,
             commands::get_storage_stats,
             commands::get_hourly_summaries,
+            commands::get_sync_status,
+            commands::sync_now,
+            commands::get_known_devices,
+            commands::get_reports_by_date,
+            commands::set_ui_selected_device_id,
             commands::get_activity,
             commands::chat_work_assistant,
             commands::cancel_assistant_request,
@@ -4602,12 +4644,11 @@ async fn main() {
             tauri::RunEvent::Reopen {
                 has_visible_windows,
                 ..
-            }
-                if !has_visible_windows => {
-                    if let Err(e) = reveal_main_window(&_app_handle.clone(), None) {
-                        log::warn!("Dock 恢复主窗口失败: {e}");
-                    }
+            } if !has_visible_windows => {
+                if let Err(e) = reveal_main_window(&_app_handle.clone(), None) {
+                    log::warn!("Dock 恢复主窗口失败: {e}");
                 }
+            }
             _ => {}
         });
 }
@@ -4756,10 +4797,18 @@ mod tests {
 
     #[test]
     fn 只有未切换的连续活动可以合并() {
-        assert!(should_merge_contiguous_activity(false, "Code", 1_500, 1_000));
-        assert!(!should_merge_contiguous_activity(true, "Code", 1_500, 1_000));
-        assert!(!should_merge_contiguous_activity(false, "Unknown", 1_500, 1_000));
-        assert!(!should_merge_contiguous_activity(false, "Code", 1_601, 1_000));
+        assert!(should_merge_contiguous_activity(
+            false, "Code", 1_500, 1_000
+        ));
+        assert!(!should_merge_contiguous_activity(
+            true, "Code", 1_500, 1_000
+        ));
+        assert!(!should_merge_contiguous_activity(
+            false, "Unknown", 1_500, 1_000
+        ));
+        assert!(!should_merge_contiguous_activity(
+            false, "Code", 1_601, 1_000
+        ));
         assert!(!should_merge_contiguous_activity(false, "Code", 999, 1_000));
     }
 
@@ -4995,8 +5044,15 @@ mod tests {
 
     #[test]
     fn 停止录制时桌宠应回到待命状态() {
-        let decision =
-            avatar_activity_decision(true, false, false, 0.82, "minimal-office", "assistant", false);
+        let decision = avatar_activity_decision(
+            true,
+            false,
+            false,
+            0.82,
+            "minimal-office",
+            "assistant",
+            false,
+        );
 
         assert!(!decision.should_continue);
         assert_eq!(
@@ -5117,8 +5173,14 @@ mod tests {
 
     #[test]
     fn 托盘录制按钮文案应与状态一致() {
-        assert_eq!(tray_recording_toggle_label(false, false, "zh-CN"), "开始录制");
-        assert_eq!(tray_recording_toggle_label(true, false, "zh-CN"), "暂停录制");
+        assert_eq!(
+            tray_recording_toggle_label(false, false, "zh-CN"),
+            "开始录制"
+        );
+        assert_eq!(
+            tray_recording_toggle_label(true, false, "zh-CN"),
+            "暂停录制"
+        );
         assert_eq!(tray_recording_toggle_label(true, true, "zh-CN"), "恢复录制");
     }
 
@@ -5365,9 +5427,7 @@ mod tests {
 
     #[test]
     fn 配置损坏时应跳过键鼠采集() {
-        assert!(!should_initialize_avatar_input(
-            ConfigLoadStatus::Corrupted
-        ));
+        assert!(!should_initialize_avatar_input(ConfigLoadStatus::Corrupted));
 
         for status in [
             ConfigLoadStatus::Loaded,

@@ -14,15 +14,29 @@ use tauri::State;
 
 use super::shared::collect_privacy_filters;
 
-pub(crate) fn load_daily_stats_for_overview(state: &AppState, date: &str) -> Result<DailyStats, AppError> {
+pub(crate) fn load_daily_stats_for_overview(
+    state: &AppState,
+    date: &str,
+) -> Result<DailyStats, AppError> {
+    load_daily_stats_for_overview_device(state, date, None)
+}
+
+pub(crate) fn load_daily_stats_for_overview_device(
+    state: &AppState,
+    date: &str,
+    device_id: Option<&str>,
+) -> Result<DailyStats, AppError> {
     let segments = state.config.effective_work_segments();
     let (ignored_apps, excluded_domains) = collect_privacy_filters(state);
-    let mut stats = state.database.get_daily_stats_with_segments_filtered(
-        date,
-        &segments,
-        &ignored_apps,
-        &excluded_domains,
-    )?;
+    let mut stats = state
+        .database
+        .get_daily_stats_with_segments_filtered_for_device(
+            date,
+            &segments,
+            &ignored_apps,
+            &excluded_domains,
+            device_id,
+        )?;
 
     apply_flex_overtime_correction(
         &mut stats,
@@ -568,6 +582,7 @@ fn load_full_overview_stats(
     date: Option<&str>,
     date_from: Option<&str>,
     date_to: Option<&str>,
+    device_id: Option<&str>,
     state: &AppState,
 ) -> Result<DailyStats, AppError> {
     let normalized_mode = mode.trim().to_lowercase();
@@ -579,13 +594,17 @@ fn load_full_overview_stats(
 
             if start == end {
                 let date_value = start.format("%Y-%m-%d").to_string();
-                load_daily_stats_for_overview(state, &date_value)?
+                load_daily_stats_for_overview_device(state, &date_value, device_id)?
             } else {
                 let mut daily_stats = Vec::new();
                 let mut current = start;
                 while current <= end {
                     let current_date = current.format("%Y-%m-%d").to_string();
-                    daily_stats.push(load_daily_stats_for_overview(state, &current_date)?);
+                    daily_stats.push(load_daily_stats_for_overview_device(
+                        state,
+                        &current_date,
+                        device_id,
+                    )?);
                     current = current
                         .succ_opt()
                         .ok_or_else(|| AppError::Config("计算概览日期范围失败".to_string()))?;
@@ -605,7 +624,11 @@ fn load_full_overview_stats(
             let mut current = start;
             while current <= end {
                 let current_date = current.format("%Y-%m-%d").to_string();
-                daily_stats.push(load_daily_stats_for_overview(state, &current_date)?);
+                daily_stats.push(load_daily_stats_for_overview_device(
+                    state,
+                    &current_date,
+                    device_id,
+                )?);
                 current = current
                     .succ_opt()
                     .ok_or_else(|| AppError::Config("计算周概览日期范围失败".to_string()))?;
@@ -614,7 +637,7 @@ fn load_full_overview_stats(
         }
         _ => {
             let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-            load_daily_stats_for_overview(state, &today)?
+            load_daily_stats_for_overview_device(state, &today, device_id)?
         }
     };
 
@@ -632,12 +655,24 @@ pub(crate) fn get_overview_stats_inner(
     date_to: Option<String>,
     state: &Arc<Mutex<AppState>>,
 ) -> Result<DailyStats, AppError> {
+    get_overview_stats_filtered_inner(mode, date, date_from, date_to, None, state)
+}
+
+fn get_overview_stats_filtered_inner(
+    mode: String,
+    date: Option<String>,
+    date_from: Option<String>,
+    date_to: Option<String>,
+    device_id: Option<String>,
+    state: &Arc<Mutex<AppState>>,
+) -> Result<DailyStats, AppError> {
     let state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
     let stats = load_full_overview_stats(
         &mode,
         date.as_deref(),
         date_from.as_deref(),
         date_to.as_deref(),
+        device_id.as_deref(),
         &state,
     )?;
     Ok(project_overview_homepage(stats))
@@ -650,9 +685,10 @@ pub async fn get_overview_stats(
     date: Option<String>,
     date_from: Option<String>,
     date_to: Option<String>,
+    device_id: Option<String>,
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<DailyStats, AppError> {
-    get_overview_stats_inner(mode, date, date_from, date_to, state.inner())
+    get_overview_stats_filtered_inner(mode, date, date_from, date_to, device_id, state.inner())
 }
 
 /// 获取当前概览范围内的完整域名摘要，不包含 URL 明细。
@@ -662,6 +698,7 @@ pub async fn get_overview_domains(
     date: Option<String>,
     date_from: Option<String>,
     date_to: Option<String>,
+    device_id: Option<String>,
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<OverviewDomainCollection, AppError> {
     let state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
@@ -670,6 +707,7 @@ pub async fn get_overview_domains(
         date.as_deref(),
         date_from.as_deref(),
         date_to.as_deref(),
+        device_id.as_deref(),
         &state,
     )?;
     Ok(build_overview_domain_collection(&stats))
@@ -683,6 +721,7 @@ pub async fn get_overview_domain_detail(
     date: Option<String>,
     date_from: Option<String>,
     date_to: Option<String>,
+    device_id: Option<String>,
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<Option<OverviewDomainDetail>, AppError> {
     let state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
@@ -691,6 +730,7 @@ pub async fn get_overview_domain_detail(
         date.as_deref(),
         date_from.as_deref(),
         date_to.as_deref(),
+        device_id.as_deref(),
         &state,
     )?;
     Ok(build_overview_domain_detail(&stats, &domain))
@@ -722,9 +762,11 @@ pub(crate) fn get_daily_stats_inner(
 #[tauri::command]
 pub async fn get_daily_stats(
     date: String,
+    device_id: Option<String>,
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<DailyStats, AppError> {
-    get_daily_stats_inner(&date, state.inner())
+    let state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
+    load_daily_stats_for_overview_device(&state, &date, device_id.as_deref())
 }
 
 pub(crate) fn get_hourly_app_breakdown_inner(
@@ -732,6 +774,17 @@ pub(crate) fn get_hourly_app_breakdown_inner(
     date_from: Option<String>,
     date_to: Option<String>,
     mode: Option<String>,
+    state: &Arc<Mutex<AppState>>,
+) -> Result<Vec<HourlyAppBucket>, AppError> {
+    get_hourly_app_breakdown_filtered_inner(date, date_from, date_to, mode, None, state)
+}
+
+fn get_hourly_app_breakdown_filtered_inner(
+    date: Option<String>,
+    date_from: Option<String>,
+    date_to: Option<String>,
+    mode: Option<String>,
+    device_id: Option<String>,
     state: &Arc<Mutex<AppState>>,
 ) -> Result<Vec<HourlyAppBucket>, AppError> {
     let state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
@@ -759,12 +812,15 @@ pub(crate) fn get_hourly_app_breakdown_inner(
     };
 
     let (ignored_apps, excluded_domains) = collect_privacy_filters(&state);
-    state.database.get_hourly_app_breakdown_range_filtered(
-        &date_from,
-        &date_to,
-        &ignored_apps,
-        &excluded_domains,
-    )
+    state
+        .database
+        .get_hourly_app_breakdown_range_filtered_for_device(
+            &date_from,
+            &date_to,
+            &ignored_apps,
+            &excluded_domains,
+            device_id.as_deref(),
+        )
 }
 
 /// 获取每小时×应用的时长分布
@@ -774,9 +830,17 @@ pub async fn get_hourly_app_breakdown(
     date_from: Option<String>,
     date_to: Option<String>,
     mode: Option<String>,
+    device_id: Option<String>,
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<Vec<HourlyAppBucket>, AppError> {
-    get_hourly_app_breakdown_inner(date, date_from, date_to, mode, state.inner())
+    get_hourly_app_breakdown_filtered_inner(
+        date,
+        date_from,
+        date_to,
+        mode,
+        device_id,
+        state.inner(),
+    )
 }
 
 /// 获取历史应用列表 —— 内部复用版
@@ -963,20 +1027,17 @@ pub(crate) fn get_hourly_summaries_inner(
     date: &str,
     state: &Arc<Mutex<AppState>>,
 ) -> Result<Vec<serde_json::Value>, AppError> {
+    get_hourly_summaries_filtered_inner(date, None, state)
+}
+
+fn get_hourly_summaries_filtered_inner(
+    date: &str,
+    device_id: Option<&str>,
+    state: &Arc<Mutex<AppState>>,
+) -> Result<Vec<serde_json::Value>, AppError> {
     use chrono::Timelike;
 
     let app_state = state.clone();
-
-    let saved_created_at: HashMap<i32, i64> = {
-        let s = app_state
-            .lock()
-            .map_err(|e| AppError::Unknown(e.to_string()))?;
-        s.database
-            .get_hourly_summaries(date)?
-            .iter()
-            .map(|summary| (summary.hour, summary.created_at))
-            .collect()
-    };
 
     let now = chrono::Local::now();
     let today = now.format("%Y-%m-%d").to_string();
@@ -990,12 +1051,54 @@ pub(crate) fn get_hourly_summaries_inner(
         24
     };
 
+    if device_id.is_none() {
+        let mut summaries = (0..end_hour)
+            .filter_map(|hour| crate::build_hourly_summary(&app_state, date, hour))
+            .collect::<Vec<_>>();
+        if date == today {
+            if let Some(current) = crate::build_hourly_summary(&app_state, date, current_hour) {
+                summaries.push(current);
+            }
+        }
+        return Ok(summaries
+            .iter()
+            .map(|summary| {
+                serde_json::json!({
+                    "hour": summary.hour,
+                    "summary": summary.summary,
+                    "main_apps": summary.main_apps,
+                    "activity_count": summary.activity_count,
+                    "total_duration": summary.total_duration,
+                })
+            })
+            .collect());
+    }
+
+    let saved_created_at: HashMap<i32, i64> = {
+        let s = app_state
+            .lock()
+            .map_err(|e| AppError::Unknown(e.to_string()))?;
+        s.database
+            .get_hourly_summaries_for_device(date, device_id)?
+            .iter()
+            .map(|summary| (summary.hour, summary.created_at))
+            .collect()
+    };
+
+    let selected_is_local = device_id
+        .map(|selected| {
+            app_state
+                .lock()
+                .map(|state| selected == state.config.sync.device_id)
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
     for hour in 0..end_hour {
         let fresh = matches!(
             (saved_created_at.get(&hour), local_hour_end_timestamp(date, hour)),
             (Some(&created_at), Some(end_ts)) if created_at >= end_ts
         );
-        if !fresh {
+        if selected_is_local && !fresh {
             crate::generate_and_save_summary(&app_state, date, hour);
         }
     }
@@ -1004,11 +1107,12 @@ pub(crate) fn get_hourly_summaries_inner(
         let s = app_state
             .lock()
             .map_err(|e| AppError::Unknown(e.to_string()))?;
-        s.database.get_hourly_summaries(date)?
+        s.database
+            .get_hourly_summaries_for_device(date, device_id)?
     };
 
     // 今天的当前小时：内存计算,不写库(旧版本可能残留过半截摘要,一并以内存结果覆盖展示)
-    if date == today {
+    if date == today && selected_is_local {
         if let Some(current) = crate::build_hourly_summary(&app_state, date, current_hour) {
             summaries.retain(|summary| summary.hour != current_hour);
             summaries.push(current);
@@ -1034,9 +1138,10 @@ pub(crate) fn get_hourly_summaries_inner(
 #[tauri::command]
 pub async fn get_hourly_summaries(
     date: String,
+    device_id: Option<String>,
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<Vec<serde_json::Value>, AppError> {
-    get_hourly_summaries_inner(&date, state.inner())
+    get_hourly_summaries_filtered_inner(&date, device_id.as_deref(), state.inner())
 }
 
 /// 清理今天之前的所有活动记录
@@ -1063,17 +1168,37 @@ pub async fn clear_old_activities(
     if screenshots_dir.exists() {
         if let Ok(entries) = std::fs::read_dir(&screenshots_dir) {
             for entry in entries.flatten() {
-                if let Some(name) = entry.file_name().to_str() {
-                    // 保留今天和昨天的目录
-                    if name != today && name != yesterday && entry.path().is_dir() {
-                        if let Ok(dir_entries) = std::fs::read_dir(entry.path()) {
-                            for file_entry in dir_entries.flatten() {
-                                if file_entry.path().is_file() {
-                                    deleted_screenshots += 1;
-                                }
-                            }
+                if !entry.path().is_dir() {
+                    continue;
+                }
+                let direct_name = entry.file_name().to_string_lossy().to_string();
+                let date_dirs =
+                    if chrono::NaiveDate::parse_from_str(&direct_name, "%Y-%m-%d").is_ok() {
+                        vec![(direct_name, entry.path())]
+                    } else {
+                        std::fs::read_dir(entry.path())
+                            .into_iter()
+                            .flatten()
+                            .flatten()
+                            .filter(|child| child.path().is_dir())
+                            .map(|child| {
+                                (
+                                    child.file_name().to_string_lossy().to_string(),
+                                    child.path(),
+                                )
+                            })
+                            .collect()
+                    };
+                for (name, path) in date_dirs {
+                    if name != today
+                        && name != yesterday
+                        && chrono::NaiveDate::parse_from_str(&name, "%Y-%m-%d").is_ok()
+                    {
+                        if let Ok(files) = std::fs::read_dir(&path) {
+                            deleted_screenshots +=
+                                files.flatten().filter(|file| file.path().is_file()).count();
                         }
-                        let _ = std::fs::remove_dir_all(entry.path());
+                        let _ = std::fs::remove_dir_all(path);
                     }
                 }
             }
@@ -1509,20 +1634,19 @@ mod tests {
 pub async fn get_range_daily_totals(
     date_from: String,
     date_to: String,
+    device_id: Option<String>,
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<Vec<serde_json::Value>, AppError> {
     let state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
-    let (start, end) = resolve_overview_date_span(
-        None,
-        Some(date_from.as_str()),
-        Some(date_to.as_str()),
-    )?;
+    let (start, end) =
+        resolve_overview_date_span(None, Some(date_from.as_str()), Some(date_to.as_str()))?;
 
     let mut totals = Vec::new();
     let mut current = start;
     while current <= end && totals.len() < 31 {
         let current_date = current.format("%Y-%m-%d").to_string();
-        let stats = load_daily_stats_for_overview(&state, &current_date)?;
+        let stats =
+            load_daily_stats_for_overview_device(&state, &current_date, device_id.as_deref())?;
         totals.push(serde_json::json!({
             "date": current_date,
             "total_duration": stats.total_duration,

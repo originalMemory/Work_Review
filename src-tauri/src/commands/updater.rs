@@ -652,8 +652,6 @@ pub async fn download_and_install_github_update(
     Err(AppError::Unknown(message))
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;

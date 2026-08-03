@@ -6,7 +6,7 @@ use rusqlite::{params, Connection, Row};
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 /// 安全地将 NaiveDateTime 转换为本地时间戳
 /// 在 DST 跳变时不会 panic：
@@ -41,8 +41,7 @@ fn local_hour_bounds(date: chrono::NaiveDate, hour: u32) -> Result<(i64, i64)> {
     let hour = hour.min(23);
     let start = safe_local_timestamp(date.and_hms_opt(hour, 0, 0).unwrap());
     let end_naive = if hour == 23 {
-        date.succ_opt()
-            .and_then(|next| next.and_hms_opt(0, 0, 0))
+        date.succ_opt().and_then(|next| next.and_hms_opt(0, 0, 0))
     } else {
         date.and_hms_opt(hour + 1, 0, 0)
     }
@@ -157,6 +156,51 @@ pub struct Activity {
     /// 远程截图 URL（上传成功后填充）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub screenshot_url: Option<String>,
+}
+
+/// 同步协议使用的活动记录。业务层继续使用 `Activity`，避免同步元数据污染采集逻辑。
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SyncActivity {
+    pub uuid: String,
+    pub device_id: String,
+    #[serde(default)]
+    pub sync_version: i64,
+    #[serde(flatten)]
+    pub activity: Activity,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SyncDailyReport {
+    pub date: String,
+    pub locale: String,
+    pub device_id: String,
+    pub content: String,
+    pub ai_mode: String,
+    pub model_name: Option<String>,
+    pub fallback_reason: Option<String>,
+    pub created_at: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SyncHourlySummary {
+    pub date: String,
+    pub hour: i32,
+    pub device_id: String,
+    pub summary: String,
+    pub main_apps: String,
+    pub activity_count: i64,
+    pub total_duration: i64,
+    pub representative_screenshots: Option<String>,
+    pub created_at: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SyncEntityCategory {
+    pub entity_key: String,
+    pub base_category: String,
+    pub semantic_category: String,
+    pub source: String,
+    pub created_at: i64,
 }
 
 /// 每日报告
@@ -641,12 +685,14 @@ fn pick_excerpt(candidates: &[String]) -> String {
 /// 使得 Database 可以跨 async 边界共享（Agent 架构 Stage 6）。
 pub struct Database {
     conn: Arc<Mutex<Connection>>,
+    local_device_id: Arc<RwLock<String>>,
 }
 
 impl Clone for Database {
     fn clone(&self) -> Self {
         Self {
             conn: Arc::clone(&self.conn),
+            local_device_id: Arc::clone(&self.local_device_id),
         }
     }
 }
@@ -668,9 +714,23 @@ impl Database {
         )?;
         let db = Self {
             conn: Arc::new(Mutex::new(conn)),
+            local_device_id: Arc::new(RwLock::new(String::new())),
         };
         db.init_tables()?;
         Ok(db)
+    }
+
+    pub fn set_local_device_id(&self, device_id: &str) {
+        if let Ok(mut current) = self.local_device_id.write() {
+            *current = device_id.to_string();
+        }
+    }
+
+    fn local_device_id(&self) -> String {
+        self.local_device_id
+            .read()
+            .map(|value| value.clone())
+            .unwrap_or_default()
     }
 
     /// 备份数据库到目标路径
@@ -708,7 +768,11 @@ impl Database {
                 browser_url TEXT,
                 executable_path TEXT,
                 semantic_category TEXT,
-                semantic_confidence INTEGER
+                semantic_confidence INTEGER,
+                screenshot_url TEXT,
+                uuid TEXT,
+                device_id TEXT NOT NULL DEFAULT '',
+                sync_version INTEGER NOT NULL DEFAULT 0
             )",
             [],
         )?;
@@ -726,7 +790,13 @@ impl Database {
             "CREATE INDEX IF NOT EXISTS idx_activities_app_timestamp ON activities (app_name, timestamp)",
             [],
         )?;
-
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (
+                name TEXT PRIMARY KEY,
+                applied_at INTEGER NOT NULL
+            )",
+            [],
+        )?;
         conn.execute(
             "CREATE TABLE IF NOT EXISTS daily_reports (
                 date TEXT PRIMARY KEY,
@@ -748,7 +818,8 @@ impl Database {
                 model_name TEXT,
                 fallback_reason TEXT,
                 created_at INTEGER NOT NULL,
-                UNIQUE(date, locale)
+                device_id TEXT NOT NULL DEFAULT '',
+                UNIQUE(date, locale, device_id)
             )",
             [],
         )?;
@@ -781,7 +852,8 @@ impl Database {
                 total_duration INTEGER NOT NULL,
                 representative_screenshots TEXT,
                 created_at INTEGER NOT NULL,
-                UNIQUE(date, hour)
+                device_id TEXT NOT NULL DEFAULT '',
+                UNIQUE(date, hour, device_id)
             )",
             [],
         )?;
@@ -807,6 +879,51 @@ impl Database {
         );
         // 迁移：添加 screenshot_url 列（远程存储 URL）
         let _ = conn.execute("ALTER TABLE activities ADD COLUMN screenshot_url TEXT", []);
+        let _ = conn.execute("ALTER TABLE activities ADD COLUMN uuid TEXT", []);
+        let _ = conn.execute(
+            "ALTER TABLE activities ADD COLUMN device_id TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE activities ADD COLUMN sync_version INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS activity_sync_sequence (
+                id INTEGER PRIMARY KEY AUTOINCREMENT
+            );
+            CREATE TRIGGER IF NOT EXISTS activities_sync_ai
+            AFTER INSERT ON activities
+            WHEN new.sync_version = 0
+            BEGIN
+                INSERT INTO activity_sync_sequence(id) VALUES(NULL);
+                UPDATE activities SET sync_version = last_insert_rowid() WHERE id = new.id;
+            END;
+            CREATE TRIGGER IF NOT EXISTS activities_sync_au
+            AFTER UPDATE ON activities
+            WHEN new.sync_version = old.sync_version
+            BEGIN
+                INSERT INTO activity_sync_sequence(id) VALUES(NULL);
+                UPDATE activities SET sync_version = last_insert_rowid() WHERE id = new.id;
+            END;
+            UPDATE activities SET sync_version = 0 WHERE sync_version = 0;
+            CREATE INDEX IF NOT EXISTS idx_activities_device_sync_version
+                ON activities (device_id, sync_version);",
+        )?;
+        // SQLite 允许 UNIQUE 索引包含多个 NULL；不要使用部分索引，否则
+        // INSERT ... ON CONFLICT(uuid) 无法匹配该约束。
+        conn.execute("DROP INDEX IF EXISTS idx_activities_uuid", [])?;
+        conn.execute(
+            "CREATE UNIQUE INDEX idx_activities_uuid ON activities (uuid)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_activities_device_timestamp ON activities (device_id, timestamp)",
+            [],
+        )?;
+        let daily_reports_recreated = Self::migrate_daily_reports_device_schema(&conn)?;
+        let hourly_summaries_recreated = Self::migrate_hourly_summaries_device_schema(&conn)?;
+        Self::backfill_activity_uuids(&conn)?;
 
         // AI 实体分类缓存：后台任务对未知应用/域名做一次性归类,此后采集直接查表,
         // 无需用户手动加规则。entity_key 形如 "app:xxx" / "domain:yyy"。
@@ -973,6 +1090,208 @@ impl Database {
             END;"
         )?;
 
+        if hourly_summaries_recreated {
+            conn.execute(
+                "INSERT INTO hourly_summaries_fts(hourly_summaries_fts) VALUES('rebuild')",
+                [],
+            )?;
+        }
+        if daily_reports_recreated {
+            conn.execute(
+                "INSERT INTO daily_reports_fts(daily_reports_fts) VALUES('rebuild')",
+                [],
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn migrate_daily_reports_device_schema(conn: &Connection) -> Result<bool> {
+        if conn
+            .prepare("SELECT device_id FROM daily_reports_localized LIMIT 0")
+            .is_ok()
+        {
+            return Ok(false);
+        }
+
+        conn.execute_batch(
+            "CREATE TABLE daily_reports_localized_v2 (
+                date TEXT NOT NULL,
+                locale TEXT NOT NULL,
+                content TEXT NOT NULL,
+                ai_mode TEXT NOT NULL,
+                model_name TEXT,
+                fallback_reason TEXT,
+                created_at INTEGER NOT NULL,
+                device_id TEXT NOT NULL DEFAULT '',
+                UNIQUE(date, locale, device_id)
+            );
+            INSERT INTO daily_reports_localized_v2
+                (date, locale, content, ai_mode, model_name, fallback_reason, created_at, device_id)
+                SELECT date, locale, content, ai_mode, model_name, fallback_reason, created_at, ''
+                FROM daily_reports_localized;
+            DROP TABLE daily_reports_localized;
+            ALTER TABLE daily_reports_localized_v2 RENAME TO daily_reports_localized;",
+        )?;
+        Ok(true)
+    }
+
+    fn migrate_hourly_summaries_device_schema(conn: &Connection) -> Result<bool> {
+        if conn
+            .prepare("SELECT device_id FROM hourly_summaries LIMIT 0")
+            .is_ok()
+        {
+            return Ok(false);
+        }
+
+        conn.execute_batch(
+            "CREATE TABLE hourly_summaries_v2 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL,
+                hour INTEGER NOT NULL,
+                summary TEXT NOT NULL,
+                main_apps TEXT NOT NULL,
+                activity_count INTEGER NOT NULL,
+                total_duration INTEGER NOT NULL,
+                representative_screenshots TEXT,
+                created_at INTEGER NOT NULL,
+                device_id TEXT NOT NULL DEFAULT '',
+                UNIQUE(date, hour, device_id)
+            );
+            INSERT INTO hourly_summaries_v2
+                (date, hour, summary, main_apps, activity_count, total_duration,
+                 representative_screenshots, created_at, device_id)
+                SELECT date, hour, summary, main_apps, activity_count, total_duration,
+                       representative_screenshots, created_at, ''
+                FROM hourly_summaries;
+            DROP TABLE hourly_summaries;
+            ALTER TABLE hourly_summaries_v2 RENAME TO hourly_summaries;
+            CREATE INDEX IF NOT EXISTS idx_hourly_summaries_date
+                ON hourly_summaries (date);",
+        )?;
+        Ok(true)
+    }
+
+    fn backfill_activity_uuids(conn: &Connection) -> Result<()> {
+        let mut stmt = conn.prepare("SELECT id FROM activities WHERE uuid IS NULL OR uuid = ''")?;
+        let ids = stmt
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+
+        for id in ids {
+            conn.execute(
+                "UPDATE activities SET uuid = ?1 WHERE id = ?2",
+                params![uuid::Uuid::now_v7().to_string(), id],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// 将升级前的本机数据归属到当前设备。
+    pub fn backfill_local_device_id(&self, device_id: &str) -> Result<()> {
+        if device_id.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().map_err(|e| {
+            AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
+        })?;
+        let transaction = conn.transaction()?;
+        let already_applied = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE name = 'sync_device_backfill_v1')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if already_applied {
+            return Ok(());
+        }
+        let has_device_owned_data = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM activities WHERE device_id != ''
+                UNION ALL
+                SELECT 1 FROM daily_reports_localized WHERE device_id != ''
+                UNION ALL
+                SELECT 1 FROM hourly_summaries WHERE device_id != ''
+            )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if has_device_owned_data {
+            transaction.execute(
+                "INSERT INTO schema_migrations (name, applied_at) VALUES ('sync_device_backfill_v1', ?1)",
+                params![chrono::Utc::now().timestamp()],
+            )?;
+            transaction.commit()?;
+            return Ok(());
+        }
+        transaction.execute(
+            "UPDATE activities SET device_id = ?1 WHERE device_id IS NULL OR device_id = ''",
+            params![device_id],
+        )?;
+        transaction.execute(
+            "UPDATE daily_reports_localized SET device_id = ?1 WHERE device_id IS NULL OR device_id = ''",
+            params![device_id],
+        )?;
+        transaction.execute(
+            "UPDATE hourly_summaries SET device_id = ?1 WHERE device_id IS NULL OR device_id = ''",
+            params![device_id],
+        )?;
+        transaction.execute(
+            "INSERT INTO schema_migrations (name, applied_at) VALUES ('sync_device_backfill_v1', ?1)",
+            params![chrono::Utc::now().timestamp()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// 把旧的 `screenshots/YYYY-MM-DD` 布局迁到当前设备目录。
+    pub fn migrate_screenshots_to_device_dir(
+        &self,
+        data_dir: &Path,
+        device_id: &str,
+    ) -> Result<()> {
+        if device_id.is_empty() {
+            return Ok(());
+        }
+        let screenshots_dir = data_dir.join("screenshots");
+        if !screenshots_dir.is_dir() {
+            return Ok(());
+        }
+
+        let target_root = screenshots_dir.join(device_id);
+        for entry in std::fs::read_dir(&screenshots_dir)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !entry.path().is_dir()
+                || chrono::NaiveDate::parse_from_str(&name, "%Y-%m-%d").is_err()
+            {
+                continue;
+            }
+            let destination = target_root.join(&name);
+            std::fs::create_dir_all(&destination)?;
+            for file in std::fs::read_dir(entry.path())? {
+                let file = file?;
+                let target = destination.join(file.file_name());
+                if !target.exists() {
+                    std::fs::rename(file.path(), target)?;
+                }
+            }
+            let _ = std::fs::remove_dir(entry.path());
+        }
+
+        let conn = self.conn.lock().map_err(|e| {
+            AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
+        })?;
+        conn.execute(
+            "UPDATE activities
+             SET screenshot_path = ?1 || substr(screenshot_path, 13)
+             WHERE screenshot_path LIKE 'screenshots/20__-__-__/%'
+               AND screenshot_path NOT LIKE ?2",
+            params![
+                format!("screenshots/{device_id}/"),
+                format!("screenshots/{device_id}/%")
+            ],
+        )?;
         Ok(())
     }
 
@@ -1001,9 +1320,11 @@ impl Database {
             .map(normalize_url)
             .filter(|url| !url.is_empty());
 
+        let activity_uuid = uuid::Uuid::now_v7().to_string();
+        let device_id = self.local_device_id();
         conn.execute(
-            "INSERT INTO activities (timestamp, app_name, window_title, screenshot_path, ocr_text, category, duration, browser_url, executable_path, semantic_category, semantic_confidence, screenshot_url)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO activities (timestamp, app_name, window_title, screenshot_path, ocr_text, category, duration, browser_url, executable_path, semantic_category, semantic_confidence, screenshot_url, uuid, device_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 activity.timestamp,
                 activity.app_name,
@@ -1017,6 +1338,8 @@ impl Database {
                 activity.semantic_category,
                 activity.semantic_confidence,
                 activity.screenshot_url,
+                activity_uuid,
+                device_id,
             ],
         )?;
 
@@ -1224,7 +1547,6 @@ impl Database {
         Ok(())
     }
 
-
     /// 更新活动的 OCR 文本
     pub fn update_activity_ocr(&self, id: i64, ocr_text: Option<String>) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| {
@@ -1296,6 +1618,52 @@ impl Database {
             .filter_map(|r| r.ok())
             .collect();
         Ok(rows)
+    }
+
+    pub fn get_sync_entity_categories_since(&self, since: i64) -> Result<Vec<SyncEntityCategory>> {
+        let conn = self.conn.lock().map_err(|e| {
+            AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
+        })?;
+        let mut stmt = conn.prepare(
+            "SELECT entity_key, base_category, semantic_category, source, created_at
+             FROM entity_category_cache WHERE created_at > ?1 ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map(params![since], |row| {
+            Ok(SyncEntityCategory {
+                entity_key: row.get(0)?,
+                base_category: row.get(1)?,
+                semantic_category: row.get(2)?,
+                source: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(AppError::Database)
+    }
+
+    pub fn upsert_sync_entity_category(&self, record: &SyncEntityCategory) -> Result<bool> {
+        let conn = self.conn.lock().map_err(|e| {
+            AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
+        })?;
+        let changed = conn.execute(
+            "INSERT INTO entity_category_cache
+             (entity_key, base_category, semantic_category, source, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(entity_key) DO UPDATE SET
+                base_category = excluded.base_category,
+                semantic_category = excluded.semantic_category,
+                source = excluded.source,
+                created_at = excluded.created_at
+             WHERE excluded.created_at > entity_category_cache.created_at",
+            params![
+                record.entity_key,
+                record.base_category,
+                record.semantic_category,
+                record.source,
+                record.created_at,
+            ],
+        )?;
+        Ok(changed > 0)
     }
 
     /// 写入/覆盖一条实体分类缓存。
@@ -1449,7 +1817,6 @@ impl Database {
         Ok(count)
     }
 
-
     /// 删除指定日期之前的所有活动记录（使用时间戳范围查询以利用索引）
     pub fn delete_activities_before_date(&self, before_date: &str) -> Result<usize> {
         let conn = self
@@ -1479,8 +1846,14 @@ impl Database {
     fn invalidate_daily_cache(conn: &Connection, dates: &std::collections::HashSet<String>) {
         for date in dates {
             let _ = conn.execute("DELETE FROM daily_reports WHERE date = ?1", params![date]);
-            let _ = conn.execute("DELETE FROM daily_reports_localized WHERE date = ?1", params![date]);
-            let _ = conn.execute("DELETE FROM hourly_summaries WHERE date = ?1", params![date]);
+            let _ = conn.execute(
+                "DELETE FROM daily_reports_localized WHERE date = ?1",
+                params![date],
+            );
+            let _ = conn.execute(
+                "DELETE FROM hourly_summaries WHERE date = ?1",
+                params![date],
+            );
         }
     }
 
@@ -1561,7 +1934,9 @@ impl Database {
             "SELECT screenshot_path, timestamp FROM activities WHERE timestamp >= ?1 AND timestamp < ?2",
         )?;
         let rows: Vec<(String, i64)> = stmt
-            .query_map(params![start_ts, end_ts], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .query_map(params![start_ts, end_ts], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
             .filter_map(|r| r.ok())
             .collect();
         let paths: Vec<String> = rows
@@ -1642,8 +2017,10 @@ impl Database {
                     .map(|(_, ts)| Self::ts_to_local_date(*ts))
                     .filter(|d| !d.is_empty())
                     .collect();
-                let deleted =
-                    conn.execute("DELETE FROM activities WHERE app_name = ?1", params![app_name])?;
+                let deleted = conn.execute(
+                    "DELETE FROM activities WHERE app_name = ?1",
+                    params![app_name],
+                )?;
                 (paths, dates, deleted)
             }
         };
@@ -1673,6 +2050,23 @@ impl Database {
         segments: &[crate::config::WorkTimeSegment],
         ignored_apps: &[String],
         excluded_domains: &[String],
+    ) -> Result<DailyStats> {
+        self.get_daily_stats_with_segments_filtered_for_device(
+            date,
+            segments,
+            ignored_apps,
+            excluded_domains,
+            None,
+        )
+    }
+
+    pub fn get_daily_stats_with_segments_filtered_for_device(
+        &self,
+        date: &str,
+        segments: &[crate::config::WorkTimeSegment],
+        ignored_apps: &[String],
+        excluded_domains: &[String],
+        device_id: Option<&str>,
     ) -> Result<DailyStats> {
         let conn = self.conn.lock().map_err(|e| {
             AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
@@ -1713,10 +2107,11 @@ impl Database {
                     screenshot_url
              FROM activities
              WHERE timestamp > ?1 AND (timestamp - duration) < ?2
+               AND (?3 IS NULL OR device_id = ?3)
              ORDER BY timestamp ASC",
         )?;
 
-        let activity_rows = stmt.query_map(params![start_ts, end_ts], |row| {
+        let activity_rows = stmt.query_map(params![start_ts, end_ts, device_id], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
@@ -2022,9 +2417,7 @@ impl Database {
                                 })
                                 .collect();
                             url_details.sort_by(|a, b| {
-                                b.duration
-                                    .cmp(&a.duration)
-                                    .then_with(|| a.url.cmp(&b.url))
+                                b.duration.cmp(&a.duration).then_with(|| a.url.cmp(&b.url))
                             });
                             let domain_duration: i64 = url_details.iter().map(|u| u.duration).sum();
                             DomainUsage {
@@ -2149,6 +2542,16 @@ impl Database {
         limit: Option<u32>,
         offset: Option<u32>,
     ) -> Result<Vec<Activity>> {
+        self.get_timeline_filtered(date, limit, offset, None)
+    }
+
+    pub fn get_timeline_filtered(
+        &self,
+        date: &str,
+        limit: Option<u32>,
+        offset: Option<u32>,
+        device_id: Option<&str>,
+    ) -> Result<Vec<Activity>> {
         let conn = self.conn.lock().map_err(|e| {
             AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
         })?;
@@ -2195,6 +2598,7 @@ impl Database {
                     ) as total_duration
                 FROM activities
                 WHERE timestamp > ?1 AND (timestamp - duration) < ?2
+                  AND (?5 IS NULL OR device_id = ?5)
              )
              SELECT
                 id,
@@ -2217,28 +2621,31 @@ impl Database {
         )?;
 
         let activities: Vec<Activity> = stmt
-            .query_map(params![start_ts, end_ts, limit_val, offset_val], |row| {
-                let browser_url: String = row.get(8)?;
-                Ok(Activity {
-                    id: Some(row.get(0)?),
-                    timestamp: row.get(1)?,
-                    app_name: row.get(2)?,
-                    window_title: row.get(3)?,
-                    screenshot_path: row.get(4)?,
-                    ocr_text: row.get(5)?,
-                    category: row.get(6)?,
-                    duration: row.get(7)?,
-                    browser_url: if browser_url.is_empty() {
-                        None
-                    } else {
-                        Some(browser_url)
-                    },
-                    executable_path: row.get(9)?,
-                    semantic_category: row.get(10)?,
-                    semantic_confidence: row.get(11)?,
-                    screenshot_url: row.get(12)?,
-                })
-            })?
+            .query_map(
+                params![start_ts, end_ts, limit_val, offset_val, device_id],
+                |row| {
+                    let browser_url: String = row.get(8)?;
+                    Ok(Activity {
+                        id: Some(row.get(0)?),
+                        timestamp: row.get(1)?,
+                        app_name: row.get(2)?,
+                        window_title: row.get(3)?,
+                        screenshot_path: row.get(4)?,
+                        ocr_text: row.get(5)?,
+                        category: row.get(6)?,
+                        duration: row.get(7)?,
+                        browser_url: if browser_url.is_empty() {
+                            None
+                        } else {
+                            Some(browser_url)
+                        },
+                        executable_path: row.get(9)?,
+                        semantic_category: row.get(10)?,
+                        semantic_confidence: row.get(11)?,
+                        screenshot_url: row.get(12)?,
+                    })
+                },
+            )?
             .filter_map(|r| r.ok())
             .collect();
 
@@ -2269,6 +2676,23 @@ impl Database {
         ignored_apps: &[String],
         excluded_domains: &[String],
     ) -> Result<Vec<HourlyAppBucket>> {
+        self.get_hourly_app_breakdown_range_filtered_for_device(
+            date_from,
+            date_to,
+            ignored_apps,
+            excluded_domains,
+            None,
+        )
+    }
+
+    pub fn get_hourly_app_breakdown_range_filtered_for_device(
+        &self,
+        date_from: &str,
+        date_to: &str,
+        ignored_apps: &[String],
+        excluded_domains: &[String],
+        device_id: Option<&str>,
+    ) -> Result<Vec<HourlyAppBucket>> {
         let mut start_date = chrono::NaiveDate::parse_from_str(date_from, "%Y-%m-%d")
             .map_err(|e| AppError::Config(e.to_string()))?;
         let mut end_date = chrono::NaiveDate::parse_from_str(date_to, "%Y-%m-%d")
@@ -2295,6 +2719,7 @@ impl Database {
                 browser_url
              FROM activities
              WHERE timestamp > ?1 AND (timestamp - duration) < ?2 AND duration > 0
+               AND (?3 IS NULL OR device_id = ?3)
              ORDER BY timestamp ASC",
         )?;
 
@@ -2309,7 +2734,7 @@ impl Database {
             Option<String>,
             Option<String>,
         )> = stmt
-            .query_map(params![start_ts, end_ts], |row| {
+            .query_map(params![start_ts, end_ts, device_id], |row| {
                 Ok((
                     row.get(0)?,
                     row.get(1)?,
@@ -2588,15 +3013,253 @@ impl Database {
         Ok(activities)
     }
 
+    pub fn get_sync_activities_since(
+        &self,
+        since: i64,
+        device_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SyncActivity>> {
+        let conn = self.conn.lock().map_err(|e| {
+            AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
+        })?;
+        let mut stmt = conn.prepare(
+            "SELECT uuid, device_id, sync_version, timestamp, app_name, window_title, screenshot_path,
+                    ocr_text, category, duration, browser_url, executable_path,
+                    semantic_category, semantic_confidence, screenshot_url
+             FROM activities
+             WHERE sync_version > ?1 AND device_id = ?2
+             ORDER BY sync_version ASC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![since, device_id, limit as i64], |row| {
+            Ok(SyncActivity {
+                uuid: row.get(0)?,
+                device_id: row.get(1)?,
+                sync_version: row.get(2)?,
+                activity: Activity {
+                    id: None,
+                    timestamp: row.get(3)?,
+                    app_name: row.get(4)?,
+                    window_title: row.get(5)?,
+                    screenshot_path: row.get(6)?,
+                    ocr_text: row.get(7)?,
+                    category: row.get(8)?,
+                    duration: row.get(9)?,
+                    browser_url: row.get(10)?,
+                    executable_path: row.get(11)?,
+                    semantic_category: row.get(12)?,
+                    semantic_confidence: row.get(13)?,
+                    screenshot_url: row.get(14)?,
+                },
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(AppError::Database)
+    }
+
+    pub fn get_known_device_ids(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().map_err(|e| {
+            AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
+        })?;
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT device_id FROM activities
+             WHERE device_id IS NOT NULL AND device_id != '' ORDER BY device_id",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(AppError::Database)
+    }
+
+    pub fn upsert_sync_activity(&self, record: &SyncActivity) -> Result<bool> {
+        if record.uuid.trim().is_empty() || record.device_id.trim().is_empty() {
+            return Err(AppError::Config(
+                "同步活动缺少 uuid 或 device_id".to_string(),
+            ));
+        }
+        let conn = self.conn.lock().map_err(|e| {
+            AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
+        })?;
+        let normalized_url = record
+            .activity
+            .browser_url
+            .as_deref()
+            .map(normalize_url)
+            .filter(|value| !value.is_empty());
+        let changed = conn.execute(
+            "INSERT INTO activities
+             (timestamp, app_name, window_title, screenshot_path, ocr_text, category, duration,
+              browser_url, executable_path, semantic_category, semantic_confidence,
+              screenshot_url, uuid, device_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             ON CONFLICT(uuid) DO UPDATE SET
+                timestamp = excluded.timestamp,
+                app_name = excluded.app_name,
+                window_title = excluded.window_title,
+                screenshot_path = excluded.screenshot_path,
+                ocr_text = excluded.ocr_text,
+                category = excluded.category,
+                duration = excluded.duration,
+                browser_url = excluded.browser_url,
+                executable_path = excluded.executable_path,
+                semantic_category = excluded.semantic_category,
+                semantic_confidence = excluded.semantic_confidence,
+                screenshot_url = excluded.screenshot_url,
+                device_id = excluded.device_id",
+            params![
+                record.activity.timestamp,
+                record.activity.app_name,
+                record.activity.window_title,
+                record.activity.screenshot_path,
+                record.activity.ocr_text,
+                record.activity.category,
+                record.activity.duration,
+                normalized_url,
+                record.activity.executable_path,
+                record.activity.semantic_category,
+                record.activity.semantic_confidence,
+                record.activity.screenshot_url,
+                record.uuid,
+                record.device_id,
+            ],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn get_sync_reports_since(
+        &self,
+        since: i64,
+        device_id: &str,
+    ) -> Result<Vec<SyncDailyReport>> {
+        let conn = self.conn.lock().map_err(|e| {
+            AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
+        })?;
+        let mut stmt = conn.prepare(
+            "SELECT date, locale, device_id, content, ai_mode, model_name, fallback_reason, created_at
+             FROM daily_reports_localized
+             WHERE created_at > ?1 AND device_id = ?2 ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map(params![since, device_id], |row| {
+            Ok(SyncDailyReport {
+                date: row.get(0)?,
+                locale: row.get(1)?,
+                device_id: row.get(2)?,
+                content: row.get(3)?,
+                ai_mode: row.get(4)?,
+                model_name: row.get(5)?,
+                fallback_reason: row.get(6)?,
+                created_at: row.get(7)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(AppError::Database)
+    }
+
+    pub fn upsert_sync_report(&self, report: &SyncDailyReport) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| {
+            AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
+        })?;
+        conn.execute(
+            "INSERT INTO daily_reports_localized
+             (date, locale, device_id, content, ai_mode, model_name, fallback_reason, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(date, locale, device_id) DO UPDATE SET
+                content = excluded.content,
+                ai_mode = excluded.ai_mode,
+                model_name = excluded.model_name,
+                fallback_reason = excluded.fallback_reason,
+                created_at = excluded.created_at
+             WHERE excluded.created_at > daily_reports_localized.created_at",
+            params![
+                report.date,
+                report.locale,
+                report.device_id,
+                report.content,
+                report.ai_mode,
+                report.model_name,
+                report.fallback_reason,
+                report.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_sync_hourly_summaries_since(
+        &self,
+        since: i64,
+        device_id: &str,
+    ) -> Result<Vec<SyncHourlySummary>> {
+        let conn = self.conn.lock().map_err(|e| {
+            AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
+        })?;
+        let mut stmt = conn.prepare(
+            "SELECT date, hour, device_id, summary, main_apps, activity_count, total_duration,
+                    representative_screenshots, created_at
+             FROM hourly_summaries
+             WHERE created_at > ?1 AND device_id = ?2 ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map(params![since, device_id], |row| {
+            Ok(SyncHourlySummary {
+                date: row.get(0)?,
+                hour: row.get(1)?,
+                device_id: row.get(2)?,
+                summary: row.get(3)?,
+                main_apps: row.get(4)?,
+                activity_count: row.get(5)?,
+                total_duration: row.get(6)?,
+                representative_screenshots: row.get(7)?,
+                created_at: row.get(8)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(AppError::Database)
+    }
+
+    pub fn upsert_sync_hourly_summary(&self, summary: &SyncHourlySummary) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| {
+            AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
+        })?;
+        conn.execute(
+            "INSERT INTO hourly_summaries
+             (date, hour, device_id, summary, main_apps, activity_count, total_duration,
+              representative_screenshots, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(date, hour, device_id) DO UPDATE SET
+                summary = excluded.summary,
+                main_apps = excluded.main_apps,
+                activity_count = excluded.activity_count,
+                total_duration = excluded.total_duration,
+                representative_screenshots = excluded.representative_screenshots,
+                created_at = excluded.created_at
+             WHERE excluded.created_at > hourly_summaries.created_at",
+            params![
+                summary.date,
+                summary.hour,
+                summary.device_id,
+                summary.summary,
+                summary.main_apps,
+                summary.activity_count,
+                summary.total_duration,
+                summary.representative_screenshots,
+                summary.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
     /// 保存每日报告
     pub fn save_report(&self, report: &DailyReport) -> Result<()> {
+        let device_id = self.local_device_id();
+        self.save_report_for_device(report, &device_id)
+    }
+
+    pub fn save_report_for_device(&self, report: &DailyReport, device_id: &str) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| {
             AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
         })?;
 
         conn.execute(
-            "INSERT OR REPLACE INTO daily_reports_localized (date, locale, content, ai_mode, model_name, fallback_reason, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT OR REPLACE INTO daily_reports_localized
+             (date, locale, content, ai_mode, model_name, fallback_reason, created_at, device_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 report.date,
                 report.locale,
@@ -2605,6 +3268,7 @@ impl Database {
                 report.model_name,
                 report.fallback_reason,
                 report.created_at,
+                device_id,
             ],
         )?;
 
@@ -2613,16 +3277,27 @@ impl Database {
 
     /// 获取每日报告
     pub fn get_report(&self, date: &str, locale: Option<&str>) -> Result<Option<DailyReport>> {
+        let device_id = self.local_device_id();
+        self.get_report_for_device(date, locale, Some(&device_id))
+    }
+
+    pub fn get_report_for_device(
+        &self,
+        date: &str,
+        locale: Option<&str>,
+        device_id: Option<&str>,
+    ) -> Result<Option<DailyReport>> {
         let conn = self.conn.lock().map_err(|e| {
             AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
         })?;
         let locale = locale.unwrap_or("zh-CN");
+        let device_id = device_id.unwrap_or("");
 
         let result = conn.query_row(
             "SELECT date, locale, content, ai_mode, model_name, fallback_reason, created_at
              FROM daily_reports_localized
-             WHERE date = ?1 AND locale = ?2",
-            params![date, locale],
+             WHERE date = ?1 AND locale = ?2 AND device_id = ?3",
+            params![date, locale, device_id],
             |row| {
                 Ok(DailyReport {
                     date: row.get(0)?,
@@ -2641,6 +3316,55 @@ impl Database {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(AppError::Database(e)),
         }
+    }
+
+    pub fn get_reports_by_date(
+        &self,
+        date: &str,
+        locale: Option<&str>,
+        device_id: Option<&str>,
+    ) -> Result<Vec<SyncDailyReport>> {
+        let conn = self.conn.lock().map_err(|e| {
+            AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
+        })?;
+        let locale = locale.unwrap_or("zh-CN");
+        let (sql, filter) = match device_id.filter(|value| !value.is_empty()) {
+            Some(device_id) => (
+                "SELECT date, locale, device_id, content, ai_mode, model_name, fallback_reason, created_at
+                 FROM daily_reports_localized
+                 WHERE date = ?1 AND locale = ?2 AND device_id = ?3 ORDER BY device_id",
+                Some(device_id),
+            ),
+            None => (
+                "SELECT date, locale, device_id, content, ai_mode, model_name, fallback_reason, created_at
+                 FROM daily_reports_localized
+                 WHERE date = ?1 AND locale = ?2 ORDER BY device_id",
+                None,
+            ),
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let map_row = |row: &Row<'_>| {
+            Ok(SyncDailyReport {
+                date: row.get(0)?,
+                locale: row.get(1)?,
+                device_id: row.get(2)?,
+                content: row.get(3)?,
+                ai_mode: row.get(4)?,
+                model_name: row.get(5)?,
+                fallback_reason: row.get(6)?,
+                created_at: row.get(7)?,
+            })
+        };
+        let reports = if let Some(device_id) = filter {
+            stmt.query_map(params![date, locale, device_id], map_row)?
+                .filter_map(|row| row.ok())
+                .collect()
+        } else {
+            stmt.query_map(params![date, locale], map_row)?
+                .filter_map(|row| row.ok())
+                .collect()
+        };
+        Ok(reports)
     }
 
     /// 列出所有可用日报日期
@@ -2668,6 +3392,7 @@ impl Database {
         end_date: &str,
         locale: Option<&str>,
     ) -> Result<Vec<DailyReport>> {
+        let device_id = self.local_device_id();
         let conn = self.conn.lock().map_err(|e| {
             AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
         })?;
@@ -2676,12 +3401,12 @@ impl Database {
         let mut stmt = conn.prepare(
             "SELECT date, locale, content, ai_mode, model_name, fallback_reason, created_at
              FROM daily_reports_localized
-             WHERE date >= ?1 AND date <= ?2 AND locale = ?3
+             WHERE date >= ?1 AND date <= ?2 AND locale = ?3 AND device_id = ?4
              ORDER BY date ASC",
         )?;
 
         let reports: Vec<DailyReport> = stmt
-            .query_map(params![start_date, end_date, locale], |row| {
+            .query_map(params![start_date, end_date, locale, device_id], |row| {
                 Ok(DailyReport {
                     date: row.get(0)?,
                     locale: row.get(1)?,
@@ -2700,14 +3425,24 @@ impl Database {
 
     /// 保存小时摘要
     pub fn save_hourly_summary(&self, summary: &HourlySummary) -> Result<i64> {
+        let device_id = self.local_device_id();
+        self.save_hourly_summary_for_device(summary, &device_id)
+    }
+
+    pub fn save_hourly_summary_for_device(
+        &self,
+        summary: &HourlySummary,
+        device_id: &str,
+    ) -> Result<i64> {
         let conn = self.conn.lock().map_err(|e| {
             AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
         })?;
 
         conn.execute(
             "INSERT OR REPLACE INTO hourly_summaries 
-             (date, hour, summary, main_apps, activity_count, total_duration, representative_screenshots, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             (date, hour, summary, main_apps, activity_count, total_duration,
+              representative_screenshots, created_at, device_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 summary.date,
                 summary.hour,
@@ -2717,6 +3452,7 @@ impl Database {
                 summary.total_duration,
                 summary.representative_screenshots,
                 summary.created_at,
+                device_id,
             ],
         )?;
 
@@ -2725,33 +3461,57 @@ impl Database {
 
     /// 获取指定日期的所有小时摘要
     pub fn get_hourly_summaries(&self, date: &str) -> Result<Vec<HourlySummary>> {
+        let device_id = self.local_device_id();
+        self.get_hourly_summaries_for_device(date, Some(&device_id))
+    }
+
+    pub fn get_hourly_summaries_for_device(
+        &self,
+        date: &str,
+        device_id: Option<&str>,
+    ) -> Result<Vec<HourlySummary>> {
         let conn = self.conn.lock().map_err(|e| {
             AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
         })?;
 
-        let mut stmt = conn.prepare(
-            "SELECT id, date, hour, summary, main_apps, activity_count, total_duration, representative_screenshots, created_at 
-             FROM hourly_summaries 
-             WHERE date = ?1 
-             ORDER BY hour ASC"
-        )?;
+        let (sql, filter) = match device_id.filter(|value| !value.is_empty()) {
+            Some(device_id) => (
+                "SELECT id, date, hour, summary, main_apps, activity_count, total_duration,
+                        representative_screenshots, created_at
+                 FROM hourly_summaries WHERE date = ?1 AND device_id = ?2 ORDER BY hour ASC",
+                Some(device_id),
+            ),
+            None => (
+                "SELECT id, date, hour, summary, main_apps, activity_count, total_duration,
+                        representative_screenshots, created_at
+                 FROM hourly_summaries WHERE date = ?1 ORDER BY hour ASC",
+                None,
+            ),
+        };
+        let mut stmt = conn.prepare(sql)?;
 
-        let summaries: Vec<HourlySummary> = stmt
-            .query_map(params![date], |row| {
-                Ok(HourlySummary {
-                    id: Some(row.get(0)?),
-                    date: row.get(1)?,
-                    hour: row.get(2)?,
-                    summary: row.get(3)?,
-                    main_apps: row.get(4)?,
-                    activity_count: row.get(5)?,
-                    total_duration: row.get(6)?,
-                    representative_screenshots: row.get(7)?,
-                    created_at: row.get(8)?,
-                })
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
+        let map_row = |row: &Row<'_>| {
+            Ok(HourlySummary {
+                id: Some(row.get(0)?),
+                date: row.get(1)?,
+                hour: row.get(2)?,
+                summary: row.get(3)?,
+                main_apps: row.get(4)?,
+                activity_count: row.get(5)?,
+                total_duration: row.get(6)?,
+                representative_screenshots: row.get(7)?,
+                created_at: row.get(8)?,
+            })
+        };
+        let summaries = if let Some(device_id) = filter {
+            stmt.query_map(params![date, device_id], map_row)?
+                .filter_map(|row| row.ok())
+                .collect()
+        } else {
+            stmt.query_map(params![date], map_row)?
+                .filter_map(|row| row.ok())
+                .collect()
+        };
 
         Ok(summaries)
     }
@@ -2981,8 +3741,15 @@ impl Database {
 
         // Rust 侧只对归一化后同名（忽略大小写）的应用做二次合并
         let mut merged: HashMap<String, AppCategorySnapshot> = HashMap::new();
-        for (raw_name, category, total_duration, count, latest_timestamp, executable_path, screenshot_url) in
-            rows
+        for (
+            raw_name,
+            category,
+            total_duration,
+            count,
+            latest_timestamp,
+            executable_path,
+            screenshot_url,
+        ) in rows
         {
             let normalized_name = crate::categorize::normalize_display_app_name(&raw_name);
             let key = normalized_name.to_lowercase();
@@ -3468,10 +4235,7 @@ impl Database {
     }
 
     /// 会话列表（按最近更新排序），附带消息数。
-    pub fn list_assistant_conversations(
-        &self,
-        limit: usize,
-    ) -> Result<Vec<AssistantConversation>> {
+    pub fn list_assistant_conversations(&self, limit: usize) -> Result<Vec<AssistantConversation>> {
         let conn = self.conn.lock().map_err(|e| {
             AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
         })?;
@@ -3546,7 +4310,6 @@ impl Database {
         )?;
         Ok(id)
     }
-
 
     /// 删除会话及其全部消息。
     pub fn delete_assistant_conversation(&self, conversation_id: i64) -> Result<()> {
@@ -3712,9 +4475,7 @@ impl Database {
                 .map(|(a, b)| a * b)
                 .sum();
             let score = f64::from(score);
-            if top.len() >= limit
-                && top.last().map(|h| h.score).unwrap_or(f64::MIN) >= score
-            {
+            if top.len() >= limit && top.last().map(|h| h.score).unwrap_or(f64::MIN) >= score {
                 continue;
             }
             let content: String = row.get(5)?;
@@ -3742,7 +4503,6 @@ impl Database {
         Ok(top)
     }
 
-
     /// 获取活跃洞察（未归档，confidence > 0.3），按置信度降序。
     pub fn get_active_insights(&self, limit: usize) -> Result<Vec<WorkInsight>> {
         let conn = self.conn.lock().map_err(|e| {
@@ -3769,7 +4529,6 @@ impl Database {
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(AppError::Database)
     }
-
 
     /// 检查是否存在相似洞察（同类型 + 内容包含关键词），用于去重。
     pub fn has_similar_insight(&self, insight_type: &str, keyword: &str) -> Result<bool> {
@@ -4811,7 +5570,10 @@ mod tests {
 
         // 自定义分类 key 应原样保留，不应被归到 "other"（回归 #109）
         assert!(
-            stats.category_usage.iter().any(|c| c.category == "design_custom"),
+            stats
+                .category_usage
+                .iter()
+                .any(|c| c.category == "design_custom"),
             "自定义分类应出现在时间分配里，而不是被吞掉"
         );
         assert!(
@@ -5061,12 +5823,7 @@ mod tests {
             .get_daily_stats_with_segments_filtered(date, &[], &[], &excluded_domains)
             .expect("读取隐私过滤后的主统计失败");
         let buckets = db
-            .get_hourly_app_breakdown_range_filtered(
-                date,
-                date,
-                &[],
-                &excluded_domains,
-            )
+            .get_hourly_app_breakdown_range_filtered(date, date, &[], &excluded_domains)
             .expect("读取隐私过滤后的每小时应用明细失败");
 
         assert_eq!(stats.total_duration, 10 * 60);
@@ -5853,5 +6610,200 @@ mod tests {
 
         let _ = std::fs::remove_file(source_path);
         let _ = std::fs::remove_file(backup_path);
+    }
+
+    #[test]
+    fn 同步活动应按设备隔离且保留稳定标识() {
+        let db_path = temp_db_path("sync-device-filter");
+        let db = Database::new(&db_path).expect("创建数据库失败");
+        db.set_local_device_id("device-a");
+        let timestamp = local_ts("2026-08-03", 10, 0);
+        db.insert_activity(&Activity {
+            id: None,
+            timestamp,
+            app_name: "Code".to_string(),
+            window_title: "local.rs".to_string(),
+            screenshot_path: "screenshots/device-a/2026-08-03/a.jpg".to_string(),
+            ocr_text: None,
+            category: "development".to_string(),
+            duration: 60,
+            browser_url: None,
+            executable_path: None,
+            semantic_category: None,
+            semantic_confidence: None,
+            screenshot_url: None,
+        })
+        .expect("插入本机活动失败");
+
+        let local = db
+            .get_sync_activities_since(0, "device-a", 10)
+            .expect("读取待同步活动失败");
+        assert_eq!(local.len(), 1);
+        assert!(!local[0].uuid.is_empty());
+
+        let mut remote = local[0].clone();
+        remote.uuid = uuid::Uuid::now_v7().to_string();
+        remote.device_id = "device-b".to_string();
+        remote.activity.window_title = "remote.rs".to_string();
+        db.upsert_sync_activity(&remote).expect("写入远端活动失败");
+
+        let device_b = db
+            .get_timeline_filtered("2026-08-03", None, None, Some("device-b"))
+            .expect("按设备读取时间线失败");
+        assert_eq!(device_b.len(), 1);
+        assert_eq!(device_b[0].window_title, "remote.rs");
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn 活动可变字段更新后应产生新的同步版本() {
+        let db_path = temp_db_path("sync-activity-version");
+        let db = Database::new(&db_path).expect("创建数据库失败");
+        db.set_local_device_id("device-a");
+        let id = db
+            .insert_activity(&Activity {
+                id: None,
+                timestamp: local_ts("2026-08-03", 10, 0),
+                app_name: "Code".to_string(),
+                window_title: "sync.rs".to_string(),
+                screenshot_path: String::new(),
+                ocr_text: None,
+                category: "development".to_string(),
+                duration: 60,
+                browser_url: None,
+                executable_path: None,
+                semantic_category: None,
+                semantic_confidence: None,
+                screenshot_url: None,
+            })
+            .expect("插入活动失败");
+        let first = db
+            .get_sync_activities_since(0, "device-a", 10)
+            .expect("读取首个同步版本失败");
+        assert_eq!(first.len(), 1);
+
+        db.update_activity_ocr(id, Some("updated OCR".to_string()))
+            .expect("更新 OCR 失败");
+        let changed = db
+            .get_sync_activities_since(first[0].sync_version, "device-a", 10)
+            .expect("读取更新后的同步版本失败");
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].activity.ocr_text.as_deref(), Some("updated OCR"));
+        assert!(changed[0].sync_version > first[0].sync_version);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn 设备回填只执行一次并保留全设备报告() {
+        let db_path = temp_db_path("sync-device-backfill-once");
+        let db = Database::new(&db_path).expect("创建数据库失败");
+        db.backfill_local_device_id("device-a")
+            .expect("首次设备回填失败");
+        let report = super::DailyReport {
+            date: "2026-08-03".to_string(),
+            locale: "zh-CN".to_string(),
+            content: "combined".to_string(),
+            ai_mode: "local".to_string(),
+            model_name: None,
+            fallback_reason: None,
+            created_at: 1,
+        };
+        db.save_report_for_device(&report, "")
+            .expect("保存全设备报告失败");
+        db.backfill_local_device_id("device-a")
+            .expect("再次执行设备回填失败");
+
+        assert!(db
+            .get_report_for_device("2026-08-03", Some("zh-CN"), Some(""))
+            .expect("读取全设备报告失败")
+            .is_some());
+        assert!(db
+            .get_report_for_device("2026-08-03", Some("zh-CN"), Some("device-a"))
+            .expect("读取本机报告失败")
+            .is_none());
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn 设备字段迁移后应重建日报与小时摘要全文索引() {
+        let db_path = temp_db_path("sync-device-fts-migration");
+        {
+            let conn = rusqlite::Connection::open(&db_path).expect("创建旧数据库失败");
+            conn.execute_batch(
+                "CREATE TABLE daily_reports_localized (
+                    date TEXT NOT NULL, locale TEXT NOT NULL, content TEXT NOT NULL,
+                    ai_mode TEXT NOT NULL, model_name TEXT, fallback_reason TEXT,
+                    created_at INTEGER NOT NULL, UNIQUE(date, locale)
+                );
+                INSERT INTO daily_reports_localized VALUES
+                    ('2026-08-03', 'zh-CN', 'legacyreporttoken', 'local', NULL, NULL, 1);
+                CREATE TABLE hourly_summaries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT NOT NULL, hour INTEGER NOT NULL,
+                    summary TEXT NOT NULL, main_apps TEXT NOT NULL, activity_count INTEGER NOT NULL,
+                    total_duration INTEGER NOT NULL, representative_screenshots TEXT,
+                    created_at INTEGER NOT NULL, UNIQUE(date, hour)
+                );
+                INSERT INTO hourly_summaries
+                    (date, hour, summary, main_apps, activity_count, total_duration, created_at)
+                    VALUES ('2026-08-03', 10, 'legacyhourtoken', 'Code', 1, 60, 1);
+                CREATE VIRTUAL TABLE daily_reports_fts USING fts5(
+                    date, content, ai_mode, content='daily_reports_localized', content_rowid='rowid'
+                );
+                CREATE VIRTUAL TABLE hourly_summaries_fts USING fts5(
+                    date, summary, main_apps, content='hourly_summaries', content_rowid='id'
+                );",
+            )
+            .expect("准备旧数据库失败");
+        }
+
+        let db = Database::new(&db_path).expect("迁移数据库失败");
+        let conn = db.conn.lock().expect("锁定数据库失败");
+        let report_hits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM daily_reports_fts WHERE daily_reports_fts MATCH 'legacyreporttoken'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("查询日报索引失败");
+        let summary_hits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM hourly_summaries_fts WHERE hourly_summaries_fts MATCH 'legacyhourtoken'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("查询小时摘要索引失败");
+        assert_eq!(report_hits, 1);
+        assert_eq!(summary_hits, 1);
+        drop(conn);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn 实体分类同步应由较新记录胜出() {
+        let db_path = temp_db_path("sync-entity-category");
+        let db = Database::new(&db_path).expect("创建数据库失败");
+        let newer = super::SyncEntityCategory {
+            entity_key: "app:codex".to_string(),
+            base_category: "development".to_string(),
+            semantic_category: "AI协作".to_string(),
+            source: "ai".to_string(),
+            created_at: 20,
+        };
+        assert!(db
+            .upsert_sync_entity_category(&newer)
+            .expect("写入分类失败"));
+
+        let mut older = newer.clone();
+        older.semantic_category = "其他".to_string();
+        older.created_at = 10;
+        assert!(!db
+            .upsert_sync_entity_category(&older)
+            .expect("写入旧分类失败"));
+
+        let records = db
+            .get_sync_entity_categories_since(0)
+            .expect("读取分类失败");
+        assert_eq!(records, vec![newer]);
+        let _ = std::fs::remove_file(db_path);
     }
 }

@@ -28,6 +28,8 @@
   import { getViewportPopoverPlacement } from '../../lib/utils/popoverPosition.js';
   import { prepareTimelineActivities, upsertTimelineActivity } from './timelineData.js';
   import LocalizedDatePicker from '../../lib/components/LocalizedDatePicker.svelte';
+  import DeviceFilter from '../../lib/components/DeviceFilter.svelte';
+  import { selectedDeviceId } from '../../lib/stores/deviceFilter.js';
   import HourlySummaryDrawer from './HourlySummaryDrawer.svelte';
   import { confirm } from '../../lib/stores/confirm.js';
 
@@ -688,8 +690,8 @@
 
     try {
       const [activitiesData, summariesData] = await Promise.all([
-        invoke('get_timeline', { date: requestDate, limit: PAGE_SIZE, offset: 0 }),
-        invoke('get_hourly_summaries', { date: requestDate }),
+        invoke('get_timeline', { date: requestDate, limit: PAGE_SIZE, offset: 0, deviceId: $selectedDeviceId }),
+        invoke('get_hourly_summaries', { date: requestDate, deviceId: $selectedDeviceId }),
       ]);
 
       if (requestId !== loadTimelineRequestId || requestDate !== selectedDate) return;
@@ -747,6 +749,7 @@
         date: requestDate,
         limit: PAGE_SIZE, 
         offset: requestOffset,
+        deviceId: $selectedDeviceId,
       });
 
       if (requestId !== loadMoreRequestId || requestDate !== selectedDate) return;
@@ -793,7 +796,7 @@
     summaryRefreshError = null;
 
     try {
-      const summariesData = await invoke('get_hourly_summaries', { date: requestDate });
+      const summariesData = await invoke('get_hourly_summaries', { date: requestDate, deviceId: $selectedDeviceId });
       if (requestId !== summaryRefreshRequestId || requestDate !== selectedDate) return;
       hourlySummaries = summariesData;
     } catch (e) {
@@ -1207,6 +1210,10 @@
     summaryRefreshError = null;
     loadTimeline();
   }
+  $: if ($selectedDeviceId !== undefined) {
+    $selectedDeviceId;
+    if (lastLoadedDate) loadTimeline();
+  }
 
   $: featuredActivityIds = new Set(selectFeaturedActivityIds(activities));
 
@@ -1317,6 +1324,7 @@
       </div>
     </div>
     <div class="page-toolbar">
+      <DeviceFilter />
       {#key `timeline-date-${currentLocale}`}
         <LocalizedDatePicker
           bind:value={selectedDate}
