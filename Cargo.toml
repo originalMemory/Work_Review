@@ -6,6 +6,7 @@ members = [
     "crates/skills-engine",
     "src-tauri",
 ]
+exclude = ["sync-server"]
 
 [profile.release]
 opt-level = 3

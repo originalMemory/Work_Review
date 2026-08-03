@@ -5,6 +5,7 @@ node_modules/
 dist/
 src-tauri/target/
 test_uia/target/
+sync-server/target/
 test_uia/*.txt
 
 # IDE
