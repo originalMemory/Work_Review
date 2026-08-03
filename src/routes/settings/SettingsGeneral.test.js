@@ -187,3 +187,16 @@ test('工作时间设置应支持分段配置并写回 work_time_segments', asyn
   assert.match(source, /function removeWorkSegment\(/);
   assert.match(source, /function updateSegment\(/);
 });
+
+test('基本设置应支持从当前设备记录中配置空闲豁免应用', async () => {
+  const source = await readFile(
+    new URL('./components/SettingsGeneral.svelte', import.meta.url),
+    'utf8'
+  );
+
+  assert.match(source, /invoke\('get_recorded_app_names'\)/);
+  assert.match(source, /config\.idle_exempt_app_names/);
+  assert.match(source, /function addIdleExempt\(/);
+  assert.match(source, /function removeIdleExempt\(/);
+  assert.match(source, /settingsGeneral\.idleExemptTitle/);
+});

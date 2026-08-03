@@ -10,6 +10,8 @@
   $: currentLocale = $locale;
   let workHours = '—';
   let autoStartEnabled = false;
+  let recordedAppNames = [];
+  let addIdleExemptSelection = '';
   const MAX_WORK_SEGMENTS = 8;
 
   onMount(async () => {
@@ -27,7 +29,30 @@
     } catch (e) {
       console.error('查询自启动状态失败:', e);
     }
+    try {
+      recordedAppNames = await invoke('get_recorded_app_names');
+    } catch (e) {
+      console.error('加载已记录应用列表失败:', e);
+      recordedAppNames = [];
+    }
   });
+
+  $: idleExemptList = config?.idle_exempt_app_names ?? [];
+  $: idleExemptAddOptions = [...new Set([...recordedAppNames, ...idleExemptList])]
+    .filter((name) => !idleExemptList.includes(name))
+    .sort((left, right) => left.localeCompare(right));
+
+  function removeIdleExempt(name) {
+    config.idle_exempt_app_names = idleExemptList.filter((item) => item !== name);
+    handleChange();
+  }
+
+  function addIdleExempt() {
+    if (!addIdleExemptSelection || idleExemptList.includes(addIdleExemptSelection)) return;
+    config.idle_exempt_app_names = [...idleExemptList, addIdleExemptSelection];
+    addIdleExemptSelection = '';
+    handleChange();
+  }
 
   function normalizeHour(value) {
     const parsed = Number.parseInt(value, 10);
@@ -368,6 +393,52 @@
             />
             <span class="text-xs settings-subtle">{t('settingsGeneral.minutesUnit')}</span>
           </div>
+        </div>
+
+        <!-- 空闲检测豁免应用 -->
+        <div class="mt-4 border-t border-slate-200 pt-4 dark:border-[#30363d]">
+          <span class="settings-text text-sm">{t('settingsGeneral.idleExemptTitle')}</span>
+          <p class="settings-muted mt-0.5">{t('settingsGeneral.idleExemptDescription')}</p>
+
+          <div class="mt-3 flex min-h-8 flex-wrap gap-2">
+            {#if idleExemptList.length === 0}
+              <span class="settings-subtle">{t('settingsGeneral.idleExemptEmpty')}</span>
+            {:else}
+              {#each idleExemptList as name (name)}
+                <span class="inline-flex items-center gap-1 rounded-full bg-slate-200 px-2.5 py-1 text-sm text-slate-800 dark:bg-slate-700 dark:text-slate-100">
+                  {name}
+                  <button
+                    type="button"
+                    class="rounded px-1 text-slate-500 hover:bg-slate-300 hover:text-slate-800 dark:hover:bg-slate-600 dark:hover:text-white"
+                    aria-label={t('settingsGeneral.idleExemptRemoveAria', { name })}
+                    on:click={() => removeIdleExempt(name)}
+                  >×</button>
+                </span>
+              {/each}
+            {/if}
+          </div>
+
+          <div class="mt-3 flex flex-wrap items-center gap-2">
+            <select
+              bind:value={addIdleExemptSelection}
+              aria-label={t('settingsGeneral.idleExemptAddPlaceholder')}
+              class="min-w-48 rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-sm text-slate-800 dark:border-[#484f58] dark:bg-[#21262d] dark:text-slate-100"
+            >
+              <option value="">{t('settingsGeneral.idleExemptAddPlaceholder')}</option>
+              {#each idleExemptAddOptions as name (name)}
+                <option value={name}>{name}</option>
+              {/each}
+            </select>
+            <button
+              type="button"
+              class="settings-action-secondary px-3 py-1.5 text-xs"
+              disabled={!addIdleExemptSelection}
+              on:click={addIdleExempt}
+            >{t('settingsGeneral.idleExemptAdd')}</button>
+          </div>
+          {#if recordedAppNames.length === 0}
+            <p class="settings-note mt-2">{t('settingsGeneral.idleExemptNoCandidates')}</p>
+          {/if}
         </div>
       </CollapsibleSection>
     </div>

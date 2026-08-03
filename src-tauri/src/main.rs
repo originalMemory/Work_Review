@@ -1186,12 +1186,23 @@ fn previous_app_backfill_duration(
     duration_to_record: i64,
     was_input_idle: bool,
     is_confirmed_idle: bool,
+    previous_app_idle_exempt: bool,
 ) -> i64 {
-    if !app_changed || duration_to_record <= 0 || was_input_idle || is_confirmed_idle {
+    if !app_changed || duration_to_record <= 0 {
+        return 0;
+    }
+    if previous_app_idle_exempt {
+        return duration_to_record;
+    }
+    if was_input_idle || is_confirmed_idle {
         0
     } else {
         duration_to_record
     }
+}
+
+fn should_zero_duration_for_idle(is_confirmed_idle: bool, app_idle_exempt: bool) -> bool {
+    is_confirmed_idle && !app_idle_exempt
 }
 
 fn should_persist_merge_update(effective_duration: i64) -> bool {
@@ -2481,6 +2492,16 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
         } else {
             duration_to_record
         };
+        let (current_app_idle_exempt, previous_app_idle_exempt) = {
+            let state_guard = state.lock().unwrap_or_else(|e| e.into_inner());
+            let current = state_guard
+                .config
+                .is_idle_exempt_app(&active_window.app_name);
+            let previous = previous_app_name
+                .as_deref()
+                .is_some_and(|name| state_guard.config.is_idle_exempt_app(name));
+            (current, previous)
+        };
 
         use privacy::PrivacyAction;
         let result: Option<database::Activity> = match privacy_action {
@@ -2499,6 +2520,7 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                     duration_to_record,
                     was_input_idle,
                     skip_is_confirmed_idle,
+                    previous_app_idle_exempt,
                 );
                 backfill_previous_activity_if_needed(
                     &state,
@@ -2534,6 +2556,7 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                     duration_to_record,
                     was_input_idle,
                     anonymized_is_confirmed_idle,
+                    previous_app_idle_exempt,
                 );
                 backfill_previous_activity_if_needed(
                     &state,
@@ -2545,7 +2568,10 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                     current_timestamp,
                     &active_window.app_name,
                 );
-                let effective_duration = if anonymized_is_confirmed_idle {
+                let effective_duration = if should_zero_duration_for_idle(
+                    anonymized_is_confirmed_idle,
+                    current_app_idle_exempt,
+                ) {
                     log::debug!("空闲确认: 脱敏活动跳过时长记录");
                     0
                 } else {
@@ -2713,6 +2739,7 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                         duration_to_record,
                         was_input_idle,
                         is_confirmed_idle,
+                        previous_app_idle_exempt,
                     );
                     backfill_previous_activity_if_needed(
                         &state,
@@ -2726,7 +2753,10 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                     );
 
                     // 如果确认空闲，跳过时长记录
-                    let effective_duration = if is_confirmed_idle {
+                    let effective_duration = if should_zero_duration_for_idle(
+                        is_confirmed_idle,
+                        current_app_idle_exempt,
+                    ) {
                         log::debug!("空闲确认: 跳过本次时长记录");
                         0
                     } else {
@@ -2926,6 +2956,7 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                                     duration_to_record,
                                     was_input_idle,
                                     is_confirmed_idle,
+                                    previous_app_idle_exempt,
                                 );
                                 backfill_previous_activity_if_needed(
                                     &state,
@@ -2939,7 +2970,10 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                                 );
 
                                 // 如果确认空闲，跳过时长记录（但仍创建活动记录以保持截图）
-                                let effective_duration = if is_confirmed_idle {
+                                let effective_duration = if should_zero_duration_for_idle(
+                                    is_confirmed_idle,
+                                    current_app_idle_exempt,
+                                ) {
                                     log::debug!("空闲确认: 新活动时长设为 0");
                                     0
                                 } else {
@@ -3127,6 +3161,7 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                             duration_to_record,
                             was_input_idle,
                             is_confirmed_idle,
+                            previous_app_idle_exempt,
                         );
                         backfill_previous_activity_if_needed(
                             &state,
@@ -3138,7 +3173,10 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                             current_timestamp,
                             &active_window.app_name,
                         );
-                        let effective_duration = if is_confirmed_idle {
+                        let effective_duration = if should_zero_duration_for_idle(
+                            is_confirmed_idle,
+                            current_app_idle_exempt,
+                        ) {
                             log::debug!("关闭截图后按输入空闲判定，新活动时长设为 0");
                             0
                         } else {
@@ -4572,6 +4610,7 @@ async fn main() {
             commands::fetch_models,
             commands::get_running_apps,
             commands::get_recent_apps,
+            commands::get_recorded_app_names,
             commands::set_app_category_rule,
             commands::set_domain_semantic_rule,
             commands::get_categories,
@@ -4672,9 +4711,9 @@ mod tests {
         should_initialize_avatar_input, should_initialize_startup_permissions,
         should_merge_contiguous_activity, should_persist_merge_update, should_prevent_exit,
         should_probe_browser_url_before_change_detection, should_request_screen_capture_permission,
-        should_run_startup_cleanup, should_skip_system_window, tray_recording_toggle_action,
-        tray_recording_toggle_label, AvatarNudgeRuntime, BreakReminderRuntime, BreakReminderSignal,
-        MainWindowCloseBehavior, RecordingToggleAction,
+        should_run_startup_cleanup, should_skip_system_window, should_zero_duration_for_idle,
+        tray_recording_toggle_action, tray_recording_toggle_label, AvatarNudgeRuntime,
+        BreakReminderRuntime, BreakReminderSignal, MainWindowCloseBehavior, RecordingToggleAction,
     };
     use crate::avatar_engine::{
         apply_avatar_visual_settings, default_avatar_state, derive_avatar_state,
@@ -4780,13 +4819,32 @@ mod tests {
 
     #[test]
     fn 已进入输入空闲后切换应用不应回补上一应用时长() {
-        assert_eq!(previous_app_backfill_duration(true, 3600, true, false), 0);
-        assert_eq!(previous_app_backfill_duration(true, 3600, false, true), 0);
         assert_eq!(
-            previous_app_backfill_duration(true, 3600, false, false),
+            previous_app_backfill_duration(true, 3600, true, false, false),
+            0
+        );
+        assert_eq!(
+            previous_app_backfill_duration(true, 3600, false, true, false),
+            0
+        );
+        assert_eq!(
+            previous_app_backfill_duration(true, 3600, false, false, false),
             3600
         );
-        assert_eq!(previous_app_backfill_duration(false, 3600, false, false), 0);
+        assert_eq!(
+            previous_app_backfill_duration(false, 3600, false, false, false),
+            0
+        );
+    }
+
+    #[test]
+    fn 空闲豁免应用切换时仍应回补上一应用时长() {
+        assert_eq!(
+            previous_app_backfill_duration(true, 3600, true, true, true),
+            3600
+        );
+        assert!(!should_zero_duration_for_idle(true, true));
+        assert!(should_zero_duration_for_idle(true, false));
     }
 
     #[test]

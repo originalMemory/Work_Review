@@ -3599,6 +3599,23 @@ impl Database {
             .collect())
     }
 
+    /// 列出当前设备活动中出现过的原始应用名，供空闲豁免配置选择。
+    pub fn list_distinct_recorded_app_names(&self, device_id: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().map_err(|error| {
+            AppError::Database(rusqlite::Error::InvalidParameterName(error.to_string()))
+        })?;
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT app_name FROM activities
+             WHERE TRIM(app_name) != '' AND app_name != 'Unknown' AND device_id = ?1
+             ORDER BY app_name COLLATE NOCASE",
+        )?;
+        let names = stmt
+            .query_map(params![device_id], |row| row.get::<_, String>(0))?
+            .filter_map(|row| row.ok())
+            .collect();
+        Ok(names)
+    }
+
     /// 获取历史应用详情（按使用时长排序），包含最近可用的远程截图 URL
     pub fn get_recent_app_usage(&self, limit: u32) -> Result<Vec<AppUsage>> {
         use std::collections::HashMap;
@@ -6644,6 +6661,7 @@ mod tests {
         let mut remote = local[0].clone();
         remote.uuid = uuid::Uuid::now_v7().to_string();
         remote.device_id = "device-b".to_string();
+        remote.activity.app_name = "Remote Player".to_string();
         remote.activity.window_title = "remote.rs".to_string();
         db.upsert_sync_activity(&remote).expect("写入远端活动失败");
 
@@ -6652,6 +6670,16 @@ mod tests {
             .expect("按设备读取时间线失败");
         assert_eq!(device_b.len(), 1);
         assert_eq!(device_b[0].window_title, "remote.rs");
+        assert_eq!(
+            db.list_distinct_recorded_app_names("device-a")
+                .expect("读取本机应用名失败"),
+            vec!["Code"]
+        );
+        assert_eq!(
+            db.list_distinct_recorded_app_names("device-b")
+                .expect("读取远端应用名失败"),
+            vec!["Remote Player"]
+        );
         let _ = std::fs::remove_file(db_path);
     }
 

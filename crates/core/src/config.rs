@@ -1052,6 +1052,9 @@ pub struct AppConfig {
     /// 概览、时间线与日报共用的设备筛选；None 表示全部设备
     #[serde(default)]
     pub ui_selected_device_id: Option<String>,
+    /// 空闲检测豁免应用；名称与活动记录中的 app_name 精确匹配
+    #[serde(default)]
+    pub idle_exempt_app_names: Vec<String>,
     /// 日报附加提示词
     #[serde(default)]
     pub daily_report_custom_prompt: String,
@@ -1378,6 +1381,7 @@ impl Default for AppConfig {
             remote_storage: RemoteStorageConfig::default(),
             sync: SyncConfig::default(),
             ui_selected_device_id: None,
+            idle_exempt_app_names: Vec::new(),
             daily_report_custom_prompt: String::new(),
             daily_report_prompt_presets: Vec::new(),
             daily_report_system_prompt_override: None,
@@ -1525,9 +1529,24 @@ impl AppConfig {
             normalize_optional_string(self.remote_storage.webdav.public_url_base.take());
         self.sync.normalize();
         self.ui_selected_device_id = normalize_optional_string(self.ui_selected_device_id.take());
+        let mut seen = std::collections::HashSet::new();
+        self.idle_exempt_app_names = self
+            .idle_exempt_app_names
+            .drain(..)
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .filter(|name| seen.insert(name.clone()))
+            .collect();
+        self.idle_exempt_app_names.sort();
         self.node_gateway.device_name =
             normalize_optional_string(self.node_gateway.device_name.take());
         self.sync_text_model_profiles();
+    }
+
+    pub fn is_idle_exempt_app(&self, app_name: &str) -> bool {
+        self.idle_exempt_app_names
+            .iter()
+            .any(|name| name == app_name)
     }
 
     /// 从文件加载配置
@@ -2852,6 +2871,23 @@ mod tests {
             config.remote_storage.webdav.public_url_base.as_deref(),
             Some("https://cdn.example.com/base/")
         );
+    }
+
+    #[test]
+    fn 空闲豁免应用应去重清理并保持精确匹配() {
+        let mut config = AppConfig::default();
+        config.idle_exempt_app_names = vec![
+            " IINA ".to_string(),
+            "IINA".to_string(),
+            "  ".to_string(),
+            "Game".to_string(),
+        ];
+
+        config.normalize();
+
+        assert_eq!(config.idle_exempt_app_names, vec!["Game", "IINA"]);
+        assert!(config.is_idle_exempt_app("IINA"));
+        assert!(!config.is_idle_exempt_app("iina"));
     }
 
     #[test]

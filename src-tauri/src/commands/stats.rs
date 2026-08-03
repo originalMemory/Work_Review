@@ -865,6 +865,17 @@ pub async fn get_recent_apps(
     get_recent_apps_inner(state.inner())
 }
 
+/// 获取当前设备已记录的原始应用名，供空闲豁免选择。
+#[tauri::command]
+pub async fn get_recorded_app_names(
+    state: State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Vec<String>, AppError> {
+    let state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
+    state
+        .database
+        .list_distinct_recorded_app_names(&state.config.sync.device_id)
+}
+
 /// 获取当前运行的应用列表
 #[tauri::command]
 pub async fn get_running_apps() -> Result<Vec<String>, AppError> {
