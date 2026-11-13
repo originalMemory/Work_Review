@@ -9,7 +9,6 @@ const activity = {
   app_name: 'Code',
   window_title: 'timelineGateway.test.ts',
   screenshot_path: '',
-  ocr_text: null,
   category: 'development',
   duration: 60,
   browser_url: null,

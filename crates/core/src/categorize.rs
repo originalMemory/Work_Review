@@ -339,7 +339,7 @@ fn is_probable_domain(value: &str) -> bool {
 
     let tld = labels.last().copied().unwrap_or_default();
     // TLD 最少 2 字符、最多 12 字符，且必须全是 ASCII 字母
-    // 上限防止 OCR 丢失斜杠后把域名和路径拼为超长假 TLD（如 github.comwm94i）
+    // 上限防止网址缺少斜杠后把域名和路径拼为超长假 TLD（如 github.comwm94i）
     if tld.len() < 2 || tld.len() > 12 || !tld.chars().all(|c| c.is_ascii_alphabetic()) {
         return false;
     }
@@ -479,8 +479,8 @@ fn extract_url_from_text(text: &str) -> Option<String> {
         .next()
 }
 
-/// 检测是否为可疑的 host-only 域名（可能由 OCR 丢失斜杠导致域名+路径合并）
-/// 例如 `linux.do/latest` → OCR 丢失 `/` → `linux.dolatest`
+/// 检测是否为可疑的 host-only 域名（可能由网址缺少斜杠导致域名+路径合并）
+/// 例如 `linux.do/latest` → 缺少 `/` → `linux.dolatest`
 pub fn is_merged_domain(url: &str) -> bool {
     let without_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
 
@@ -533,24 +533,14 @@ pub fn infer_browser_page_hint(window_title: &str) -> Option<String> {
     extract_url_from_title(window_title).filter(|url| !is_merged_domain(url))
 }
 
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-pub fn infer_browser_page_hint_from_text(text: &str) -> Option<String> {
-    extract_url_from_text(text).filter(|url| !is_merged_domain(url))
-}
-
-/// 按采集网址、窗口标题、OCR 文本的优先级解析浏览器页面。
-/// 保留页面路径供展示使用；可疑的合并域名不能阻止标题和 OCR 兜底。
-pub fn resolve_browser_page_hint(
-    browser_url: Option<&str>,
-    window_title: &str,
-    ocr_text: Option<&str>,
-) -> Option<String> {
+/// 按采集网址、窗口标题的优先级解析浏览器页面。
+/// 保留页面路径供展示使用，可疑域名由窗口标题解析。
+pub fn resolve_browser_page_hint(browser_url: Option<&str>, window_title: &str) -> Option<String> {
     browser_url
         .map(|url| url.trim().trim_end_matches('/'))
         .filter(|url| !url.is_empty() && !is_merged_domain(url))
         .map(str::to_string)
         .or_else(|| infer_browser_page_hint(window_title))
-        .or_else(|| ocr_text.and_then(infer_browser_page_hint_from_text))
 }
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -1152,57 +1142,6 @@ mod tests {
     }
 
     #[test]
-    fn 浏览器页面解析应统一网址标题和ocr的优先级() {
-        let cases = [
-            (
-                Some(" https://example.com/from-url/ "),
-                "https://title.example/page - Chrome",
-                Some("https://ocr.example/page"),
-                Some("https://example.com/from-url"),
-            ),
-            (
-                None,
-                "title.example - Chrome",
-                Some("https://ocr.example/page"),
-                Some("https://title.example"),
-            ),
-            (
-                Some(" \t\n "),
-                "title.example - Chrome",
-                None,
-                Some("https://title.example"),
-            ),
-            (
-                Some(""),
-                "页面加载中",
-                Some("当前页面 https://ocr.example/page"),
-                Some("https://ocr.example/page"),
-            ),
-            (
-                Some("https://linux.dolatest/"),
-                "title.example - Chrome",
-                Some("https://ocr.example/page"),
-                Some("https://title.example"),
-            ),
-            (
-                Some("linux.dolatest"),
-                "页面加载中",
-                Some("当前页面 https://ocr.example/page"),
-                Some("https://ocr.example/page"),
-            ),
-            (None, "页面加载中", None, None),
-        ];
-
-        for (browser_url, title, ocr_text, expected) in cases {
-            assert_eq!(
-                resolve_browser_page_hint(browser_url, title, ocr_text).as_deref(),
-                expected,
-                "网址={browser_url:?}，标题={title}，OCR={ocr_text:?}"
-            );
-        }
-    }
-
-    #[test]
     fn 网站域名规则应规范化后精确匹配() {
         assert_eq!(
             normalize_domain_rule(" HTTPS://Docs.Example.com:443/path?q=1 "),
@@ -1246,5 +1185,33 @@ mod tests {
         assert_eq!(normalize_display_app_name("eqmac"), "eqMac");
         assert_eq!(normalize_display_app_name("yabai"), "yabai");
         assert_eq!(normalize_display_app_name("Safari"), "Safari");
+    }
+    #[test]
+    fn 浏览器页面解析应优先网址并使用标题补充() {
+        for (url, title, expected) in [
+            (
+                Some("https://url.example/page/"),
+                "title.example - Chrome",
+                Some("https://url.example/page"),
+            ),
+            (
+                None,
+                "title.example - Chrome",
+                Some("https://title.example"),
+            ),
+            (
+                Some(""),
+                "title.example - Chrome",
+                Some("https://title.example"),
+            ),
+            (
+                Some("https://linux.dolatest/"),
+                "title.example - Chrome",
+                Some("https://title.example"),
+            ),
+            (None, "页面加载中", None),
+        ] {
+            assert_eq!(resolve_browser_page_hint(url, title).as_deref(), expected);
+        }
     }
 }

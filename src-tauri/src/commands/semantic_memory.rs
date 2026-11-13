@@ -1,6 +1,6 @@
 //! 语义记忆（屏幕级数字记忆）。
 //!
-//! 把已采集的 OCR 文本、窗口标题和 URL 聚合为记忆块，经嵌入模型向量化后支持
+//! 把已采集的窗口标题和 URL 聚合为记忆块，经嵌入模型向量化后支持
 //! 语义检索。索引与召回均执行当前完整隐私规则；任何状态或指纹不一致都会关闭
 //! 向量召回并降级为关键词检索，避免使用过期或不符合当前隐私配置的向量。
 
@@ -350,7 +350,6 @@ pub(crate) fn build_chunk_drafts(activities: &[Activity]) -> Vec<ChunkDraft> {
         app_name: String,
         title: String,
         browser_url: Option<String>,
-        best_ocr: String,
         titles: Vec<String>,
         last_activity_id: i64,
     }
@@ -362,8 +361,7 @@ pub(crate) fn build_chunk_drafts(activities: &[Activity]) -> Vec<ChunkDraft> {
         if title.is_empty() || title == "[内容已脱敏]" {
             continue;
         }
-        let ocr = activity.ocr_text.as_deref().unwrap_or("").trim();
-        if ocr.is_empty() && activity.browser_url.is_none() && title.chars().count() < 4 {
+        if activity.browser_url.is_none() && title.chars().count() < 4 {
             continue;
         }
 
@@ -381,14 +379,10 @@ pub(crate) fn build_chunk_drafts(activities: &[Activity]) -> Vec<ChunkDraft> {
             app_name: activity.app_name.clone(),
             title: title.to_string(),
             browser_url: activity.browser_url.clone(),
-            best_ocr: String::new(),
             titles: Vec::new(),
             last_activity_id: id,
         });
         entry.last_activity_id = entry.last_activity_id.max(id);
-        if ocr.chars().count() > entry.best_ocr.chars().count() {
-            entry.best_ocr = ocr.to_string();
-        }
         if entry.browser_url.is_none() {
             entry.browser_url = activity.browser_url.clone();
         }
@@ -404,10 +398,6 @@ pub(crate) fn build_chunk_drafts(activities: &[Activity]) -> Vec<ChunkDraft> {
             let mut content = format!("{} | {}", group.app_name, group.titles.join(" / "));
             if let Some(url) = &group.browser_url {
                 content.push_str(&format!("\n{url}"));
-            }
-            if !group.best_ocr.is_empty() {
-                content.push('\n');
-                content.push_str(&group.best_ocr);
             }
             let content: String = content.chars().take(CHUNK_CONTENT_MAX_CHARS).collect();
             ChunkDraft {
@@ -984,21 +974,13 @@ mod tests {
     use super::*;
     use work_review_core::config::{AppPrivacyRule, PrivacyLevel};
 
-    fn activity(
-        id: i64,
-        timestamp: i64,
-        app: &str,
-        title: &str,
-        url: Option<&str>,
-        ocr: Option<&str>,
-    ) -> Activity {
+    fn activity(id: i64, timestamp: i64, app: &str, title: &str, url: Option<&str>) -> Activity {
         Activity {
             id: Some(id),
             timestamp,
             app_name: app.to_string(),
             window_title: title.to_string(),
             screenshot_path: String::new(),
-            ocr_text: ocr.map(ToString::to_string),
             category: "other".to_string(),
             duration: 30,
             browser_url: url.map(ToString::to_string),
@@ -1010,7 +992,7 @@ mod tests {
     }
 
     #[test]
-    fn 分块应按日期应用域名聚合并保留最长ocr() {
+    fn 分块应按日期应用域名聚合并保留标题网址() {
         let timestamp = 1_753_500_000;
         let activities = vec![
             activity(
@@ -1019,7 +1001,6 @@ mod tests {
                 "Chrome",
                 "Rust async 详解 - 博客",
                 Some("https://blog.example.com/rust-async"),
-                Some("短 OCR"),
             ),
             activity(
                 2,
@@ -1027,16 +1008,8 @@ mod tests {
                 "Chrome",
                 "Rust async 详解 - 博客",
                 Some("https://blog.example.com/rust-async?p=2"),
-                Some("这是一段更长的 OCR 文本内容示例"),
             ),
-            activity(
-                3,
-                timestamp + 120,
-                "Xcode",
-                "main.rs — work-review",
-                None,
-                Some("fn main() {}"),
-            ),
+            activity(3, timestamp + 120, "Xcode", "main.rs — work-review", None),
         ];
         let drafts = build_chunk_drafts(&activities);
         assert_eq!(drafts.len(), 2, "同域名网页应合并，Xcode 单独一块");
@@ -1044,7 +1017,7 @@ mod tests {
             .iter()
             .find(|draft| draft.app_name == "Chrome")
             .unwrap();
-        assert!(chrome.content.contains("更长的 OCR"), "应保留组内最长 OCR");
+        assert!(chrome.content.contains("Rust async 详解 - 博客"));
         assert!(chrome.content.contains("blog.example.com"));
         assert_eq!(chrome.last_activity_id, 2);
     }
@@ -1053,8 +1026,8 @@ mod tests {
     fn 分块应跳过脱敏与无价值记录() {
         let timestamp = 1_753_500_000;
         let activities = vec![
-            activity(1, timestamp, "App", "[内容已脱敏]", None, Some("不应出现")),
-            activity(2, timestamp, "App", "ab", None, None),
+            activity(1, timestamp, "App", "[内容已脱敏]", None),
+            activity(2, timestamp, "App", "ab", None),
         ];
         assert!(build_chunk_drafts(&activities).is_empty());
     }

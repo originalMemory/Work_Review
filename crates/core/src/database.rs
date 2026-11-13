@@ -110,7 +110,7 @@ fn matches_excluded_domain_for_stats(target: &str, excluded_domains: &[String]) 
 const UNRESOLVED_BROWSER_DOMAIN_LABEL: &str = "未识别页面";
 const UNRESOLVED_BROWSER_URL_LABEL: &str = "未识别 URL";
 
-const ACTIVITY_SELECT_COLUMNS: &str = "id, timestamp, app_name, window_title, screenshot_path, ocr_text, category, duration, browser_url, executable_path, semantic_category, semantic_confidence, screenshot_url";
+const ACTIVITY_SELECT_COLUMNS: &str = "id, timestamp, app_name, window_title, screenshot_path, category, duration, browser_url, executable_path, semantic_category, semantic_confidence, screenshot_url";
 
 fn activity_from_row(row: &Row<'_>) -> rusqlite::Result<Activity> {
     Ok(Activity {
@@ -119,14 +119,13 @@ fn activity_from_row(row: &Row<'_>) -> rusqlite::Result<Activity> {
         app_name: row.get(2)?,
         window_title: row.get(3)?,
         screenshot_path: row.get(4)?,
-        ocr_text: row.get(5)?,
-        category: row.get(6)?,
-        duration: row.get(7)?,
-        browser_url: row.get(8)?,
-        executable_path: row.get(9)?,
-        semantic_category: row.get(10)?,
-        semantic_confidence: row.get(11)?,
-        screenshot_url: row.get(12)?,
+        category: row.get(5)?,
+        duration: row.get(6)?,
+        browser_url: row.get(7)?,
+        executable_path: row.get(8)?,
+        semantic_category: row.get(9)?,
+        semantic_confidence: row.get(10)?,
+        screenshot_url: row.get(11)?,
     })
 }
 
@@ -138,7 +137,6 @@ pub struct Activity {
     pub app_name: String,
     pub window_title: String,
     pub screenshot_path: String,
-    pub ocr_text: Option<String>,
     pub category: String,
     pub duration: i64,
     /// 浏览器 URL（如果当前是浏览器应用）
@@ -848,7 +846,6 @@ impl Database {
                 app_name TEXT NOT NULL,
                 window_title TEXT NOT NULL,
                 screenshot_path TEXT NOT NULL,
-                ocr_text TEXT,
                 category TEXT NOT NULL,
                 duration INTEGER NOT NULL,
                 browser_url TEXT,
@@ -1149,11 +1146,28 @@ impl Database {
             [],
         )?;
 
+        let migration = conn.unchecked_transaction()?;
+        let removed_ocr: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('activities') WHERE name = 'ocr_text')",
+            [],
+            |row| row.get(0),
+        )?;
+        if removed_ocr {
+            migration.execute_batch(
+                "DROP TRIGGER IF EXISTS activities_ai;
+                 DROP TRIGGER IF EXISTS activities_ad;
+                 DROP TRIGGER IF EXISTS activities_au;
+                 DROP TABLE IF EXISTS activities_fts;
+                 ALTER TABLE activities DROP COLUMN ocr_text;",
+            )?;
+            Self::clear_memory_chunks_and_mark_rebuild_required_on(&migration)?;
+        }
+
         // === FTS5 全文检索索引 ===
-        // activities FTS: 索引窗口标题、OCR 文本、应用名、浏览器 URL
+        // activities FTS: 索引窗口标题、应用名、浏览器 URL
         conn.execute_batch(
             "CREATE VIRTUAL TABLE IF NOT EXISTS activities_fts USING fts5(
-                app_name, window_title, ocr_text, browser_url,
+                app_name, window_title, browser_url,
                 content='activities',
                 content_rowid='id',
                 tokenize='unicode61 remove_diacritics 2'
@@ -1161,22 +1175,22 @@ impl Database {
 
             -- 同步触发器：INSERT
             CREATE TRIGGER IF NOT EXISTS activities_ai AFTER INSERT ON activities BEGIN
-                INSERT INTO activities_fts(rowid, app_name, window_title, ocr_text, browser_url)
-                VALUES (new.id, new.app_name, new.window_title, new.ocr_text, new.browser_url);
+                INSERT INTO activities_fts(rowid, app_name, window_title, browser_url)
+                VALUES (new.id, new.app_name, new.window_title, new.browser_url);
             END;
 
             -- 同步触发器：DELETE
             CREATE TRIGGER IF NOT EXISTS activities_ad AFTER DELETE ON activities BEGIN
-                INSERT INTO activities_fts(activities_fts, rowid, app_name, window_title, ocr_text, browser_url)
-                VALUES ('delete', old.id, old.app_name, old.window_title, old.ocr_text, old.browser_url);
+                INSERT INTO activities_fts(activities_fts, rowid, app_name, window_title, browser_url)
+                VALUES ('delete', old.id, old.app_name, old.window_title, old.browser_url);
             END;
 
             -- 同步触发器：UPDATE
             CREATE TRIGGER IF NOT EXISTS activities_au AFTER UPDATE ON activities BEGIN
-                INSERT INTO activities_fts(activities_fts, rowid, app_name, window_title, ocr_text, browser_url)
-                VALUES ('delete', old.id, old.app_name, old.window_title, old.ocr_text, old.browser_url);
-                INSERT INTO activities_fts(rowid, app_name, window_title, ocr_text, browser_url)
-                VALUES (new.id, new.app_name, new.window_title, new.ocr_text, new.browser_url);
+                INSERT INTO activities_fts(activities_fts, rowid, app_name, window_title, browser_url)
+                VALUES ('delete', old.id, old.app_name, old.window_title, old.browser_url);
+                INSERT INTO activities_fts(rowid, app_name, window_title, browser_url)
+                VALUES (new.id, new.app_name, new.window_title, new.browser_url);
             END;"
         )?;
 
@@ -1234,6 +1248,12 @@ impl Database {
             END;"
         )?;
 
+        if removed_ocr {
+            conn.execute(
+                "INSERT INTO activities_fts(activities_fts) VALUES('rebuild')",
+                [],
+            )?;
+        }
         if hourly_summaries_recreated {
             conn.execute(
                 "INSERT INTO hourly_summaries_fts(hourly_summaries_fts) VALUES('rebuild')",
@@ -1247,6 +1267,7 @@ impl Database {
             )?;
         }
 
+        migration.commit()?;
         Ok(())
     }
 
@@ -1468,14 +1489,13 @@ impl Database {
         let activity_uuid = uuid::Uuid::now_v7().to_string();
         let device_id = self.local_device_id();
         tx.execute(
-            "INSERT INTO activities (timestamp, app_name, window_title, screenshot_path, ocr_text, category, duration, browser_url, executable_path, semantic_category, semantic_confidence, screenshot_url, uuid, device_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            "INSERT INTO activities (timestamp, app_name, window_title, screenshot_path, category, duration, browser_url, executable_path, semantic_category, semantic_confidence, screenshot_url, uuid, device_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 activity.timestamp,
                 activity.app_name,
                 activity.window_title,
                 activity.screenshot_path,
-                activity.ocr_text,
                 activity.category,
                 activity.duration,
                 normalized_browser_url,
@@ -1646,127 +1666,27 @@ impl Database {
         }
     }
 
-    /// 合并活动：累加时长、追加OCR、更新截图路径、更新 browser_url
+    /// 合并活动时累加时长并更新区间终点与网址。
     pub fn merge_activity(
         &self,
         id: i64,
         duration_delta: i64,
-        new_ocr: Option<&str>,
-        _new_screenshot_path: &str,
         new_timestamp: i64,
         new_browser_url: Option<&str>,
     ) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| {
             AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
         })?;
-
-        // 获取现有的 OCR 内容
-        let existing_ocr: Option<String> = conn
-            .query_row(
-                "SELECT ocr_text FROM activities WHERE id = ?1",
-                params![id],
-                |row| row.get(0),
-            )
-            .ok();
-
-        // 合并 OCR：追加新内容
-        let merged_ocr = match (existing_ocr, new_ocr) {
-            (Some(existing), Some(new)) if !new.is_empty() => {
-                // 追加新内容，用分隔符隔开
-                Some(format!("{existing}\n---\n{new}"))
-            }
-            (Some(existing), _) => Some(existing),
-            (None, Some(new)) => Some(new.to_string()),
-            (None, None) => None,
-        };
-
-        // 如果有新的 browser_url，一并更新（解决 SPA 页面导航后 URL 不刷新的问题）
-        if let Some(url) = new_browser_url
+        let url = new_browser_url
             .map(normalize_url)
-            .filter(|url| !url.is_empty())
-        {
-            conn.execute(
-                "UPDATE activities
-                 SET duration = duration + ?1,
-                     ocr_text = ?2,
-                     timestamp = ?3,
-                     browser_url = ?5
-                 WHERE id = ?4",
-                params![duration_delta, merged_ocr, new_timestamp, id, url],
-            )?;
-        } else {
-            conn.execute(
-                "UPDATE activities
-                 SET duration = duration + ?1,
-                     ocr_text = ?2,
-                     timestamp = ?3
-                 WHERE id = ?4",
-                params![duration_delta, merged_ocr, new_timestamp, id],
-            )?;
-        }
-
-        Ok(())
-    }
-
-    /// 更新活动的 OCR 文本，并让异步识别出的浏览器页面应用最新网站分类规则。
-    pub fn update_activity_ocr(
-        &self,
-        id: i64,
-        ocr_text: Option<String>,
-        website_rules: &[crate::config::WebsiteSemanticRule],
-    ) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| {
-            AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
-        })?;
-        let tx = conn.unchecked_transaction()?;
-
-        tx.execute(
-            "UPDATE activities SET ocr_text = ?1 WHERE id = ?2",
-            params![ocr_text, id],
+            .filter(|url| !url.is_empty());
+        conn.execute(
+            "UPDATE activities SET duration = duration + ?1, timestamp = ?2,
+             browser_url = COALESCE(?3, browser_url) WHERE id = ?4",
+            params![duration_delta, new_timestamp, url, id],
         )?;
-
-        if !website_rules.is_empty() {
-            let activity: Option<(String, String, Option<String>, String)> = tx
-                .query_row(
-                    "SELECT app_name, window_title, browser_url, category
-                     FROM activities WHERE id = ?1",
-                    [id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                )
-                .optional()?;
-
-            if let Some((app_name, window_title, browser_url, category)) = activity {
-                if crate::categorize::is_browser_app(&app_name) {
-                    let page_hint = crate::categorize::resolve_browser_page_hint(
-                        browser_url.as_deref(),
-                        &window_title,
-                        ocr_text.as_deref(),
-                    );
-                    if let Some(semantic_category) =
-                        crate::categorize::find_website_semantic_override(
-                            website_rules,
-                            page_hint.as_deref(),
-                        )
-                    {
-                        let base_category = crate::categorize::semantic_category_to_base_category(
-                            &semantic_category,
-                            &category,
-                        );
-                        tx.execute(
-                            "UPDATE activities
-                             SET category = ?1, semantic_category = ?2, semantic_confidence = 100
-                             WHERE id = ?3",
-                            params![base_category, semantic_category, id],
-                        )?;
-                    }
-                }
-            }
-        }
-
-        tx.commit()?;
         Ok(())
     }
-
     /// 更新活动的远程截图 URL（远程上传成功后调用）
     pub fn update_activity_screenshot_url(&self, id: i64, url: &str) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| {
@@ -2337,7 +2257,6 @@ impl Database {
             "SELECT timestamp,
                     app_name,
                     window_title,
-                    ocr_text,
                     category,
                     duration,
                     browser_url,
@@ -2356,14 +2275,13 @@ impl Database {
                 row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, i64>(5)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, Option<String>>(5)?,
                 row.get::<_, Option<String>>(6)?,
                 row.get::<_, Option<String>>(7)?,
-                row.get::<_, Option<String>>(8)?,
-                row.get::<_, String>(9)?,
-                row.get::<_, Option<String>>(10)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, Option<String>>(9)?,
             ))
         })?;
 
@@ -2409,7 +2327,6 @@ impl Database {
             timestamp,
             app_name,
             window_title,
-            ocr_text,
             category,
             duration,
             browser_url,
@@ -2432,7 +2349,6 @@ impl Database {
                 let page_hint = crate::categorize::resolve_browser_page_hint(
                     browser_url.as_deref(),
                     &window_title,
-                    ocr_text.as_deref(),
                 );
 
                 let (domain, page_hint) = match page_hint {
@@ -2806,7 +2722,6 @@ impl Database {
                     app_name,
                     window_title,
                     screenshot_path,
-                    ocr_text,
                     category,
                     duration,
                     COALESCE(RTRIM(browser_url, '/'), '') as browser_url,
@@ -2841,7 +2756,6 @@ impl Database {
                 app_name,
                 window_title,
                 screenshot_path,
-                ocr_text,
                 category,
                 total_duration,
                 browser_url,
@@ -2859,25 +2773,24 @@ impl Database {
             .query_map(
                 params![start_ts, end_ts, limit_val, offset_val, device_id],
                 |row| {
-                    let browser_url: String = row.get(8)?;
+                    let browser_url: String = row.get(7)?;
                     Ok(Activity {
                         id: Some(row.get(0)?),
                         timestamp: row.get(1)?,
                         app_name: row.get(2)?,
                         window_title: row.get(3)?,
                         screenshot_path: row.get(4)?,
-                        ocr_text: row.get(5)?,
-                        category: row.get(6)?,
-                        duration: row.get(7)?,
+                        category: row.get(5)?,
+                        duration: row.get(6)?,
                         browser_url: if browser_url.is_empty() {
                             None
                         } else {
                             Some(browser_url)
                         },
-                        executable_path: row.get(9)?,
-                        semantic_category: row.get(10)?,
-                        semantic_confidence: row.get(11)?,
-                        screenshot_url: row.get(12)?,
+                        executable_path: row.get(8)?,
+                        semantic_category: row.get(9)?,
+                        semantic_confidence: row.get(10)?,
+                        screenshot_url: row.get(11)?,
                     })
                 },
             )?
@@ -2947,7 +2860,6 @@ impl Database {
                 timestamp,
                 app_name,
                 window_title,
-                ocr_text,
                 category,
                 duration,
                 screenshot_url,
@@ -2963,7 +2875,6 @@ impl Database {
             i64,
             String,
             String,
-            Option<String>,
             String,
             i64,
             Option<String>,
@@ -2979,7 +2890,6 @@ impl Database {
                     row.get(5)?,
                     row.get(6)?,
                     row.get(7)?,
-                    row.get(8)?,
                 ))
             })?
             .filter_map(|r| r.ok())
@@ -3014,7 +2924,6 @@ impl Database {
             timestamp,
             app_name,
             window_title,
-            ocr_text,
             category,
             duration,
             screenshot_url,
@@ -3034,7 +2943,6 @@ impl Database {
                 let page_hint = crate::categorize::resolve_browser_page_hint(
                     browser_url.as_deref(),
                     &window_title,
-                    ocr_text.as_deref(),
                 );
 
                 let (domain, page_hint) = match page_hint {
@@ -3211,7 +3119,7 @@ impl Database {
         let (start_ts, end_ts) = parse_date_bounds(date_from, date_to);
 
         let mut stmt = conn.prepare(
-            "SELECT id, timestamp, app_name, window_title, screenshot_path, ocr_text, category, duration, browser_url, executable_path, semantic_category, semantic_confidence, screenshot_url
+            "SELECT id, timestamp, app_name, window_title, screenshot_path, category, duration, browser_url, executable_path, semantic_category, semantic_confidence, screenshot_url
              FROM activities
              WHERE (?1 IS NULL OR timestamp >= ?1)
                AND (?2 IS NULL OR timestamp < ?2)
@@ -3227,14 +3135,13 @@ impl Database {
                     app_name: row.get(2)?,
                     window_title: row.get(3)?,
                     screenshot_path: row.get(4)?,
-                    ocr_text: row.get(5)?,
-                    category: row.get(6)?,
-                    duration: row.get(7)?,
-                    browser_url: row.get(8)?,
-                    executable_path: row.get(9)?,
-                    semantic_category: row.get(10)?,
-                    semantic_confidence: row.get(11)?,
-                    screenshot_url: row.get(12)?,
+                    category: row.get(5)?,
+                    duration: row.get(6)?,
+                    browser_url: row.get(7)?,
+                    executable_path: row.get(8)?,
+                    semantic_category: row.get(9)?,
+                    semantic_confidence: row.get(10)?,
+                    screenshot_url: row.get(11)?,
                 })
             })?
             .filter_map(|row| row.ok())
@@ -3254,7 +3161,7 @@ impl Database {
         })?;
         let mut stmt = conn.prepare(
             "SELECT uuid, device_id, sync_version, timestamp, app_name, window_title, screenshot_path,
-                    ocr_text, category, duration, browser_url, executable_path,
+                    category, duration, browser_url, executable_path,
                     semantic_category, semantic_confidence, screenshot_url
              FROM activities
              WHERE sync_version > ?1 AND device_id = ?2
@@ -3271,14 +3178,13 @@ impl Database {
                     app_name: row.get(4)?,
                     window_title: row.get(5)?,
                     screenshot_path: row.get(6)?,
-                    ocr_text: row.get(7)?,
-                    category: row.get(8)?,
-                    duration: row.get(9)?,
-                    browser_url: row.get(10)?,
-                    executable_path: row.get(11)?,
-                    semantic_category: row.get(12)?,
-                    semantic_confidence: row.get(13)?,
-                    screenshot_url: row.get(14)?,
+                    category: row.get(7)?,
+                    duration: row.get(8)?,
+                    browser_url: row.get(9)?,
+                    executable_path: row.get(10)?,
+                    semantic_category: row.get(11)?,
+                    semantic_confidence: row.get(12)?,
+                    screenshot_url: row.get(13)?,
                 },
             })
         })?;
@@ -3316,16 +3222,15 @@ impl Database {
             .filter(|value| !value.is_empty());
         let changed = conn.execute(
             "INSERT INTO activities
-             (timestamp, app_name, window_title, screenshot_path, ocr_text, category, duration,
+             (timestamp, app_name, window_title, screenshot_path, category, duration,
               browser_url, executable_path, semantic_category, semantic_confidence,
               screenshot_url, uuid, device_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(uuid) DO UPDATE SET
                 timestamp = excluded.timestamp,
                 app_name = excluded.app_name,
                 window_title = excluded.window_title,
                 screenshot_path = excluded.screenshot_path,
-                ocr_text = excluded.ocr_text,
                 category = excluded.category,
                 duration = excluded.duration,
                 browser_url = excluded.browser_url,
@@ -3339,7 +3244,6 @@ impl Database {
                 record.activity.app_name,
                 record.activity.window_title,
                 record.activity.screenshot_path,
-                record.activity.ocr_text,
                 record.activity.category,
                 record.activity.duration,
                 normalized_url,
@@ -4088,14 +3992,9 @@ impl Database {
             return Ok(Vec::new());
         };
 
-        // 先流式读取轻量字段，仅在 URL 和标题均无法解析时读取单条 OCR。
-        // 不使用域名 LIKE 预筛选，以免标题推断或可疑 URL 兜底的表示形式被遗漏。
         let mut candidates = conn.prepare(
-            "SELECT id, app_name, window_title, browser_url,
-                    ocr_text IS NOT NULL AND ocr_text != ''
-             FROM activities ORDER BY timestamp ASC, id ASC",
+            "SELECT id, app_name, window_title, browser_url FROM activities ORDER BY timestamp ASC, id ASC",
         )?;
-        let mut ocr_query = conn.prepare("SELECT ocr_text FROM activities WHERE id = ?1")?;
         let mut activity_query = conn.prepare(&format!(
             "SELECT {ACTIVITY_SELECT_COLUMNS} FROM activities WHERE id = ?1"
         ))?;
@@ -4111,22 +4010,8 @@ impl Database {
             let id: i64 = row.get(0)?;
             let window_title: String = row.get(2)?;
             let browser_url: Option<String> = row.get(3)?;
-            let page_hint = match crate::categorize::resolve_browser_page_hint(
-                browser_url.as_deref(),
-                &window_title,
-                None,
-            ) {
-                Some(page_hint) => Some(page_hint),
-                None if row.get::<_, bool>(4)? => {
-                    let ocr_text: Option<String> = ocr_query.query_row([id], |row| row.get(0))?;
-                    crate::categorize::resolve_browser_page_hint(
-                        browser_url.as_deref(),
-                        &window_title,
-                        ocr_text.as_deref(),
-                    )
-                }
-                None => None,
-            };
+            let page_hint =
+                crate::categorize::resolve_browser_page_hint(browser_url.as_deref(), &window_title);
 
             if page_hint
                 .as_deref()
@@ -4193,24 +4078,13 @@ impl Database {
         start_ts: Option<i64>,
         end_ts: Option<i64>,
         limit: i64,
-    ) -> Result<
-        Vec<(
-            i64,
-            i64,
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            i64,
-            i64,
-        )>,
-    > {
+    ) -> Result<Vec<(i64, i64, String, String, Option<String>, i64, i64)>> {
         let conn = self.conn.lock().map_err(|e| {
             AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
         })?;
 
         let mut stmt = conn.prepare(
-            "SELECT a.id, a.timestamp, a.app_name, a.window_title, a.ocr_text, a.browser_url, a.duration, fts.rank
+            "SELECT a.id, a.timestamp, a.app_name, a.window_title, a.browser_url, a.duration, fts.rank
              FROM activities_fts fts
              JOIN activities a ON a.id = fts.rowid
              WHERE activities_fts MATCH ?1
@@ -4228,9 +4102,8 @@ impl Database {
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, Option<String>>(4)?,
-                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, i64>(5)?,
                     row.get::<_, i64>(6)?,
-                    row.get::<_, i64>(7)?,
                 ))
             })?
             .filter_map(|row| row.ok())
@@ -4352,9 +4225,7 @@ impl Database {
         // === FTS5 检索活动记录 ===
         if let Ok(fts_rows) = self.search_activities_fts(&fts_query, start_ts, end_ts, fetch_limit)
         {
-            for (id, timestamp, app_name, window_title, ocr_text, browser_url, duration, _rank) in
-                fts_rows
-            {
+            for (id, timestamp, app_name, window_title, browser_url, duration, _rank) in fts_rows {
                 // FTS rank 是负数，越小越好；转换为正数分数
                 let score = 200i64; // FTS 匹配即高分
 
@@ -4365,7 +4236,6 @@ impl Database {
                     .unwrap_or_default();
 
                 let excerpt = pick_excerpt(&[
-                    ocr_text.clone().unwrap_or_default(),
                     browser_url.clone().unwrap_or_default(),
                     window_title.clone(),
                 ]);
@@ -5278,13 +5148,13 @@ impl Database {
         Ok(())
     }
 
-    /// 按 id 游标增量读取活动记录（含 OCR 文本），供语义索引消费。
+    /// 按 id 游标增量读取活动记录（应用、标题和网址），供语义索引消费。
     pub fn get_activities_after_id(&self, after_id: i64, limit: usize) -> Result<Vec<Activity>> {
         let conn = self.conn.lock().map_err(|e| {
             AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
         })?;
         let mut stmt = conn.prepare(
-            "SELECT id, timestamp, app_name, window_title, screenshot_path, ocr_text,
+            "SELECT id, timestamp, app_name, window_title, screenshot_path,
                     category, duration, browser_url, executable_path,
                     semantic_category, semantic_confidence, screenshot_url
              FROM activities WHERE id > ?1 ORDER BY id ASC LIMIT ?2",
@@ -5296,14 +5166,13 @@ impl Database {
                 app_name: row.get(2)?,
                 window_title: row.get(3)?,
                 screenshot_path: row.get(4)?,
-                ocr_text: row.get(5)?,
-                category: row.get(6)?,
-                duration: row.get(7)?,
-                browser_url: row.get(8)?,
-                executable_path: row.get(9)?,
-                semantic_category: row.get(10)?,
-                semantic_confidence: row.get(11)?,
-                screenshot_url: row.get(12)?,
+                category: row.get(5)?,
+                duration: row.get(6)?,
+                browser_url: row.get(7)?,
+                executable_path: row.get(8)?,
+                semantic_category: row.get(9)?,
+                semantic_confidence: row.get(10)?,
+                screenshot_url: row.get(11)?,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -5677,7 +5546,7 @@ impl Database {
 
         // 回退：activities
         let mut stmt = conn.prepare(
-            "SELECT id, timestamp, app_name, window_title, ocr_text, browser_url, duration
+            "SELECT id, timestamp, app_name, window_title, browser_url, duration
              FROM activities
              WHERE (?1 IS NULL OR timestamp >= ?1)
                AND (?2 IS NULL OR timestamp < ?2)
@@ -5685,15 +5554,7 @@ impl Database {
              LIMIT ?3",
         )?;
 
-        let rows: Vec<(
-            i64,
-            i64,
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            i64,
-        )> = stmt
+        let rows: Vec<(i64, i64, String, String, Option<String>, i64)> = stmt
             .query_map(params![start_ts, end_ts, fetch_limit], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
@@ -5701,20 +5562,18 @@ impl Database {
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, Option<String>>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(5)?,
                 ))
             })?
             .filter_map(|row| row.ok())
             .collect();
 
-        for (id, timestamp, app_name, window_title, ocr_text, browser_url, duration) in rows {
+        for (id, timestamp, app_name, window_title, browser_url, duration) in rows {
             let score = score_memory_match(
                 query,
                 &[
                     &app_name,
                     &window_title,
-                    ocr_text.as_deref().unwrap_or(""),
                     browser_url.as_deref().unwrap_or(""),
                 ],
             );
@@ -5729,7 +5588,6 @@ impl Database {
                 .unwrap_or_default();
 
             let excerpt = pick_excerpt(&[
-                ocr_text.clone().unwrap_or_default(),
                 browser_url.clone().unwrap_or_default(),
                 window_title.clone(),
             ]);
@@ -6050,7 +5908,6 @@ mod tests {
             app_name: "Code".to_string(),
             window_title: "缺URL".to_string(),
             screenshot_path: "screenshots/a.jpg".to_string(),
-            ocr_text: None,
             category: "development".to_string(),
             duration: 10,
             browser_url: None,
@@ -6100,7 +5957,6 @@ mod tests {
                 app_name: "Code".to_string(),
                 window_title: "文件A".to_string(),
                 screenshot_path: "shot-a.jpg".to_string(),
-                ocr_text: Some("old".to_string()),
                 category: "development".to_string(),
                 duration: 10,
                 browser_url: None,
@@ -6115,7 +5971,6 @@ mod tests {
                 app_name: "Code".to_string(),
                 window_title: "文件A".to_string(),
                 screenshot_path: "shot-b.jpg".to_string(),
-                ocr_text: Some("new".to_string()),
                 category: "development".to_string(),
                 duration: 25,
                 browser_url: None,
@@ -6130,7 +5985,6 @@ mod tests {
                 app_name: "Code".to_string(),
                 window_title: "文件B".to_string(),
                 screenshot_path: "shot-c.jpg".to_string(),
-                ocr_text: None,
                 category: "development".to_string(),
                 duration: 15,
                 browser_url: None,
@@ -6162,7 +6016,6 @@ mod tests {
             file_a.screenshot_url.as_deref(),
             Some("https://cdn.example.com/workreview/shot-b.jpg")
         );
-        assert_eq!(file_a.ocr_text.as_deref(), Some("new"));
         assert_eq!(file_b.duration, 15);
 
         let raw_activities = db
@@ -6192,7 +6045,6 @@ mod tests {
             app_name: "Google Chrome".to_string(),
             window_title: "GitHub".to_string(),
             screenshot_path: "shot-a.jpg".to_string(),
-            ocr_text: Some("old".to_string()),
             category: "browser".to_string(),
             duration: 10,
             browser_url: Some("https://github.com".to_string()),
@@ -6203,7 +6055,7 @@ mod tests {
         };
 
         let inserted_id = db.insert_activity(&activity).expect("插入测试数据失败");
-        db.merge_activity(inserted_id, 20, Some("new"), "shot-b.jpg", now, None)
+        db.merge_activity(inserted_id, 20, now, None)
             .expect("合并活动失败");
 
         let merged = db
@@ -6214,7 +6066,6 @@ mod tests {
         assert_eq!(merged.screenshot_path, "shot-a.jpg");
         assert_eq!(merged.duration, 30);
         assert_eq!(merged.timestamp, now);
-        assert_eq!(merged.ocr_text.as_deref(), Some("old\n---\nnew"));
 
         let _ = std::fs::remove_file(db_path);
     }
@@ -6232,7 +6083,6 @@ mod tests {
                 app_name: "Code".to_string(),
                 window_title: "旧窗口".to_string(),
                 screenshot_path: "old.jpg".to_string(),
-                ocr_text: None,
                 category: "development".to_string(),
                 duration: 30,
                 browser_url: None,
@@ -6247,7 +6097,6 @@ mod tests {
                 app_name: "Code".to_string(),
                 window_title: "新窗口".to_string(),
                 screenshot_path: "new.jpg".to_string(),
-                ocr_text: None,
                 category: "development".to_string(),
                 duration: 45,
                 browser_url: None,
@@ -6292,7 +6141,6 @@ mod tests {
                 app_name: "work-review".to_string(),
                 window_title: "主窗口".to_string(),
                 screenshot_path: "wr-a.jpg".to_string(),
-                ocr_text: None,
                 category: "development".to_string(),
                 duration: 540,
                 browser_url: None,
@@ -6307,7 +6155,6 @@ mod tests {
                 app_name: "Work Review".to_string(),
                 window_title: "设置".to_string(),
                 screenshot_path: "wr-b.jpg".to_string(),
-                ocr_text: None,
                 category: "development".to_string(),
                 duration: 540,
                 browser_url: None,
@@ -6322,7 +6169,6 @@ mod tests {
                 app_name: "Code".to_string(),
                 window_title: "main.rs".to_string(),
                 screenshot_path: "code.jpg".to_string(),
-                ocr_text: None,
                 category: "development".to_string(),
                 duration: 300,
                 browser_url: None,
@@ -6375,7 +6221,6 @@ mod tests {
                 app_name: "Code".to_string(),
                 window_title: "main.rs".to_string(),
                 screenshot_path: "code-a.jpg".to_string(),
-                ocr_text: None,
                 category: "development".to_string(),
                 duration: 30 * 60,
                 browser_url: None,
@@ -6390,7 +6235,6 @@ mod tests {
                 app_name: "Chrome".to_string(),
                 window_title: "docs".to_string(),
                 screenshot_path: "chrome-a.jpg".to_string(),
-                ocr_text: None,
                 category: "browser".to_string(),
                 duration: 20 * 60,
                 browser_url: Some("https://example.com/docs".to_string()),
@@ -6442,7 +6286,6 @@ mod tests {
                 app_name: "Chrome".to_string(),
                 window_title: "Linux Do".to_string(),
                 screenshot_path: "chrome-a.jpg".to_string(),
-                ocr_text: None,
                 category: "browser".to_string(),
                 duration: 30 * 60,
                 browser_url: Some("linux.dolatest".to_string()),
@@ -6457,7 +6300,6 @@ mod tests {
                 app_name: "Chrome".to_string(),
                 window_title: "Docs".to_string(),
                 screenshot_path: "chrome-b.jpg".to_string(),
-                ocr_text: None,
                 category: "browser".to_string(),
                 duration: 5 * 60,
                 browser_url: Some("https://example.com/docs".to_string()),
@@ -6515,7 +6357,6 @@ mod tests {
                 app_name: "mail".to_string(),
                 window_title: "Inbox".to_string(),
                 screenshot_path: "mail-a.jpg".to_string(),
-                ocr_text: None,
                 category: "office".to_string(),
                 duration: 10 * 60,
                 browser_url: None,
@@ -6530,7 +6371,6 @@ mod tests {
                 app_name: "邮件".to_string(),
                 window_title: "Draft".to_string(),
                 screenshot_path: "mail-b.jpg".to_string(),
-                ocr_text: None,
                 category: "office".to_string(),
                 duration: 5 * 60,
                 browser_url: None,
@@ -6576,7 +6416,6 @@ mod tests {
                 app_name: "Chrome".to_string(),
                 window_title: "docs".to_string(),
                 screenshot_path: "chrome-a.jpg".to_string(),
-                ocr_text: None,
                 category: "browser".to_string(),
                 duration: 40 * 60,
                 browser_url: Some("https://example.com/docs".to_string()),
@@ -6591,7 +6430,6 @@ mod tests {
                 app_name: "WeChat".to_string(),
                 window_title: "team".to_string(),
                 screenshot_path: "wechat-a.jpg".to_string(),
-                ocr_text: None,
                 category: "communication".to_string(),
                 duration: 35 * 60,
                 browser_url: None,
@@ -6628,7 +6466,6 @@ mod tests {
                 app_name: "Chrome".to_string(),
                 window_title: "docs".to_string(),
                 screenshot_path: "chrome-a.jpg".to_string(),
-                ocr_text: None,
                 category: "browser".to_string(),
                 duration: 50 * 60,
                 browser_url: Some("https://example.com/docs".to_string()),
@@ -6643,7 +6480,6 @@ mod tests {
                 app_name: "WeChat".to_string(),
                 window_title: "team".to_string(),
                 screenshot_path: "wechat-a.jpg".to_string(),
-                ocr_text: None,
                 category: "communication".to_string(),
                 duration: 55 * 60,
                 browser_url: None,
@@ -6658,7 +6494,6 @@ mod tests {
                 app_name: "Code".to_string(),
                 window_title: "main.rs".to_string(),
                 screenshot_path: "code-a.jpg".to_string(),
-                ocr_text: None,
                 category: "development".to_string(),
                 duration: 65 * 60,
                 browser_url: None,
@@ -6704,7 +6539,6 @@ mod tests {
                 app_name: "SecretApp".to_string(),
                 window_title: "private".to_string(),
                 screenshot_path: "secret.jpg".to_string(),
-                ocr_text: None,
                 category: "communication".to_string(),
                 duration: 10 * 60,
                 browser_url: None,
@@ -6719,7 +6553,6 @@ mod tests {
                 app_name: "Code".to_string(),
                 window_title: "main.rs".to_string(),
                 screenshot_path: "code.jpg".to_string(),
-                ocr_text: None,
                 category: "development".to_string(),
                 duration: 20 * 60,
                 browser_url: None,
@@ -6734,7 +6567,6 @@ mod tests {
                 app_name: "Chrome".to_string(),
                 window_title: "Secret".to_string(),
                 screenshot_path: "browser.jpg".to_string(),
-                ocr_text: None,
                 category: "browser".to_string(),
                 duration: 15 * 60,
                 browser_url: Some("https://secret.example.com/doc".to_string()),
@@ -6789,7 +6621,6 @@ mod tests {
                 app_name: "Chrome".to_string(),
                 window_title: format!("site-{index}"),
                 screenshot_path: format!("site-{index}.jpg"),
-                ocr_text: None,
                 category: "browser".to_string(),
                 duration: 60,
                 browser_url: Some(format!("https://site-{index}.example/page")),
@@ -6823,7 +6654,6 @@ mod tests {
             app_name: "MyApp".to_string(),
             window_title: "work".to_string(),
             screenshot_path: "a.jpg".to_string(),
-            ocr_text: None,
             category: "design_custom".to_string(),
             duration: 20 * 60,
             browser_url: None,
@@ -6869,7 +6699,6 @@ mod tests {
             app_name: "Code".to_string(),
             window_title: "main.rs".to_string(),
             screenshot_path: "code-a.jpg".to_string(),
-            ocr_text: None,
             category: "development".to_string(),
             duration: 40 * 60,
             browser_url: None,
@@ -6906,7 +6735,6 @@ mod tests {
                 app_name: "Cursor".to_string(),
                 window_title: "main.rs".to_string(),
                 screenshot_path: format!("cursor-{date}.jpg"),
-                ocr_text: None,
                 category: "development".to_string(),
                 duration: 10 * 60,
                 browser_url: None,
@@ -6943,7 +6771,6 @@ mod tests {
                 app_name: "Chrome".to_string(),
                 window_title: "allowed".to_string(),
                 screenshot_path: "allowed.jpg".to_string(),
-                ocr_text: None,
                 category: "browser".to_string(),
                 duration: 10 * 60,
                 browser_url: Some("https://allowed.example/doc".to_string()),
@@ -6958,7 +6785,6 @@ mod tests {
                 app_name: "Chrome".to_string(),
                 window_title: "private".to_string(),
                 screenshot_path: "private.jpg".to_string(),
-                ocr_text: None,
                 category: "browser".to_string(),
                 duration: 10 * 60,
                 browser_url: Some("https://private.example/secret".to_string()),
@@ -6973,7 +6799,6 @@ mod tests {
                 app_name: "SecretApp".to_string(),
                 window_title: "ignored".to_string(),
                 screenshot_path: "ignored.jpg".to_string(),
-                ocr_text: None,
                 category: "communication".to_string(),
                 duration: 10 * 60,
                 browser_url: None,
@@ -6988,7 +6813,6 @@ mod tests {
                 app_name: "Code".to_string(),
                 window_title: "main.rs".to_string(),
                 screenshot_path: "code.jpg".to_string(),
-                ocr_text: None,
                 category: "development".to_string(),
                 duration: 10 * 60,
                 browser_url: None,
@@ -7045,7 +6869,6 @@ mod tests {
                 app_name: "Chrome".to_string(),
                 window_title: "https://allowed.example/doc - Chrome".to_string(),
                 screenshot_path: "allowed.jpg".to_string(),
-                ocr_text: None,
                 category: "browser".to_string(),
                 duration: 10 * 60,
                 browser_url: Some("https://allowed.example/doc".to_string()),
@@ -7060,7 +6883,6 @@ mod tests {
                 app_name: "Chrome".to_string(),
                 window_title: "https://private.example/from-title - Chrome".to_string(),
                 screenshot_path: "private-title.jpg".to_string(),
-                ocr_text: None,
                 category: "browser".to_string(),
                 duration: 10 * 60,
                 browser_url: None,
@@ -7073,9 +6895,8 @@ mod tests {
                 id: None,
                 timestamp: local_ts(date, 10, 30),
                 app_name: "Chrome".to_string(),
-                window_title: "页面加载中".to_string(),
-                screenshot_path: "private-ocr.jpg".to_string(),
-                ocr_text: Some("当前页面 https://private.example/from-ocr".to_string()),
+                window_title: "https://private.example/from-title - Chrome".to_string(),
+                screenshot_path: "private-content.jpg".to_string(),
                 category: "browser".to_string(),
                 duration: 10 * 60,
                 browser_url: Some("linux.dolatest".to_string()),
@@ -7118,7 +6939,6 @@ mod tests {
                 app_name: "Chrome".to_string(),
                 window_title: "docs".to_string(),
                 screenshot_path: "chrome-a.jpg".to_string(),
-                ocr_text: None,
                 category: "browser".to_string(),
                 duration: 40 * 60,
                 browser_url: Some("https://example.com/docs".to_string()),
@@ -7133,7 +6953,6 @@ mod tests {
                 app_name: "WeChat".to_string(),
                 window_title: "team".to_string(),
                 screenshot_path: "wechat-a.jpg".to_string(),
-                ocr_text: None,
                 category: "communication".to_string(),
                 duration: 35 * 60,
                 browser_url: None,
@@ -7175,7 +6994,6 @@ mod tests {
             app_name: "Chrome".to_string(),
             window_title: "docs".to_string(),
             screenshot_path: "chrome-a.jpg".to_string(),
-            ocr_text: None,
             category: "browser".to_string(),
             duration: 20 * 60,
             browser_url: Some("https://example.com/docs".to_string()),
@@ -7214,7 +7032,6 @@ mod tests {
             app_name: "Code".to_string(),
             window_title: "night.ts".to_string(),
             screenshot_path: "night.jpg".to_string(),
-            ocr_text: None,
             category: "development".to_string(),
             duration: 20 * 60,
             browser_url: None,
@@ -7248,7 +7065,6 @@ mod tests {
             app_name: "Code".to_string(),
             window_title: "late.ts".to_string(),
             screenshot_path: "late.jpg".to_string(),
-            ocr_text: None,
             category: "development".to_string(),
             duration: 20 * 60,
             browser_url: None,
@@ -7282,7 +7098,6 @@ mod tests {
             app_name: "Code".to_string(),
             window_title: "standup.md".to_string(),
             screenshot_path: "standup.jpg".to_string(),
-            ocr_text: None,
             category: "development".to_string(),
             duration: 20 * 60,
             browser_url: None,
@@ -7317,7 +7132,6 @@ mod tests {
                 app_name: "Code".to_string(),
                 window_title: "main.rs".to_string(),
                 screenshot_path: "code.jpg".to_string(),
-                ocr_text: None,
                 category: "development".to_string(),
                 duration: 60 * 60,
                 browser_url: None,
@@ -7332,7 +7146,6 @@ mod tests {
                 app_name: "Video".to_string(),
                 window_title: "休息".to_string(),
                 screenshot_path: String::new(),
-                ocr_text: None,
                 category: "entertainment".to_string(),
                 duration: 30 * 60,
                 browser_url: None,
@@ -7347,7 +7160,6 @@ mod tests {
                 app_name: "Code".to_string(),
                 window_title: "review.rs".to_string(),
                 screenshot_path: String::new(),
-                ocr_text: None,
                 category: "development".to_string(),
                 duration: 30 * 60,
                 browser_url: None,
@@ -7435,7 +7247,6 @@ mod tests {
                 app_name: "Code".to_string(),
                 window_title: "night-ops.md".to_string(),
                 screenshot_path: "night-ops-early.jpg".to_string(),
-                ocr_text: None,
                 category: "development".to_string(),
                 duration: 120 * 60,
                 browser_url: None,
@@ -7450,7 +7261,6 @@ mod tests {
                 app_name: "Code".to_string(),
                 window_title: "night-ops.md".to_string(),
                 screenshot_path: "night-ops-late.jpg".to_string(),
-                ocr_text: None,
                 category: "development".to_string(),
                 duration: 120 * 60,
                 browser_url: None,
@@ -7488,7 +7298,6 @@ mod tests {
                 app_name: "Douyin".to_string(),
                 window_title: "推荐".to_string(),
                 screenshot_path: "douyin.jpg".to_string(),
-                ocr_text: None,
                 category: "entertainment".to_string(),
                 duration: 30 * 60,
                 browser_url: None,
@@ -7503,7 +7312,6 @@ mod tests {
                 app_name: "Code".to_string(),
                 window_title: "main.rs".to_string(),
                 screenshot_path: "code.jpg".to_string(),
-                ocr_text: None,
                 category: "development".to_string(),
                 duration: 15 * 60,
                 browser_url: None,
@@ -7542,7 +7350,6 @@ mod tests {
                 app_name: "Code".to_string(),
                 window_title: "文件A".to_string(),
                 screenshot_path: "shot-a.jpg".to_string(),
-                ocr_text: Some("old".to_string()),
                 category: "development".to_string(),
                 duration: 10,
                 browser_url: None,
@@ -7559,7 +7366,6 @@ mod tests {
                 app_name: "Code".to_string(),
                 window_title: "文件A".to_string(),
                 screenshot_path: "shot-b.jpg".to_string(),
-                ocr_text: Some("new".to_string()),
                 category: "development".to_string(),
                 duration: 25,
                 browser_url: None,
@@ -7600,7 +7406,6 @@ mod tests {
             app_name: "Google Chrome".to_string(),
             window_title: "Tauri Guide".to_string(),
             screenshot_path: "guide.jpg".to_string(),
-            ocr_text: None,
             category: "browser".to_string(),
             duration: 120,
             browser_url: Some("https://tauri.app/zh-cn/develop/calling-rust/".to_string()),
@@ -7636,7 +7441,6 @@ mod tests {
                 app_name: "MuMu".to_string(),
                 window_title: "首页".to_string(),
                 screenshot_path: "mumu-a.jpg".to_string(),
-                ocr_text: None,
                 category: "design".to_string(),
                 duration: 20,
                 browser_url: None,
@@ -7651,7 +7455,6 @@ mod tests {
                 app_name: "mumu".to_string(),
                 window_title: "游戏中心".to_string(),
                 screenshot_path: "mumu-b.jpg".to_string(),
-                ocr_text: None,
                 category: "design".to_string(),
                 duration: 30,
                 browser_url: None,
@@ -7711,7 +7514,6 @@ mod tests {
                 app_name: "Google Chrome".to_string(),
                 window_title: "GitHub Issues".to_string(),
                 screenshot_path: "chrome-a.jpg".to_string(),
-                ocr_text: None,
                 category: "browser".to_string(),
                 duration: 20,
                 browser_url: Some("https://github.com/issues/28".to_string()),
@@ -7726,7 +7528,6 @@ mod tests {
                 app_name: "Arc".to_string(),
                 window_title: "Pull Requests".to_string(),
                 screenshot_path: "arc-a.jpg".to_string(),
-                ocr_text: None,
                 category: "browser".to_string(),
                 duration: 30,
                 browser_url: Some("https://github.com/pulls".to_string()),
@@ -7741,7 +7542,6 @@ mod tests {
                 app_name: "Google Chrome".to_string(),
                 window_title: "Docs".to_string(),
                 screenshot_path: "chrome-b.jpg".to_string(),
-                ocr_text: None,
                 category: "browser".to_string(),
                 duration: 15,
                 browser_url: Some("https://docs.github.com/en".to_string()),
@@ -7780,73 +7580,38 @@ mod tests {
                 "Chrome",
                 Some(" https://github.com:443/from-url/ "),
                 "other.example - Chrome",
-                Some("https://other.example"),
             ),
-            (
-                "Arc",
-                None,
-                "github.com - Arc",
-                Some("https://other.example"),
-            ),
-            (
-                "Chrome",
-                Some(" \t\n "),
-                "github.com/from-title - Chrome",
-                None,
-            ),
-            (
-                "Safari",
-                Some(""),
-                "页面加载中",
-                Some("https://github.com/from-empty-url"),
-            ),
-            (
-                "Chrome",
-                None,
-                "页面加载中",
-                Some("当前页面 https://github.com/from-ocr"),
-            ),
+            ("Arc", None, "github.com - Arc"),
+            ("Chrome", Some(" \t\n "), "github.com/from-title - Chrome"),
+            ("Safari", Some(""), "https://github.com/from-empty-url"),
+            ("Chrome", None, "当前页面 https://github.com/from-title"),
             (
                 "Chrome",
                 Some("https://linux.dolatest/"),
                 "github.com - Chrome",
-                None,
             ),
             (
                 "Chrome",
                 Some("linux.dolatest"),
-                "页面加载中",
-                Some("https://github.com/from-merged-url"),
+                "https://github.com/from-merged-url",
             ),
             (
                 "Chrome",
                 Some("https://other.example/github.com"),
                 "github.com - Chrome",
-                Some("https://github.com"),
             ),
             (
                 "Chrome",
                 Some("https://docs.github.com/en"),
                 "github.com - Chrome",
-                Some("https://github.com"),
             ),
-            (
-                "Code",
-                Some("https://github.com"),
-                "github.com",
-                Some("https://github.com"),
-            ),
-            ("Chrome", None, "页面加载中", None),
-            (
-                "Chrome",
-                None,
-                "docs.github.com - Chrome",
-                Some("https://github.com"),
-            ),
+            ("Code", Some("https://github.com"), "github.com"),
+            ("Chrome", None, "页面加载中"),
+            ("Chrome", None, "docs.github.com - Chrome"),
         ];
         let mut ids = Vec::new();
 
-        for (index, (app_name, browser_url, title, ocr_text)) in cases.iter().enumerate() {
+        for (index, (app_name, browser_url, title)) in cases.iter().enumerate() {
             let id = db
                 .insert_activity(&Activity {
                     id: None,
@@ -7854,7 +7619,6 @@ mod tests {
                     app_name: (*app_name).to_string(),
                     window_title: (*title).to_string(),
                     screenshot_path: format!("domain-{index}.jpg"),
-                    ocr_text: ocr_text.map(str::to_string),
                     category: "browser".to_string(),
                     duration: 60,
                     browser_url: browser_url.map(str::to_string),
@@ -7969,175 +7733,7 @@ mod tests {
             )
             .expect("插入损坏分类测试数据失败");
         assert!(db.get_activities_by_domain("github.com").is_err());
-
-        let db = in_memory_db();
-        db.conn
-            .lock()
-            .unwrap()
-            .execute(
-                "INSERT INTO activities (timestamp, app_name, window_title, screenshot_path,
-             category, duration, ocr_text)
-             VALUES (1, 'Chrome', '页面加载中', '', 'browser', 60, X'FF')",
-                [],
-            )
-            .expect("插入损坏 OCR 测试数据失败");
-        assert!(db.get_activities_by_domain("github.com").is_err());
     }
-
-    #[test]
-    fn 异步ocr应补充网站规则分类并尊重网址标题和应用边界() {
-        let db = in_memory_db();
-        let rules = [crate::config::WebsiteSemanticRule {
-            domain: "github.com".to_string(),
-            semantic_category: "休息娱乐".to_string(),
-        }];
-        let date = "2026-03-27";
-        let cases = [
-            (
-                "Chrome",
-                None,
-                "页面加载中",
-                "https://github.com/page",
-                true,
-            ),
-            (
-                "Chrome",
-                Some("https://other.example"),
-                "github.com - Chrome",
-                "https://github.com/page",
-                false,
-            ),
-            (
-                "Chrome",
-                Some("https://github.com"),
-                "other.example - Chrome",
-                "https://other.example/page",
-                true,
-            ),
-            (
-                "Chrome",
-                None,
-                "other.example - Chrome",
-                "https://github.com/page",
-                false,
-            ),
-            ("Code", None, "页面加载中", "https://github.com/page", false),
-            (
-                "Chrome",
-                Some("linux.dolatest"),
-                "页面加载中",
-                "https://github.com/page",
-                true,
-            ),
-            (
-                "Chrome",
-                None,
-                "页面加载中",
-                "https://other.example/page",
-                false,
-            ),
-        ];
-
-        for (index, (app_name, browser_url, title, ocr_text, should_override)) in
-            cases.iter().enumerate()
-        {
-            let id = db
-                .insert_activity(&Activity {
-                    id: None,
-                    timestamp: local_ts(date, 10, index as u32 + 1),
-                    app_name: (*app_name).to_string(),
-                    window_title: (*title).to_string(),
-                    screenshot_path: format!("ocr-{index}.jpg"),
-                    ocr_text: None,
-                    category: "browser".to_string(),
-                    duration: 60,
-                    browser_url: browser_url.map(str::to_string),
-                    executable_path: None,
-                    semantic_category: Some("资料阅读".to_string()),
-                    semantic_confidence: Some(70),
-                    screenshot_url: None,
-                })
-                .expect("插入异步 OCR 测试数据失败");
-
-            db.update_activity_ocr(id, Some((*ocr_text).to_string()), &rules)
-                .expect("更新 OCR 和网站分类失败");
-            let activity = db
-                .conn
-                .lock()
-                .unwrap()
-                .query_row(
-                    &format!(
-                        "SELECT {} FROM activities WHERE id = ?1",
-                        super::ACTIVITY_SELECT_COLUMNS
-                    ),
-                    [id],
-                    super::activity_from_row,
-                )
-                .expect("读取 OCR 更新后的活动失败");
-            assert_eq!(activity.ocr_text.as_deref(), Some(*ocr_text));
-            assert_eq!(activity.browser_url.as_deref(), *browser_url);
-            assert_eq!(
-                activity.category,
-                if *should_override {
-                    "entertainment"
-                } else {
-                    "browser"
-                }
-            );
-            assert_eq!(
-                activity.semantic_category.as_deref(),
-                Some(if *should_override {
-                    "休息娱乐"
-                } else {
-                    "资料阅读"
-                })
-            );
-            assert_eq!(
-                activity.semantic_confidence,
-                Some(if *should_override { 100 } else { 70 })
-            );
-        }
-
-        let stats = db
-            .get_daily_stats(date)
-            .expect("读取 OCR 补分类后的统计失败");
-        assert_eq!(stats.total_duration, 7 * 60);
-        assert_eq!(stats.work_time_duration, 4 * 60);
-    }
-
-    #[test]
-    fn 异步ocr分类写入失败应回滚ocr文本() {
-        let db = in_memory_db();
-        db.conn
-            .lock()
-            .unwrap()
-            .execute_batch(
-                "INSERT INTO activities (id, timestamp, app_name, window_title, screenshot_path,
-             category, duration, ocr_text)
-             VALUES (1, 1, 'Chrome', '页面加载中', '', 'browser', 60, '旧文本');
-             CREATE TRIGGER reject_classification BEFORE UPDATE OF category ON activities
-             BEGIN SELECT RAISE(ABORT, '分类更新失败'); END;",
-            )
-            .expect("初始化回滚测试数据失败");
-        let rules = [crate::config::WebsiteSemanticRule {
-            domain: "github.com".to_string(),
-            semantic_category: "休息娱乐".to_string(),
-        }];
-
-        assert!(db
-            .update_activity_ocr(1, Some("https://github.com".to_string()), &rules)
-            .is_err());
-        let ocr_text: String = db
-            .conn
-            .lock()
-            .unwrap()
-            .query_row("SELECT ocr_text FROM activities WHERE id = 1", [], |row| {
-                row.get(0)
-            })
-            .expect("读取回滚后的 OCR 失败");
-        assert_eq!(ocr_text, "旧文本");
-    }
-
     #[test]
     fn 同一天日报应支持按语言分别保存和读取() {
         let db_path = temp_db_path("report-locale");
@@ -8201,7 +7797,6 @@ mod tests {
             app_name: "Windows Terminal".to_string(),
             window_title: "npm run tauri dev".to_string(),
             screenshot_path: "term.jpg".to_string(),
-            ocr_text: Some("cargo check".to_string()),
             category: "development".to_string(),
             duration: 120,
             browser_url: None,
@@ -8256,7 +7851,6 @@ mod tests {
             app_name: app_name.to_string(),
             window_title: "测试活动".to_string(),
             screenshot_path: "test.png".to_string(),
-            ocr_text: Some("测试 OCR".to_string()),
             category: "development".to_string(),
             duration: 60,
             browser_url: None,
@@ -9175,7 +8769,6 @@ mod tests {
             app_name: "Code".to_string(),
             window_title: "local.rs".to_string(),
             screenshot_path: "screenshots/device-a/2026-08-03/a.jpg".to_string(),
-            ocr_text: None,
             category: "development".to_string(),
             duration: 60,
             browser_url: None,
@@ -9229,7 +8822,6 @@ mod tests {
                 app_name: "Code".to_string(),
                 window_title: "sync.rs".to_string(),
                 screenshot_path: String::new(),
-                ocr_text: None,
                 category: "development".to_string(),
                 duration: 60,
                 browser_url: None,
@@ -9244,13 +8836,16 @@ mod tests {
             .expect("读取首个同步版本失败");
         assert_eq!(first.len(), 1);
 
-        db.update_activity_ocr(id, Some("updated OCR".to_string()), &[])
-            .expect("更新 OCR 失败");
+        db.update_activity_screenshot_url(id, "https://example.com/updated.jpg")
+            .expect("更新截图网址失败");
         let changed = db
             .get_sync_activities_since(first[0].sync_version, "device-a", 10)
             .expect("读取更新后的同步版本失败");
         assert_eq!(changed.len(), 1);
-        assert_eq!(changed[0].activity.ocr_text.as_deref(), Some("updated OCR"));
+        assert_eq!(
+            changed[0].activity.screenshot_url.as_deref(),
+            Some("https://example.com/updated.jpg")
+        );
         assert!(changed[0].sync_version > first[0].sync_version);
         let _ = std::fs::remove_file(db_path);
     }
@@ -9392,5 +8987,114 @@ mod tests {
             db.get_activity_by_id(b).unwrap().unwrap().screenshot_path,
             activity.screenshot_path
         );
+    }
+    fn seed_legacy_ocr_database(path: &std::path::Path) -> String {
+        let db = Database::new(path).unwrap();
+        db.set_local_device_id("device-a");
+        let mut activity = sample_activity(local_ts("2026-11-13", 10, 0), "Code");
+        activity.window_title = "retainedtitle".into();
+        activity.screenshot_path = "screenshots/device-a/2026-11-13/a.jpg".into();
+        let id = db.insert_activity(&activity).unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "DROP TRIGGER activities_ai;
+                 DROP TRIGGER activities_ad;
+                 DROP TRIGGER activities_au;
+                 DROP TABLE activities_fts;
+                 ALTER TABLE activities ADD COLUMN ocr_text TEXT;
+                 UPDATE activities SET ocr_text = 'obsoleteocrsecret';
+                 CREATE VIRTUAL TABLE activities_fts USING fts5(
+                    app_name, window_title, ocr_text, browser_url,
+                    content='activities', content_rowid='id'
+                 );
+                 INSERT INTO activities_fts(activities_fts) VALUES('rebuild');
+                 CREATE TRIGGER activities_ai AFTER INSERT ON activities BEGIN
+                    INSERT INTO activities_fts(rowid, app_name, window_title, ocr_text, browser_url)
+                    VALUES(new.id, new.app_name, new.window_title, new.ocr_text, new.browser_url);
+                 END;
+                 CREATE TRIGGER activities_au AFTER UPDATE ON activities BEGIN
+                    INSERT INTO activities_fts(activities_fts, rowid, app_name, window_title, ocr_text, browser_url)
+                    VALUES('delete', old.id, old.app_name, old.window_title, old.ocr_text, old.browser_url);
+                    INSERT INTO activities_fts(rowid, app_name, window_title, ocr_text, browser_url)
+                    VALUES(new.id, new.app_name, new.window_title, new.ocr_text, new.browser_url);
+                 END;
+                 CREATE TRIGGER activities_ad AFTER DELETE ON activities BEGIN
+                    INSERT INTO activities_fts(activities_fts, rowid, app_name, window_title, ocr_text, browser_url)
+                    VALUES('delete', old.id, old.app_name, old.window_title, old.ocr_text, old.browser_url);
+                 END;
+                 INSERT INTO memory_chunks(chunk_key, date, app_name, title, content, last_activity_id, updated_at)
+                    VALUES('legacy', '2026-11-13', 'Code', 'old memory', 'obsoleteocrsecret', 1, 1);
+                 INSERT INTO daily_reports(date, content, ai_mode, created_at)
+                    VALUES('2026-11-13', 'retained report', 'local', 1);"
+            ).unwrap();
+            assert_eq!(conn.query_row("SELECT COUNT(*) FROM activities_fts WHERE activities_fts MATCH 'obsoleteocrsecret'", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+        }
+        let snapshot = db.get_sync_activities_since(0, "device-a", 10).unwrap();
+        assert!(db.get_activity_by_id(id).unwrap().is_some());
+        serde_json::to_string(&snapshot).unwrap()
+    }
+
+    #[test]
+    fn 升级应删除历史ocr及派生索引并保留活动同步与日报() {
+        let path = temp_db_path("remove-ocr");
+        let snapshot = seed_legacy_ocr_database(&path);
+        for _ in 0..2 {
+            let db = Database::new(&path).unwrap();
+            assert_eq!(
+                serde_json::to_string(&db.get_sync_activities_since(0, "device-a", 10).unwrap())
+                    .unwrap(),
+                snapshot
+            );
+            let conn = db.conn.lock().unwrap();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('activities') WHERE name='ocr_text'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0
+            );
+            assert_eq!(conn.query_row("SELECT COUNT(*) FROM activities_fts WHERE activities_fts MATCH 'obsoleteocrsecret'", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+            assert_eq!(conn.query_row("SELECT COUNT(*) FROM activities_fts WHERE activities_fts MATCH 'retainedtitle'", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM memory_chunks", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT content FROM daily_reports WHERE date='2026-11-13'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+                "retained report"
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn 删除ocr迁移失败时应回滚列数据与全文索引() {
+        let path = temp_db_path("remove-ocr-rollback");
+        seed_legacy_ocr_database(&path);
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TRIGGER block_memory_delete BEFORE DELETE ON memory_chunks BEGIN SELECT RAISE(ABORT, 'fail migration'); END;").unwrap();
+        }
+        assert!(Database::new(&path).is_err());
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT ocr_text FROM activities", [], |row| row
+                .get::<_, String>(0))
+                .unwrap(),
+            "obsoleteocrsecret"
+        );
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM activities_fts WHERE activities_fts MATCH 'obsoleteocrsecret'", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+        drop(conn);
+        std::fs::remove_file(path).unwrap();
     }
 }

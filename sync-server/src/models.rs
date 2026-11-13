@@ -11,7 +11,6 @@ pub struct SyncActivity {
     pub window_title: String,
     pub screenshot_path: String,
     #[serde(default)]
-    pub ocr_text: Option<String>,
     pub category: String,
     pub duration: i64,
     #[serde(default)]

@@ -18,7 +18,6 @@ const MANAGED_DATA_ENTRIES: &[&str] = &[
     "config.json.bak",
     "workreview.db",
     "screenshots",
-    "ocr_logs",
     "background.jpg",
     "update_settings.json",
 ];

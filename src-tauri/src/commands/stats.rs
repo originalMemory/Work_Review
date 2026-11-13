@@ -1394,7 +1394,7 @@ fn remove_screenshot_files(data_dir: &std::path::Path, paths: Vec<String>) -> us
     removed
 }
 
-/// 删除单条活动记录（连带删除对应截图文件，OCR 文本随行删除）
+/// 删除单条活动记录（连带删除对应截图文件）
 #[tauri::command]
 pub async fn delete_activity(
     id: i64,

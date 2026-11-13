@@ -18,7 +18,7 @@ scripts/
 
 | | `deb/`（推荐） | `appimage/` |
 |---|---|---|
-| 依赖怎么来 | apt 自动拉（tesseract、gnome-screenshot、webkit、...） | 脚本 apt 自动装 + 再装 5 个 shim 绕过 `LD_LIBRARY_PATH` 污染 |
+| 依赖怎么来 | apt 自动拉（gnome-screenshot、webkit、...） | 脚本 apt 自动装 + 再装 4 个 shim 绕过 `LD_LIBRARY_PATH` 污染 |
 | 产出文件 | `/usr/bin/Work_Review` + `/usr/share/applications/` + `~/.local/bin/gnome-screenshot` (no-flash shim) + `~/.local/share/sounds/{Yaru,freedesktop}/stereo/screen-capture.oga` (静音覆盖) | `~/Applications/*.AppImage` + `~/bin/` + `~/.local/share/applications/` |
 | GNOME 活动搜索 | 自带 desktop 入口 | 脚本生成 desktop 入口 |
 | 卸载复杂度 | `sudo apt remove work-review` + 删 shim/静音文件/扩展 | 逐个删 shim/launcher/desktop/AppImage |

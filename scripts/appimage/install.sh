@@ -23,7 +23,6 @@ die()   { printf '\033[1;31m[install]\033[0m %s\n' "$*" >&2; exit 1; }
 # ---- 1. apt packages ------------------------------------------------------
 log "1/6 apt packages"
 PKGS=(libfuse2 gnome-screenshot grim kde-spectacle
-      tesseract-ocr tesseract-ocr-chi-sim tesseract-ocr-chi-tra
       desktop-file-utils git)
 MISSING=()
 for p in "${PKGS[@]}"; do
@@ -95,7 +94,7 @@ fi
 # ---- 5. shims, launcher, .desktop ----------------------------------------
 log "5/6 deploy shims, launcher, .desktop"
 mkdir -p "$BIN_DIR" "$DESKTOP_DIR"
-for cmd in gdbus gnome-screenshot grim spectacle tesseract; do
+for cmd in gdbus gnome-screenshot grim spectacle; do
 cat > "$BIN_DIR/$cmd" <<EOF
 #!/bin/bash
 # Shim: strip the AppImage's bundled LD_LIBRARY_PATH before exec-ing the real
@@ -142,7 +141,7 @@ Installed:
   Launcher   : $BIN_DIR/work-review
   Desktop    : $DESKTOP_DIR/work-review.desktop
   Icon       : $ICON_DIR/Work_Review.png
-  Shims      : $BIN_DIR/{gdbus,gnome-screenshot,grim,spectacle,tesseract}
+  Shims      : $BIN_DIR/{gdbus,gnome-screenshot,grim,spectacle}
   Extension  : $EXT_DIR
 
 Next (one-time manual):

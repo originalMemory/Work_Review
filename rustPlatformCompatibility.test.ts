@@ -51,7 +51,6 @@ test('Linux 发布构建不应编译仅供 macOS 或测试使用的符号', () =
 
 test('Windows 发布构建应保留明确类型并隔离 Unix 测试依赖', () => {
   const monitor = readSource('./src-tauri/src/monitor.rs');
-  const ocr = readSource('./src-tauri/src/ocr.rs');
   const screenshot = readSource('./src-tauri/src/screenshot.rs');
   const system = readSource('./src-tauri/src/commands/system.rs');
 
@@ -69,11 +68,6 @@ test('Windows 发布构建应保留明确类型并隔离 Unix 测试依赖', () 
     monitor,
     /#\[cfg\(any\(target_os = "macos", target_os = "linux", test\)\)\]\nuse serde_json::Value;/,
     'Firefox 与 Linux 窗口解析依赖不应进入 Windows 生产构建',
-  );
-  assert.match(
-    ocr,
-    /#\[cfg\(unix\)\]\n    use super::\{[\s\S]*?PaddleModelConfig[\s\S]*?\};/,
-    'Paddle worker 测试依赖只应在 Unix 测试中导入',
   );
   assert.match(
     screenshot,

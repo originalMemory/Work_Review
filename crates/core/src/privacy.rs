@@ -76,7 +76,7 @@ impl PrivacyFilter {
     /// 如果匹配，返回 Skip；否则返回 Record。
     /// 复用统计侧的 `matches_excluded_domain`（含合并域名兼容匹配）——
     /// 此前采集侧只做精确/后缀匹配,比统计侧窄:统计里被隐藏的域名
-    /// 实际仍在被截图与 OCR。两侧必须是同一套语义。
+    /// 实际仍在被截图。两侧必须是同一套语义。
     pub fn check_url_privacy(&self, url: Option<&str>) -> PrivacyAction {
         if let Some(url) = url {
             if !url.is_empty() && matches_excluded_domain(url, &self.config.excluded_domains) {
@@ -115,7 +115,7 @@ impl PrivacyFilter {
         self.check_privacy(app_name, window_title) == PrivacyAction::Skip
     }
 
-    /// 过滤OCR文本中的敏感信息
+    /// 过滤窗口标题中的敏感信息
     pub fn filter_text(&self, text: &str) -> String {
         let mut filtered = text.to_string();
 
@@ -417,7 +417,7 @@ mod tests {
             "example.com",
             &[String::new(), "https://".to_string()]
         ));
-        // OCR 合并域名兼容语义保持不变。
+        // 不完整域名的匹配语义保持不变。
         assert!(matches_excluded_domain(
             "linux.dolatest",
             &["linux.do".to_string()]

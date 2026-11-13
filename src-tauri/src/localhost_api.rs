@@ -744,7 +744,7 @@ fn ensure_api_capture_enabled(screenshots_enabled: bool) -> Result<()> {
         Ok(())
     } else {
         Err(AppError::Config(
-            "截图与 OCR 已关闭，请先在存储设置中启用后再调用即时截图 API".to_string(),
+            "截图 已关闭，请先在存储设置中启用后再调用即时截图 API".to_string(),
         ))
     }
 }
@@ -789,19 +789,6 @@ async fn handle_capture_screenshot(state: &Arc<Mutex<AppState>>) -> Result<HttpR
         let _permit = permit;
         let result = screenshot_service.capture_for_window(active_window.as_ref())?;
         let encoded_result = screenshot_service.generate_full_image_base64(&result.path);
-
-        if let Some(temp_path) = result
-            .ocr_source_path
-            .as_ref()
-            .filter(|path| *path != &result.path)
-        {
-            if let Err(error) = std::fs::remove_file(temp_path) {
-                log::warn!(
-                    "清理即时截图 OCR 临时文件失败 {}: {error}",
-                    temp_path.display()
-                );
-            }
-        }
 
         let image_base64 = encoded_result?;
         Ok(build_capture_payload(&data_dir, result, image_base64))
@@ -1347,7 +1334,6 @@ mod tests {
             Path::new("/tmp/work-review-data"),
             ScreenshotResult {
                 path: PathBuf::from("/tmp/work-review-data/screenshots/2026-08-10/shot.jpg"),
-                ocr_source_path: None,
                 timestamp: 1_786_334_400,
                 width: 1440,
                 height: 900,
@@ -1371,7 +1357,6 @@ mod tests {
             Path::new("/tmp/work-review-data"),
             ScreenshotResult {
                 path: PathBuf::from("/private/tmp/unexpected-shot.jpg"),
-                ocr_source_path: None,
                 timestamp: 1_786_334_400,
                 width: 1440,
                 height: 900,
@@ -1390,7 +1375,7 @@ mod tests {
     #[test]
     fn 关闭截图功能时即时截图api不应绕过隐私开关() {
         let error = ensure_api_capture_enabled(false).expect_err("关闭截图时必须拒绝请求");
-        assert!(error.to_string().contains("截图与 OCR"));
+        assert!(error.to_string().contains("截图"));
         assert!(ensure_api_capture_enabled(true).is_ok());
     }
 

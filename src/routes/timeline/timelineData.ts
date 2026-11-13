@@ -4,7 +4,6 @@ export interface TimelineActivity {
   readonly app_name: string;
   readonly window_title: string;
   readonly screenshot_path: string;
-  readonly ocr_text: string | null;
   readonly category: string;
   readonly duration: number;
   readonly browser_url: string | null;
@@ -34,7 +33,6 @@ export function isTimelineActivity(value: unknown): value is TimelineActivity {
     && typeof value.app_name === 'string'
     && typeof value.window_title === 'string'
     && typeof value.screenshot_path === 'string'
-    && isNullableString(value.ocr_text)
     && typeof value.category === 'string'
     && isFiniteNumber(value.duration)
     && isNullableString(value.browser_url)

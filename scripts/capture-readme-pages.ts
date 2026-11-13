@@ -319,7 +319,6 @@ function buildTimelineActivities(locale: CaptureLocale) {
     window_title: timelineTitles[locale][index] ?? item.app,
     screenshot_path: `readme-capture-${item.id}.png`,
     screenshot_url: null,
-    ocr_text: null,
     category: item.category,
     duration: item.duration,
     browser_url: item.url || null,

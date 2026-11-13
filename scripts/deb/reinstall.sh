@@ -70,7 +70,7 @@ HAS_USER_DESKTOP=0
 [ -f "$HOME/.local/share/applications/work-review.desktop" ] && HAS_USER_DESKTOP=1
 
 HAS_SHIMS=0
-for s in gdbus gnome-screenshot grim spectacle tesseract work-review; do
+for s in gdbus gnome-screenshot grim spectacle work-review; do
     if [ -f "$HOME/bin/$s" ] && grep -q "AppImage.*LD_LIBRARY_PATH\|Launcher for Work Review" "$HOME/bin/$s" 2>/dev/null; then
         HAS_SHIMS=1; break
     fi
@@ -119,7 +119,7 @@ done
 log "  removing user-scope AppImage-scheme artefacts"
 do_rm "$HOME/.local/share/applications/work-review.desktop"
 do_rm "$HOME/.local/share/icons/hicolor/256x256/apps/Work_Review.png"
-for f in work-review gdbus gnome-screenshot grim spectacle tesseract; do
+for f in work-review gdbus gnome-screenshot grim spectacle; do
     # Only nuke our shims, not random user scripts that happen to share names
     if [ -f "$HOME/bin/$f" ] && grep -qE "AppImage|Launcher for Work Review|bundled LD_LIBRARY_PATH" "$HOME/bin/$f" 2>/dev/null; then
         do_rm "$HOME/bin/$f"
@@ -192,15 +192,6 @@ fi
 log "  sudo apt install $DEB (auto-resolves dependencies)"
 run "sudo apt-get update -qq"
 run "sudo apt-get install -y \"$DEB\""
-
-log "  ensuring Chinese OCR language packs"
-OCR_MISSING=()
-for p in tesseract-ocr-chi-sim tesseract-ocr-chi-tra; do
-    dpkg -s "$p" >/dev/null 2>&1 || OCR_MISSING+=("$p")
-done
-if [ ${#OCR_MISSING[@]} -gt 0 ]; then
-    run "sudo apt-get install -y ${OCR_MISSING[*]}"
-fi
 
 # =========================================================================
 # PHASE 4 — neutralize gnome-screenshot 41 on GNOME 46 (no-flash + no-sound)

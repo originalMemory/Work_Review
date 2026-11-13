@@ -158,9 +158,6 @@ impl SessionAccumulator {
             }
 
             let mut text_parts = vec![activity.app_name.as_str(), activity.window_title.as_str()];
-            if let Some(ocr_text) = &activity.ocr_text {
-                text_parts.push(ocr_text.as_str());
-            }
             if let Some(url) = &activity.browser_url {
                 text_parts.push(url.as_str());
             }
@@ -743,9 +740,6 @@ fn add_score<S: Into<String>>(matches: &mut [IntentMatch], label: &str, delta: i
 fn build_todo_sources(activity: &Activity) -> Vec<(String, i32, String)> {
     let mut candidates = Vec::new();
     let mut texts = vec![activity.window_title.clone()];
-    if let Some(ocr_text) = &activity.ocr_text {
-        texts.push(ocr_text.clone());
-    }
     if let Some(url) = &activity.browser_url {
         texts.push(url.clone());
     }
@@ -966,7 +960,6 @@ mod tests {
         title: &str,
         duration: i64,
         browser_url: Option<&str>,
-        ocr_text: Option<&str>,
     ) -> Activity {
         Activity {
             id: None,
@@ -974,7 +967,6 @@ mod tests {
             app_name: app_name.to_string(),
             window_title: title.to_string(),
             screenshot_path: String::new(),
-            ocr_text: ocr_text.map(|value| value.to_string()),
             category: "development".to_string(),
             duration,
             browser_url: browser_url.map(|value| value.to_string()),
@@ -988,7 +980,7 @@ mod tests {
     #[test]
     fn 会话区间应以活动时间戳为终点回推() {
         // timestamp 是区间终点:600 秒的活动应回推出 [ts-600, ts]
-        let activities = vec![activity(1_700_000_600, "Code", "编辑文件", 600, None, None)];
+        let activities = vec![activity(1_700_000_600, "Code", "编辑文件", 600, None)];
 
         let sessions = build_work_sessions(&activities);
         assert_eq!(sessions.len(), 1);
@@ -1000,15 +992,14 @@ mod tests {
     #[test]
     fn 应按空闲间隔聚合连续_session() {
         let activities = vec![
-            activity(1_700_000_000, "Code", "实现 session 聚合", 300, None, None),
-            activity(1_700_000_360, "iTerm", "cargo test", 240, None, None),
+            activity(1_700_000_000, "Code", "实现 session 聚合", 300, None),
+            activity(1_700_000_360, "iTerm", "cargo test", 240, None),
             activity(
                 1_700_002_000,
                 "Chrome",
                 "GitHub Pull Request",
                 180,
                 Some("https://github.com/org/repo/pull/1"),
-                None,
             ),
         ];
 
@@ -1022,21 +1013,13 @@ mod tests {
     #[test]
     fn 应基于会话识别主要意图() {
         let activities = vec![
-            activity(
-                1_700_000_000,
-                "Code",
-                "fix login bug",
-                300,
-                None,
-                Some("traceback investigate error"),
-            ),
+            activity(1_700_000_000, "Code", "fix login bug", 300, None),
             activity(
                 1_700_000_200,
                 "Chrome",
                 "GitHub Pull Request review",
                 240,
                 Some("https://github.com/org/repo/pull/8"),
-                None,
             ),
         ];
 
@@ -1053,26 +1036,21 @@ mod tests {
     #[test]
     fn 应提取显式待办项() {
         let activities = vec![
-            activity(
-                1_700_000_000,
-                "Notion",
-                "TODO: 补充周报结论",
-                120,
-                None,
-                Some("- [ ] 修复 session 聚合边界"),
-            ),
+            activity(1_700_000_000, "Notion", "TODO: 补充周报结论", 120, None),
             activity(
                 1_700_000_200,
                 "Chrome",
                 "Issue #42 fix login redirect",
                 120,
                 Some("https://github.com/org/repo/issues/42"),
-                None,
             ),
         ];
 
         let todos = extract_todos(&activities);
         assert!(!todos.items.is_empty());
-        assert!(todos.items.iter().any(|item| item.title.contains("修复")));
+        assert!(todos
+            .items
+            .iter()
+            .any(|item| item.title.contains("补充周报结论")));
     }
 }

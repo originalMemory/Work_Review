@@ -51,7 +51,7 @@ The focus is not "monitoring". It is helping you **recall, organize, and review*
 
 ## Core Capabilities
 
-- **Automatic work context recording** — Records foreground apps, browser pages, window titles, usage time, optional screenshots, and OCR text, reducing manual note-taking
+- **Automatic work context recording** — Records foreground apps, browser pages, window titles, usage time, optional screenshots, reducing manual note-taking
 - **Unified timeline and statistics** — Overview, timeline, work assistant, and daily report share the same local records, so you can inspect trends and drill into context
 - **Questions over local records** — Use the basic template or your configured model to answer "What did I do today?", "How long did this task take?", and "What have I been focused on?"
 - **Daily report generation and export** — Generate structured daily reports with Markdown export, auto-export, paragraph editing, pin/hide controls, and cached AI section ordering
@@ -154,7 +154,7 @@ Work Review is designed for personal use from the ground up. It is not intended 
 
 You can control the recording scope as needed:
 
-- Per-app settings: Normal / Anonymize / Ignore — anonymize mode automatically skips screenshots and OCR
+- Per-app settings: Normal / Anonymize / Ignore — anonymize mode automatically skips screenshots
 - Automatic sensitive keyword filtering · domain blacklist
 - Auto-pause on screen lock · manual pause/resume
 - AI only activates after you configure a model; disabled by default
@@ -166,7 +166,7 @@ You can control the recording scope as needed:
 ### Automatic Recording
 
 - Foreground apps, window titles, browser URLs, usage duration, and category records
-- Optional screenshots and OCR with multi-display strategies
+- Optional screenshots with multi-display strategies
 - Keyboard/mouse activity + screen-change idle detection to reduce false records
 - Timeline review for pages, windows, and context from any time period
 
@@ -236,7 +236,7 @@ Supported providers: Ollama (local) / LM Studio (local) / OpenAI compatible / De
 
 ```bash
 # Base
-sudo apt install xprintidle tesseract-ocr
+sudo apt install xprintidle
 # X11
 sudo apt install xdotool x11-utils scrot
 # Wayland: gdbus (GNOME) / kdotool (KDE) / swaymsg (Sway) / hyprctl (Hyprland)
@@ -244,7 +244,7 @@ sudo apt install xdotool x11-utils scrot
 
 # RPM-based distributions
 sudo dnf install xprintidle tesseract xdotool xorg-x11-utils gnome-screenshot procps-ng
-sudo zypper install xprintidle tesseract-ocr xdotool xorg-x11-tools gnome-screenshot procps
+sudo zypper install xprintidle xdotool xorg-x11-tools gnome-screenshot procps
 ```
 
 </details>

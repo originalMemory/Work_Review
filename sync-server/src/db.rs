@@ -45,7 +45,6 @@ impl Database {
                 app_name TEXT NOT NULL,
                 window_title TEXT NOT NULL,
                 screenshot_path TEXT NOT NULL DEFAULT '',
-                ocr_text TEXT,
                 category TEXT NOT NULL,
                 duration INTEGER NOT NULL,
                 browser_url TEXT,
@@ -108,6 +107,14 @@ impl Database {
             );",
         )
         .expect("初始化表结构失败");
+        let has_ocr: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('activities') WHERE name = 'ocr_text')",
+            [], |row| row.get(0),
+        ).expect("读取数据库结构失败");
+        if has_ocr {
+            conn.execute("ALTER TABLE activities DROP COLUMN ocr_text", [])
+                .expect("删除历史 OCR 列失败");
+        }
 
         let _ = conn.execute("ALTER TABLE activities ADD COLUMN screenshot_url TEXT", []);
         let _ = conn.execute(
@@ -217,8 +224,8 @@ impl Database {
 
             if let Some((_, old_path)) = existing {
                 conn.execute(
-                        "UPDATE activities SET timestamp=?1, app_name=?2, window_title=?3, screenshot_path=?4, ocr_text=?5, category=?6, duration=?7, browser_url=?8, executable_path=?9, semantic_category=?10, semantic_confidence=?11, screenshot_url=?12, device_id=?13, sync_version=?14, source_version=?15 WHERE uuid=?16",
-                        params![act.timestamp, act.app_name, act.window_title, act.screenshot_path, act.ocr_text, act.category, act.duration, act.browser_url, act.executable_path, act.semantic_category, act.semantic_confidence, act.screenshot_url, act.device_id, sync_version, act.sync_version, act.uuid],
+                        "UPDATE activities SET timestamp=?1, app_name=?2, window_title=?3, screenshot_path=?4, category=?5, duration=?6, browser_url=?7, executable_path=?8, semantic_category=?9, semantic_confidence=?10, screenshot_url=?11, device_id=?12, sync_version=?13, source_version=?14 WHERE uuid=?15",
+                        params![act.timestamp, act.app_name, act.window_title, act.screenshot_path, act.category, act.duration, act.browser_url, act.executable_path, act.semantic_category, act.semantic_confidence, act.screenshot_url, act.device_id, sync_version, act.sync_version, act.uuid],
                     )?;
                 maybe_remove_replaced_screenshot_file(
                     &conn,
@@ -229,8 +236,8 @@ impl Database {
                 accepted += 1;
             } else {
                 conn.execute(
-                        "INSERT INTO activities (uuid, device_id, timestamp, app_name, window_title, screenshot_path, ocr_text, category, duration, browser_url, executable_path, semantic_category, semantic_confidence, screenshot_url, sync_version, source_version) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
-                        params![act.uuid, act.device_id, act.timestamp, act.app_name, act.window_title, act.screenshot_path, act.ocr_text, act.category, act.duration, act.browser_url, act.executable_path, act.semantic_category, act.semantic_confidence, act.screenshot_url, sync_version, act.sync_version],
+                        "INSERT INTO activities (uuid, device_id, timestamp, app_name, window_title, screenshot_path, category, duration, browser_url, executable_path, semantic_category, semantic_confidence, screenshot_url, sync_version, source_version) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                        params![act.uuid, act.device_id, act.timestamp, act.app_name, act.window_title, act.screenshot_path, act.category, act.duration, act.browser_url, act.executable_path, act.semantic_category, act.semantic_confidence, act.screenshot_url, sync_version, act.sync_version],
                     )?;
                 accepted += 1;
             }
@@ -327,7 +334,7 @@ impl Database {
         if let Some(exclude) = exclude_device {
             let mut stmt = conn
                 .prepare(
-                    "SELECT uuid, device_id, sync_version, timestamp, app_name, window_title, screenshot_path, ocr_text, category, duration, browser_url, executable_path, semantic_category, semantic_confidence, screenshot_url
+                    "SELECT uuid, device_id, sync_version, timestamp, app_name, window_title, screenshot_path, category, duration, browser_url, executable_path, semantic_category, semantic_confidence, screenshot_url
                      FROM activities WHERE sync_version > ?1 AND device_id != ?2 ORDER BY sync_version ASC LIMIT ?3",
                 )?;
             let rows = stmt.query_map(params![since, exclude, fetch_limit], |row| {
@@ -339,14 +346,13 @@ impl Database {
                     app_name: row.get(4)?,
                     window_title: row.get(5)?,
                     screenshot_path: row.get(6)?,
-                    ocr_text: row.get(7)?,
-                    category: row.get(8)?,
-                    duration: row.get(9)?,
-                    browser_url: row.get(10)?,
-                    executable_path: row.get(11)?,
-                    semantic_category: row.get(12)?,
-                    semantic_confidence: row.get(13)?,
-                    screenshot_url: row.get(14)?,
+                    category: row.get(7)?,
+                    duration: row.get(8)?,
+                    browser_url: row.get(9)?,
+                    executable_path: row.get(10)?,
+                    semantic_category: row.get(11)?,
+                    semantic_confidence: row.get(12)?,
+                    screenshot_url: row.get(13)?,
                 })
             })?;
             for row in rows {
@@ -355,7 +361,7 @@ impl Database {
         } else {
             let mut stmt = conn
                 .prepare(
-                    "SELECT uuid, device_id, sync_version, timestamp, app_name, window_title, screenshot_path, ocr_text, category, duration, browser_url, executable_path, semantic_category, semantic_confidence, screenshot_url
+                    "SELECT uuid, device_id, sync_version, timestamp, app_name, window_title, screenshot_path, category, duration, browser_url, executable_path, semantic_category, semantic_confidence, screenshot_url
                      FROM activities WHERE sync_version > ?1 ORDER BY sync_version ASC LIMIT ?2",
                 )?;
             let rows = stmt.query_map(params![since, fetch_limit], |row| {
@@ -367,14 +373,13 @@ impl Database {
                     app_name: row.get(4)?,
                     window_title: row.get(5)?,
                     screenshot_path: row.get(6)?,
-                    ocr_text: row.get(7)?,
-                    category: row.get(8)?,
-                    duration: row.get(9)?,
-                    browser_url: row.get(10)?,
-                    executable_path: row.get(11)?,
-                    semantic_category: row.get(12)?,
-                    semantic_confidence: row.get(13)?,
-                    screenshot_url: row.get(14)?,
+                    category: row.get(7)?,
+                    duration: row.get(8)?,
+                    browser_url: row.get(9)?,
+                    executable_path: row.get(10)?,
+                    semantic_category: row.get(11)?,
+                    semantic_confidence: row.get(12)?,
+                    screenshot_url: row.get(13)?,
                 })
             })?;
             for row in rows {
@@ -502,7 +507,7 @@ impl Database {
             |row| row.get(0),
         )?;
         let mut stmt = conn.prepare(
-            "SELECT uuid, device_id, sync_version, timestamp, app_name, window_title, screenshot_path, ocr_text, category, duration, browser_url, executable_path, semantic_category, semantic_confidence, screenshot_url
+            "SELECT uuid, device_id, sync_version, timestamp, app_name, window_title, screenshot_path, category, duration, browser_url, executable_path, semantic_category, semantic_confidence, screenshot_url
              FROM activities
              WHERE timestamp BETWEEN ?1 AND ?2 AND (?3 IS NULL OR device_id = ?3)
              ORDER BY timestamp ASC, uuid ASC
@@ -518,14 +523,13 @@ impl Database {
                     app_name: row.get(4)?,
                     window_title: row.get(5)?,
                     screenshot_path: row.get(6)?,
-                    ocr_text: row.get(7)?,
-                    category: row.get(8)?,
-                    duration: row.get(9)?,
-                    browser_url: row.get(10)?,
-                    executable_path: row.get(11)?,
-                    semantic_category: row.get(12)?,
-                    semantic_confidence: row.get(13)?,
-                    screenshot_url: row.get(14)?,
+                    category: row.get(7)?,
+                    duration: row.get(8)?,
+                    browser_url: row.get(9)?,
+                    executable_path: row.get(10)?,
+                    semantic_category: row.get(11)?,
+                    semantic_confidence: row.get(12)?,
+                    screenshot_url: row.get(13)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -783,7 +787,6 @@ mod tests {
             app_name: "Code".to_string(),
             window_title: uuid.to_string(),
             screenshot_path: String::new(),
-            ocr_text: None,
             category: "development".to_string(),
             duration: 60,
             browser_url: None,
@@ -872,13 +875,13 @@ mod tests {
         let db = Database::new(&data_dir);
         let mut newer = activity("same", 100);
         newer.sync_version = 2;
-        newer.ocr_text = Some("newer".to_string());
+        newer.window_title = "newer".to_string();
         db.upsert_activities(&[newer], &data_dir)
             .expect("写入新版本活动失败");
 
         let mut stale = activity("same", 100);
         stale.sync_version = 1;
-        stale.ocr_text = Some("stale".to_string());
+        stale.window_title = "stale".to_string();
         let (accepted, duplicates) = db
             .upsert_activities(&[stale], &data_dir)
             .expect("处理旧版本活动失败");
@@ -889,7 +892,35 @@ mod tests {
             .pull_activities(0, Some("device-b"), 10)
             .expect("拉取活动失败");
         assert_eq!(activities.len(), 1);
-        assert_eq!(activities[0].ocr_text.as_deref(), Some("newer"));
+        assert_eq!(activities[0].window_title, "newer");
         let _ = std::fs::remove_dir_all(data_dir);
+    }
+    #[test]
+    fn existing_database_drops_ocr_without_changing_sync_records() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "work-review-sync-remove-ocr-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let record = activity("legacy", 100);
+        {
+            let db = Database::new(&data_dir);
+            db.upsert_activities(&[record], &data_dir).unwrap();
+            db.conn.lock().unwrap().execute_batch("ALTER TABLE activities ADD COLUMN ocr_text TEXT; UPDATE activities SET ocr_text = 'obsoleteocrsecret';").unwrap();
+        }
+        for _ in 0..2 {
+            let db = Database::new(&data_dir);
+            let (records, total) = db
+                .query_activities_range(0, 200, Some("device-a"), 10, 0)
+                .unwrap();
+            assert_eq!(total, 1);
+            assert_eq!(records[0].uuid, "legacy");
+            assert_eq!(records[0].duration, 60);
+            assert!(serde_json::to_value(&records[0])
+                .unwrap()
+                .get("ocr_text")
+                .is_none());
+            assert_eq!(db.conn.lock().unwrap().query_row("SELECT COUNT(*) FROM pragma_table_info('activities') WHERE name = 'ocr_text'", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        }
+        std::fs::remove_dir_all(data_dir).unwrap();
     }
 }

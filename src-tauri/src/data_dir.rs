@@ -379,7 +379,6 @@ mod tests {
             app_name: "Notepad".into(),
             window_title: "portable test".into(),
             screenshot_path: screenshot.into(),
-            ocr_text: None,
             category: "work".into(),
             duration: 30,
             browser_url: None,

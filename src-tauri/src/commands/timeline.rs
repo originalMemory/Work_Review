@@ -58,7 +58,7 @@ pub async fn get_timeline(
     get_timeline_filtered_inner(date, limit, offset, device_id, state.inner())
 }
 
-/// 获取单个活动（用于刷新详情页，获取最新 OCR 结果）
+/// 获取单个活动（用于刷新详情页，获取最新记录）
 #[tauri::command]
 pub async fn get_activity(
     id: i64,
@@ -79,12 +79,10 @@ pub async fn get_activity(
 /// 导出指定日期的时间线为 JSON 文件
 ///
 /// - 复用 `get_timeline_inner` 的隐私过滤（忽略应用 / 排除域名）
-/// - `include_ocr = false` 时，OCR 文本会被清空，避免泄露屏幕内容
 /// - 写入路径为用户选择的 `target_path`，必须以 `.json` 结尾
 pub(crate) fn export_timeline_json_inner(
     date: String,
     target_path: String,
-    include_ocr: bool,
     state: &Arc<Mutex<AppState>>,
 ) -> Result<String, AppError> {
     let target = target_path.trim();
@@ -94,12 +92,7 @@ pub(crate) fn export_timeline_json_inner(
     let target_path_buf = PathBuf::from(target);
 
     // 走完整时间线（不分页），并应用隐私过滤
-    let mut activities = get_timeline_inner(date.clone(), None, None, state)?;
-    if !include_ocr {
-        for a in activities.iter_mut() {
-            a.ocr_text = None;
-        }
-    }
+    let activities = get_timeline_inner(date.clone(), None, None, state)?;
 
     // 父目录可能不存在（用户选了新位置），尝试创建
     if let Some(parent) = target_path_buf.parent() {
@@ -112,7 +105,6 @@ pub(crate) fn export_timeline_json_inner(
         "version": 1,
         "date": date,
         "exported_at": chrono::Local::now().to_rfc3339(),
-        "include_ocr": include_ocr,
         "count": activities.len(),
         "activities": activities,
     });
@@ -126,15 +118,9 @@ pub(crate) fn export_timeline_json_inner(
 pub async fn export_timeline_json(
     date: String,
     target_path: String,
-    include_ocr: Option<bool>,
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<String, AppError> {
-    export_timeline_json_inner(
-        date,
-        target_path,
-        include_ocr.unwrap_or(false),
-        state.inner(),
-    )
+    export_timeline_json_inner(date, target_path, state.inner())
 }
 
 /// 获取截图缩略图

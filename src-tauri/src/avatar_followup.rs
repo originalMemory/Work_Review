@@ -454,7 +454,6 @@ mod tests {
             app_name: app_name.to_string(),
             window_title: title.to_string(),
             screenshot_path: String::new(),
-            ocr_text: None,
             category: "development".to_string(),
             duration,
             browser_url: url.map(str::to_string),

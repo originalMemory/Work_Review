@@ -1070,20 +1070,12 @@
   let exportingTimeline = false;
 
   // 导出当前日期的时间线为 JSON
-  // OCR 文本可能含屏幕内容，弹一个确认让用户选择是否一并导出
   async function exportTimelineJson() {
     if (exportingTimeline) return;
     if (!activities.length) {
       showToast(t('timeline.exportNothing'), 'error');
       return;
     }
-
-    const includeOcr = await ask(t('timeline.exportIncludeOcrMessage'), {
-      title: t('timeline.exportIncludeOcrTitle'),
-      kind: 'info',
-      okLabel: t('timeline.exportIncludeOcrYes'),
-      cancelLabel: t('timeline.exportIncludeOcrNo'),
-    });
 
     const targetPath = await saveDialog({
       defaultPath: `timeline-${selectedDate}.json`,
@@ -1096,7 +1088,6 @@
       const savedPath = await invoke('export_timeline_json', {
         date: selectedDate,
         targetPath,
-        includeOcr,
       }) as string;
       showToast(t('timeline.exportSuccess', { path: savedPath }), 'success');
     } catch (e) {

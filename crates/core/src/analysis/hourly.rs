@@ -48,7 +48,6 @@ pub struct HourlyStats {
     pub activity_count: i32,
     pub representative_screenshots: Vec<String>,
     pub urls: Vec<String>,
-    pub ocr_keywords: Vec<String>,
 }
 
 impl HourlyStats {
@@ -86,34 +85,6 @@ impl HourlyStats {
             representative_screenshots = representative_screenshots.into_iter().take(5).collect();
         }
 
-        // 提取 OCR 关键词
-        let mut ocr_keywords: Vec<String> = Vec::new();
-        let mut seen_keywords: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for activity in &activities {
-            if let Some(ocr_text) = &activity.ocr_text {
-                // 提取有意义的词（长度 > 3 的中英文词）
-                for word in ocr_text.split(|c: char| !c.is_alphanumeric() && c != '-') {
-                    let word = word.trim();
-                    if word.chars().count() >= 2
-                        && word.chars().count() <= 20
-                        && !seen_keywords.contains(word)
-                    {
-                        // 只保留中文或英文词
-                        if word.chars().all(|c| c.is_alphabetic() || c >= '\u{4e00}') {
-                            seen_keywords.insert(word.to_string());
-                            ocr_keywords.push(word.to_string());
-                            if ocr_keywords.len() >= 20 {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            if ocr_keywords.len() >= 20 {
-                break;
-            }
-        }
-
         let total_duration = calculate_activity_covered_duration(&activities);
 
         Self {
@@ -122,7 +93,6 @@ impl HourlyStats {
             activity_count,
             representative_screenshots,
             urls,
-            ocr_keywords,
         }
     }
 
@@ -176,18 +146,6 @@ pub fn generate_fallback_summary(stats: &HourlyStats) -> String {
         summary.push_str(&format!("，访问了 {domain}{extra}"));
     }
 
-    // 添加 OCR 关键词
-    if !stats.ocr_keywords.is_empty() {
-        let keywords_str = stats
-            .ocr_keywords
-            .iter()
-            .take(5)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("、");
-        summary.push_str(&format!("，涉及: {keywords_str}"));
-    }
-
     summary
 }
 
@@ -203,7 +161,6 @@ mod tests {
             app_name: app_name.to_string(),
             window_title: format!("{app_name} window"),
             screenshot_path: String::new(),
-            ocr_text: None,
             category: "development".to_string(),
             duration,
             browser_url: None,

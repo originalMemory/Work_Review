@@ -27,7 +27,6 @@ mod linux_session;
 mod localhost_api;
 mod monitor;
 mod node_gateway;
-mod ocr;
 mod remote_upload;
 mod screen_lock;
 mod screenshot;
@@ -1031,7 +1030,7 @@ pub(crate) fn resolve_activity_classification(
 
     // 与网站统计、历史回填共用域名来源；没有地址栏 URL 时仍可按标题匹配规则。
     let browser_page_hint = if work_review_core::categorize::is_browser_app(app_name) {
-        work_review_core::categorize::resolve_browser_page_hint(browser_url, window_title, None)
+        work_review_core::categorize::resolve_browser_page_hint(browser_url, window_title)
     } else {
         None
     };
@@ -1201,14 +1200,7 @@ fn persist_previous_activity_backfill(
     if let Some(previous_activity) = previous_activity {
         let previous_id = previous_activity.id?;
 
-        return match database.merge_activity(
-            previous_id,
-            duration_delta,
-            None,
-            &previous_activity.screenshot_path,
-            current_timestamp,
-            None,
-        ) {
+        return match database.merge_activity(previous_id, duration_delta, current_timestamp, None) {
             Ok(()) => {
                 log::debug!(
                     "⏱️ 时长回补: {} +{}s (切换到 {})",
@@ -1264,7 +1256,6 @@ fn persist_previous_activity_backfill(
         app_name: previous_app_name.to_string(),
         window_title,
         screenshot_path: String::new(),
-        ocr_text: None,
         category: classification.base_category,
         duration: duration_delta,
         browser_url,
@@ -1352,13 +1343,6 @@ fn reset_recording_session(
     *last_browser_url = None;
     *last_capture_time = now;
     overlay_sessions.clear();
-}
-
-fn should_run_ocr(elapsed_since_ocr: Option<Duration>, screenshot_interval: u64) -> bool {
-    match elapsed_since_ocr {
-        None => true,
-        Some(elapsed) => elapsed >= Duration::from_secs(screenshot_interval),
-    }
 }
 
 /// 浮窗只合并连续观察到的同一条记录，并保留不足一秒的余量。
@@ -2133,13 +2117,6 @@ async fn capture_screenshot_for_window(
 
     let result = result.map_err(work_review_core::error::AppError::Screenshot)?;
     if !activity_clock::Sample::now().follows(sample) {
-        if let Some(path) = result
-            .ocr_source_path
-            .as_ref()
-            .filter(|path| *path != &result.path)
-        {
-            let _ = std::fs::remove_file(path);
-        }
         let _ = std::fs::remove_file(&result.path);
         return Err(work_review_core::error::AppError::Screenshot(
             "截图跨越待机或采样中断，已丢弃本次结果".to_string(),
@@ -2173,13 +2150,6 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
     let mut is_currently_idle = false; // 当前是否处于空闲状态
 
     let poll_interval_ms = monitoring_poll_interval_ms(); // 桌宠状态和窗口切换检测优先更快反馈
-
-    // OCR 并发限制：最多 2 个 OCR 任务同时运行，防止任务堆积消耗内存
-    let ocr_semaphore = Arc::new(tokio::sync::Semaphore::new(2));
-
-    // 合并路径的截图哈希去重：用 Arc 共享给异步任务，避免 static 跨活动污染
-    let merge_screenshot_hash = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let mut last_ocr_time: Option<std::time::Instant> = None;
 
     // 锁屏检测器（无内部状态，复用同一实例避免重复分配）
     let screen_lock_monitor = screen_lock::ScreenLockMonitor::new();
@@ -2621,8 +2591,6 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                 &active_window.window_title,
                 active_window.browser_url.as_deref(),
             );
-            // 窗口标题与 OCR 文本同等过滤后再向下游传递(入库/事件/分类)：
-            // 邮件主题、IM 会话名里常出现邮箱/手机号等敏感信息,此前只过滤 OCR 文本。
             // 隐私判定(上方)与逐 tick 变化检测(last_* 变量)仍使用原始标题。
             active_window.window_title = state_guard
                 .privacy_filter
@@ -2753,7 +2721,6 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                         app_name: active_window.app_name,
                         window_title: "[内容已脱敏]".to_string(),
                         screenshot_path: String::new(),
-                        ocr_text: None,
                         category: classification.base_category,
                         duration: effective_duration,
                         browser_url: None,
@@ -2848,16 +2815,8 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                     false
                 };
 
-                // 新建与合并共用 OCR 冷却，窗口切换仍保留截图。
-                // ponytail: 冷却期内的短活动可能没有 OCR；需要逐条索引时再加有界后台队列。
-                let should_run_ocr = screenshots_enabled
-                    && should_run_ocr(
-                        last_ocr_time.map(|last| last.elapsed()),
-                        screenshot_interval,
-                    );
-
                 if is_merge {
-                    // === 合并路径：不保存截图，只做 OCR ===
+                    // === 合并路径：保留原截图并累加时长 ===
                     let latest = latest_activity.unwrap();
                     let latest_id = match latest.id {
                         Some(id) => id,
@@ -2868,8 +2827,8 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                     };
                     let previous_screenshot_path = latest.screenshot_path.clone();
 
-                    // 截屏到内存，保存为临时文件供 OCR 使用
-                    let screenshot_result = if screenshots_enabled {
+                    // 截图用于保持现有的屏幕空闲检测口径
+                    let screenshot_result = if screenshots_enabled && input_idle {
                         capture_screenshot_for_window(&state, &active_window, accounting_sample)
                             .await
                             .ok()
@@ -2935,25 +2894,6 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                         adjusted_duration
                     };
 
-                    // 截图仍用于 OCR；duration 为 0 时不能推进 timestamp，
-                    // 否则已有区间会整体向后漂移。OCR 在下方独立更新。
-                    let (latest_archive_path, ocr_input_path, temporary_ocr_source_path) =
-                        if let Some(ref screenshot) = screenshot_result {
-                            (
-                                Some(screenshot.path.clone()),
-                                screenshot
-                                    .ocr_source_path
-                                    .clone()
-                                    .unwrap_or_else(|| screenshot.path.clone()),
-                                screenshot
-                                    .ocr_source_path
-                                    .clone()
-                                    .filter(|path| path != &screenshot.path),
-                            )
-                        } else {
-                            (None, PathBuf::new(), None)
-                        };
-
                     let persisted_screenshot_path = previous_screenshot_path.clone();
                     let mut persisted_duration = latest.duration;
 
@@ -2962,8 +2902,6 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                         match state_guard.database.merge_activity(
                             latest_id,
                             effective_duration,
-                            None,
-                            &previous_screenshot_path,
                             current_timestamp,
                             active_window.browser_url.as_deref(),
                         ) {
@@ -2982,119 +2920,8 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                         }
                     }
 
-                    // 对截图执行 OCR；若已成功合并，则保留最新截图并清理旧截图
                     if let Some(screenshot) = screenshot_result {
-                        if should_run_ocr {
-                            last_ocr_time = Some(std::time::Instant::now());
-                        }
-                        let latest_capture_path =
-                            latest_archive_path.unwrap_or_else(|| screenshot.path.clone());
-                        let state_clone = state.clone();
-                        let data_dir_clone = {
-                            let state_guard = state.lock().unwrap_or_else(|e| e.into_inner());
-                            state_guard.data_dir.clone()
-                        };
-
-                        let ocr_sem = ocr_semaphore.clone();
-                        let merge_hash = merge_screenshot_hash.clone();
-
-                        tokio::spawn(async move {
-                            use std::sync::atomic::Ordering;
-
-                            if !should_run_ocr {
-                                if let Some(temp_path) = temporary_ocr_source_path {
-                                    let _ = std::fs::remove_file(temp_path);
-                                }
-                                let _ = std::fs::remove_file(latest_capture_path);
-                                return;
-                            }
-
-                            // 非阻塞获取 permit，满载时跳过 OCR 避免任务堆积
-                            let _permit = match ocr_sem.try_acquire_owned() {
-                                Ok(p) => p,
-                                Err(_) => {
-                                    log::debug!("OCR 并发已满，跳过合并路径 OCR");
-                                    if let Some(temp_path) = temporary_ocr_source_path.clone() {
-                                        let _ = std::fs::remove_file(&temp_path);
-                                    }
-                                    let _ = std::fs::remove_file(&latest_capture_path);
-                                    return;
-                                }
-                            };
-
-                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-                            // 计算哈希做去重判断
-                            let current_hash = screenshot::ScreenshotService::calculate_image_hash(
-                                &latest_capture_path,
-                            )
-                            .unwrap_or(0);
-                            let last_hash = merge_hash.swap(current_hash, Ordering::Relaxed);
-
-                            let should_ocr = if last_hash != 0 {
-                                let similarity = screenshot::ScreenshotService::hash_similarity(
-                                    last_hash,
-                                    current_hash,
-                                );
-                                if similarity > 90 {
-                                    log::debug!("合并截图相似度 {similarity}%，跳过 OCR");
-                                    false
-                                } else {
-                                    log::debug!("合并截图相似度 {similarity}%，执行 OCR");
-                                    true
-                                }
-                            } else {
-                                true
-                            };
-
-                            if should_ocr {
-                                // OCR 是阻塞调用，放入 spawn_blocking 避免阻塞异步运行时
-                                let data_dir_for_ocr = data_dir_clone.clone();
-                                let ocr_source_path = ocr_input_path.clone();
-                                let ocr_outcome = tokio::task::spawn_blocking(move || {
-                                    let ocr_service = ocr::OcrService::new(&data_dir_for_ocr);
-                                    ocr_service.extract_text(&ocr_source_path)
-                                })
-                                .await;
-                                match ocr_outcome {
-                                    Ok(Ok(Some(ocr_result))) => {
-                                        if !ocr_result.text.is_empty() {
-                                            let filtered_text =
-                                                ocr::filter_sensitive_text(&ocr_result.text);
-                                            if let Ok(state_guard) = state_clone.lock() {
-                                                if let Err(error) =
-                                                    state_guard.database.update_activity_ocr(
-                                                        latest_id,
-                                                        Some(filtered_text),
-                                                        &state_guard.config.website_semantic_rules,
-                                                    )
-                                                {
-                                                    log::warn!(
-                                                        "保存 OCR 与网站分类失败(合并): {error}"
-                                                    );
-                                                }
-                                                log::info!(
-                                                    "OCR 完成(合并): 活动 {} 识别到 {} 个字符",
-                                                    latest_id,
-                                                    ocr_result.text.len()
-                                                );
-                                            }
-                                        }
-                                    }
-                                    Ok(_) => {}
-                                    Err(e) => {
-                                        log::warn!("OCR 后台任务执行失败(合并): {e}");
-                                    }
-                                }
-                            }
-
-                            if let Some(temp_path) = temporary_ocr_source_path {
-                                let _ = std::fs::remove_file(&temp_path);
-                            }
-
-                            let _ = std::fs::remove_file(&latest_capture_path);
-                            log::debug!("已删除仅用于合并 OCR 的临时截图: {latest_capture_path:?}");
-                        });
+                        let _ = std::fs::remove_file(screenshot.path);
                     }
 
                     Some(work_review_core::database::Activity {
@@ -3103,7 +2930,6 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                         app_name: active_window.app_name.clone(),
                         window_title: active_window.window_title,
                         screenshot_path: persisted_screenshot_path,
-                        ocr_text: None,
                         category,
                         duration: persisted_duration,
                         browser_url: active_window.browser_url,
@@ -3180,30 +3006,13 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                                     adjusted_duration
                                 };
 
-                                let (
-                                    relative_path,
-                                    archive_path,
-                                    ocr_input_path,
-                                    temporary_ocr_source_path,
-                                    data_dir_clone,
-                                ) = {
+                                let archive_path = screenshot_result.path;
+                                let relative_path = {
                                     let state_guard =
                                         state.lock().unwrap_or_else(|e| e.into_inner());
-                                    (
-                                        state_guard
-                                            .screenshot_service
-                                            .get_relative_path(&screenshot_result.path),
-                                        screenshot_result.path.clone(),
-                                        screenshot_result
-                                            .ocr_source_path
-                                            .clone()
-                                            .unwrap_or_else(|| screenshot_result.path.clone()),
-                                        screenshot_result
-                                            .ocr_source_path
-                                            .clone()
-                                            .filter(|path| path != &screenshot_result.path),
-                                        state_guard.data_dir.clone(),
-                                    )
+                                    state_guard
+                                        .screenshot_service
+                                        .get_relative_path(&archive_path)
                                 };
 
                                 let activity = work_review_core::database::Activity {
@@ -3212,7 +3021,6 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                                     app_name: active_window.app_name.clone(),
                                     window_title: active_window.window_title,
                                     screenshot_path: relative_path.clone(),
-                                    ocr_text: None,
                                     category,
                                     duration: effective_duration,
                                     browser_url: active_window.browser_url,
@@ -3237,88 +3045,6 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                                             active_window.app_name,
                                             activity_id
                                         );
-
-                                        // 异步 OCR（新建活动的截图已保存，不删除）
-                                        if should_run_ocr {
-                                            last_ocr_time = Some(std::time::Instant::now());
-                                        }
-                                        let state_clone = state.clone();
-                                        let ocr_sem = ocr_semaphore.clone();
-                                        tokio::spawn(async move {
-                                            if !should_run_ocr {
-                                                if let Some(temp_path) = temporary_ocr_source_path {
-                                                    let _ = std::fs::remove_file(temp_path);
-                                                }
-                                                return;
-                                            }
-
-                                            // 非阻塞获取 permit，满载时跳过 OCR
-                                            let _permit = match ocr_sem.try_acquire_owned() {
-                                                Ok(p) => p,
-                                                Err(_) => {
-                                                    log::debug!("OCR 并发已满，跳过新建路径 OCR");
-                                                    if let Some(temp_path) =
-                                                        temporary_ocr_source_path.clone()
-                                                    {
-                                                        let _ = std::fs::remove_file(&temp_path);
-                                                    }
-                                                    return;
-                                                }
-                                            };
-
-                                            tokio::time::sleep(tokio::time::Duration::from_secs(1))
-                                                .await;
-
-                                            // OCR 是阻塞调用，放入 spawn_blocking 避免阻塞异步运行时
-                                            let data_dir_for_ocr = data_dir_clone.clone();
-                                            let ocr_source_path = ocr_input_path.clone();
-                                            let ocr_outcome =
-                                                tokio::task::spawn_blocking(move || {
-                                                    let ocr_service =
-                                                        ocr::OcrService::new(&data_dir_for_ocr);
-                                                    ocr_service.extract_text(&ocr_source_path)
-                                                })
-                                                .await;
-
-                                            match ocr_outcome {
-                                                Ok(Ok(Some(ocr_result))) => {
-                                                    if !ocr_result.text.is_empty() {
-                                                        let filtered_text =
-                                                            ocr::filter_sensitive_text(
-                                                                &ocr_result.text,
-                                                            );
-                                                        if let Ok(state_guard) = state_clone.lock()
-                                                        {
-                                                            if let Err(error) = state_guard
-                                                                .database
-                                                                .update_activity_ocr(
-                                                                    activity_id,
-                                                                    Some(filtered_text),
-                                                                    &state_guard
-                                                                        .config
-                                                                        .website_semantic_rules,
-                                                                )
-                                                            {
-                                                                log::warn!("保存 OCR 与网站分类失败(新建): {error}");
-                                                            }
-                                                            log::info!(
-                                                        "OCR 完成(新建): 活动 {} 识别到 {} 个字符",
-                                                        activity_id,
-                                                        ocr_result.text.len()
-                                                    );
-                                                        }
-                                                    }
-                                                }
-                                                Ok(_) => {}
-                                                Err(e) => {
-                                                    log::warn!("OCR 后台任务执行失败(新建): {e}");
-                                                }
-                                            }
-
-                                            if let Some(temp_path) = temporary_ocr_source_path {
-                                                let _ = std::fs::remove_file(&temp_path);
-                                            }
-                                        });
 
                                         // 异步远程上传截图
                                         {
@@ -3353,9 +3079,6 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                                     Err(e) => {
                                         log::error!("保存活动记录失败: {e}");
                                         let _ = std::fs::remove_file(&archive_path);
-                                        if let Some(temp_path) = temporary_ocr_source_path {
-                                            let _ = std::fs::remove_file(&temp_path);
-                                        }
                                         None
                                     }
                                 }
@@ -3414,7 +3137,6 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                             app_name: active_window.app_name.clone(),
                             window_title: active_window.window_title,
                             screenshot_path: String::new(),
-                            ocr_text: None,
                             category,
                             duration: effective_duration,
                             browser_url: active_window.browser_url,
@@ -3534,14 +3256,10 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                         continue;
                     }
                     let state_guard = state.lock().unwrap_or_else(|e| e.into_inner());
-                    match state_guard.database.merge_activity(
-                        act_id,
-                        ow_duration,
-                        None,
-                        &act.screenshot_path,
-                        current_ts,
-                        None,
-                    ) {
+                    match state_guard
+                        .database
+                        .merge_activity(act_id, ow_duration, current_ts, None)
+                    {
                         Ok(_) => {
                             next_overlay_sessions
                                 .insert(ow.app_name.clone(), (act_id, accounted_at));
@@ -3573,7 +3291,6 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                     app_name: ow.app_name.clone(),
                     window_title: ow_title,
                     screenshot_path: String::new(),
-                    ocr_text: None,
                     category: ow_category,
                     duration: ow_duration,
                     browser_url: None,
@@ -4991,10 +4708,9 @@ mod tests {
         should_initialize_avatar_input, should_initialize_startup_permissions,
         should_merge_contiguous_activity, should_persist_merge_update, should_prevent_exit,
         should_probe_browser_url_before_change_detection, should_request_screen_capture_permission,
-        should_run_ocr, should_run_startup_cleanup, should_skip_system_window,
-        should_zero_duration_for_idle, tray_recording_toggle_action, tray_recording_toggle_label,
-        AvatarNudgeRuntime, BreakReminderRuntime, BreakReminderSignal, MainWindowCloseBehavior,
-        RecordingToggleAction,
+        should_run_startup_cleanup, should_skip_system_window, should_zero_duration_for_idle,
+        tray_recording_toggle_action, tray_recording_toggle_label, AvatarNudgeRuntime,
+        BreakReminderRuntime, BreakReminderSignal, MainWindowCloseBehavior, RecordingToggleAction,
     };
     use crate::avatar_engine::{
         apply_avatar_visual_settings, default_avatar_state, derive_avatar_state,
@@ -5076,7 +4792,6 @@ mod tests {
             app_name: "Player".into(),
             window_title: "PiP".into(),
             screenshot_path: String::new(),
-            ocr_text: None,
             category: "entertainment".into(),
             duration: 0,
             browser_url: None,
@@ -5125,28 +4840,6 @@ mod tests {
             overlay_session_increment(Some((7, start)), &activity, sample, 1030),
             None
         );
-    }
-
-    #[test]
-    fn ocr应遵循全局间隔且首次立即执行() {
-        assert!(should_run_ocr(None, 30));
-        assert!(!should_run_ocr(Some(Duration::from_secs(29)), 30));
-        assert!(should_run_ocr(Some(Duration::from_secs(30)), 30));
-        assert!(!should_run_ocr(Some(Duration::from_secs(5)), 30));
-        assert!(!should_run_ocr(Some(Duration::ZERO), 30));
-
-        // 连续 80 分钟每秒切换窗口，30 秒间隔最多启动 160 次 OCR。
-        let mut last_ocr_at = None;
-        let mut ocr_count = 0;
-        for second in 0..80 * 60 {
-            let now = Duration::from_secs(second);
-            let elapsed = last_ocr_at.map(|last| now - last);
-            if should_run_ocr(elapsed, 30) {
-                last_ocr_at = Some(now);
-                ocr_count += 1;
-            }
-        }
-        assert_eq!(ocr_count, 160);
     }
 
     #[test]

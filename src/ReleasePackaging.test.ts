@@ -37,7 +37,7 @@ test('Linux 发行包应同时生成 RPM 并在 README 中说明', async () => {
   assert.ok(tauriConfig.bundle.targets.includes('rpm'));
   assert.ok(tauriConfig.bundle.linux.rpm.depends.includes('xdotool'));
   assert.ok(tauriConfig.bundle.linux.rpm.depends.includes('xprintidle'));
-  assert.ok(tauriConfig.bundle.linux.rpm.depends.includes('tesseract'));
+  assert.ok(!tauriConfig.bundle.linux.rpm.depends.includes('tesseract'));
   assert.ok(tauriConfig.bundle.linux.rpm.depends.includes('procps-ng'));
   assert.match(zh, /Linux x86_64[\s\S]*\.rpm/);
   assert.match(en, /Linux x86_64[\s\S]*\.rpm/);

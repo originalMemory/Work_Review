@@ -51,7 +51,7 @@ Work Review 面向个人工作复盘，适合用来回答这些问题：
 
 ## 核心能力
 
-- **自动记录工作上下文** — 记录前台应用、浏览器页面、窗口标题、使用时长、可选截图和 OCR 文本，减少手动补记
+- **自动记录工作上下文** — 记录前台应用、浏览器页面、窗口标题、使用时长、可选截图，减少手动补记
 - **统一时间线和统计** — 概览、时间线、工作助手、日报共用同一份本地记录，既能看趋势，也能追到具体上下文
 - **本地记录问答** — 用基础模板或你配置的模型回答“今天做了什么”“某个任务花了多久”“最近在推进什么”等问题
 - **日报生成与导出** — 生成结构化日报，支持 Markdown 导出、自动导出、段落编辑、钉选/隐藏和 AI 编排顺序
@@ -154,7 +154,7 @@ Work Review 从设计上面向个人使用，不适用于：员工监控 · 团�
 
 你可以按需控制记录范围：
 
-- 按应用设置为「正常 / 脱敏 / 忽略」，脱敏模式自动跳过截图和 OCR
+- 按应用设置为「正常 / 脱敏 / 忽略」，脱敏模式自动跳过截图
 - 敏感关键词自动过滤 · 域名黑名单
 - 锁屏自动暂停 · 手动暂停/恢复
 - AI 仅在你主动配置模型后启用，默认关闭
@@ -166,7 +166,7 @@ Work Review 从设计上面向个人使用，不适用于：员工监控 · 团�
 ### 自动记录
 
 - 前台应用、窗口标题、浏览器 URL、使用时长和分类记录
-- 可选截图与 OCR，支持多屏策略
+- 可选截图，支持多屏策略
 - 键鼠活动 + 屏幕变化空闲检测，减少挂机误记
 - 时间线回看任意时段的页面、窗口和上下文
 
@@ -236,7 +236,7 @@ Work Review 的核心始终是**本地记录**。AI 的作用是让记录更容�
 
 ```bash
 # 基础
-sudo apt install xprintidle tesseract-ocr
+sudo apt install xprintidle
 # X11
 sudo apt install xdotool x11-utils scrot
 # Wayland: gdbus (GNOME) / kdotool (KDE) / swaymsg (Sway) / hyprctl (Hyprland)
@@ -244,7 +244,7 @@ sudo apt install xdotool x11-utils scrot
 
 # RPM-based distributions
 sudo dnf install xprintidle tesseract xdotool xorg-x11-utils gnome-screenshot procps-ng
-sudo zypper install xprintidle tesseract-ocr xdotool xorg-x11-tools gnome-screenshot procps
+sudo zypper install xprintidle xdotool xorg-x11-tools gnome-screenshot procps
 ```
 
 </details>

@@ -585,7 +585,7 @@ pub struct StorageConfig {
     pub jpeg_quality: u8,
     /// 最大图片宽度（超过会缩放）
     pub max_image_width: u32,
-    /// 是否启用截图与 OCR
+    /// 是否启用截图
     #[serde(default = "default_screenshots_enabled")]
     pub screenshots_enabled: bool,
     /// 截图屏幕范围
@@ -1296,7 +1296,7 @@ pub struct AppConfig {
     /// 搜索服务 API Key（为空时 web_search 工具不注册，网页读取/天气不受影响）
     #[serde(default)]
     pub assistant_search_api_key: Option<String>,
-    /// 语义记忆总开关（隐私默认关：开启后 OCR/标题会送往嵌入模型；
+    /// 语义记忆总开关（隐私默认关：开启后 标题/网址会送往嵌入模型；
     /// 本地 Ollama 时数据不出机，云端 API 时明示出网）
     #[serde(default)]
     pub memory_semantic_enabled: bool,

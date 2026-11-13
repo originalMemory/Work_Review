@@ -295,7 +295,7 @@ pub struct AssistantRuntime {
 /// 当前请求允许注册的长期记忆工具。
 ///
 /// 写权限只根据 commands 层收到的原始用户消息计算，并通过 Tokio task-local
-/// 传递到 Executor 内部的工具注册阶段，避免 OCR、网页或工具输出扩大权限。
+/// 传递到 Executor 内部的工具注册阶段，避免 网页或工具输出扩大权限。
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct UserMemoryToolCapabilities {
     pub search: bool,
@@ -2271,7 +2271,7 @@ async fn forget_user_memory_action(ctx: &ToolContext<'_>, args: Value) -> Result
 }
 
 /// semantic_search — 屏幕记忆语义检索（经 commands 层桥接）。
-/// 结果含 OCR 摘要（源自任意网页），按不可信内容包裹防注入。
+/// 结果含历史窗口标题和网址，按不可信内容包裹防注入。
 async fn semantic_search_tool(ctx: &ToolContext<'_>, args: Value) -> Result<String, String> {
     let query = required_str_arg(&args, "query")?;
     let limit = args
@@ -2344,7 +2344,7 @@ impl ToolRegistry {
         if with_semantic {
             registry.register(ToolDefinition {
                 name: "semantic_search",
-                description: "语义检索用户看过的全部屏幕内容（OCR 全文/网页标题/URL 的向量检索，比 search_memory 的关键词匹配更能理解意思）。当用户问「那篇讲 XX 的文章在哪看的」「我是不是研究过 XX」「上个月看过的那个文档讲了什么」这类凭印象找记录的问题时优先使用。",
+                description: "语义检索用户的活动记录（应用名/窗口标题/URL 的向量检索，比 search_memory 的关键词匹配更能理解意思）。当用户问「那篇讲 XX 的文章在哪看的」「我是不是研究过 XX」「上个月看过的那个文档讲了什么」这类凭印象找记录的问题时优先使用。",
                 parameters_schema: json!({
                     "type": "object",
                     "properties": {
@@ -2610,7 +2610,7 @@ impl ToolRegistry {
         if capabilities.forget {
             self.register(ToolDefinition {
                 name: "forget_user_memory",
-                description: "按 ID 和 expected_revision 永久删除一条结构化长期记忆。只删除长期记忆，不删除原始聊天、OCR 或活动记录。必须先弹出确认卡片。",
+                description: "按 ID 和 expected_revision 永久删除一条结构化长期记忆。只删除长期记忆，不删除原始聊天或活动记录。必须先弹出确认卡片。",
                 parameters_schema: json!({
                     "type": "object",
                     "properties": {

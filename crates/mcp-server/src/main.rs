@@ -529,7 +529,7 @@ fn sanitize_result(result: &mut Value) {
 fn sanitize_value(value: &mut Value) {
     match value {
         Value::Object(obj) => {
-            // 完全删除：截图路径/URL、可执行文件路径、OCR 提取文本（屏幕内容可能含密码/私信等）
+            // 屏幕内容字段也需要脱敏，避免连接旧版 localhost API 时泄露正文。
             obj.remove("screenshot_path");
             obj.remove("screenshot_url");
             obj.remove("executable_path");
@@ -1439,7 +1439,6 @@ mod tests {
             app_name: app_name.to_string(),
             window_title: String::new(),
             screenshot_path: String::new(),
-            ocr_text: None,
             category: "development".to_string(),
             duration: 60,
             browser_url: browser_url.map(str::to_string),

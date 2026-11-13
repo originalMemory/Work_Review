@@ -473,7 +473,6 @@ mod tests {
                     } else {
                         String::new()
                     },
-                    ocr_text: None,
                     category: "development".to_string(),
                     duration: 60,
                     browser_url: None,

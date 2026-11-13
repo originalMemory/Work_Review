@@ -17,11 +17,6 @@ use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::time::Duration;
-#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux", test))]
-use std::{
-    collections::hash_map::DefaultHasher,
-    hash::{Hash, Hasher},
-};
 use work_review_core::config::{ScreenshotDisplayMode, ScreenshotWidthMode, StorageConfig};
 use work_review_core::error::{AppError, Result};
 
@@ -148,8 +143,6 @@ pub fn has_input_monitoring_permission() -> bool {
 pub struct ScreenshotResult {
     /// 归档截图路径（长期保留）
     pub path: PathBuf,
-    /// OCR 临时源图路径（识别后可删除）
-    pub ocr_source_path: Option<PathBuf>,
     pub timestamp: i64,
     pub width: u32,
     pub height: u32,
@@ -240,7 +233,6 @@ pub struct ScreenshotService {
 
 impl ScreenshotService {
     pub fn new(data_dir: &Path, storage_config: &StorageConfig, device_id: &str) -> Self {
-        let _ = cleanup_stale_ocr_temp_dir(data_dir);
         Self {
             data_dir: data_dir.to_path_buf(),
             config: ScreenshotConfig::from(storage_config),
@@ -685,15 +677,9 @@ impl ScreenshotService {
         time_str: &str,
         timestamp: i64,
     ) -> Result<ScreenshotResult> {
-        let (archive_path, ocr_source_path) =
-            capture_output_paths(&self.data_dir, screenshots_dir, time_str);
-        ensure_parent_dir(&ocr_source_path)?;
+        let archive_path = screenshots_dir.join(format!("{time_str}.jpg"));
         let persist_result = (|| -> Result<(u32, u32)> {
-            if temp_png != ocr_source_path {
-                move_or_copy_file(temp_png, &ocr_source_path)?;
-            }
-
-            let image = image::open(&ocr_source_path)
+            let image = image::open(temp_png)
                 .map_err(|e| AppError::Screenshot(format!("读取截图失败: {e}")))?;
             let archive_image = prepare_archive_image_with_config(image, &self.config);
             let width = archive_image.width();
@@ -709,7 +695,7 @@ impl ScreenshotService {
         let (width, height) = match persist_result {
             Ok(dimensions) => dimensions,
             Err(error) => {
-                cleanup_failed_capture_outputs(&archive_path, &ocr_source_path);
+                let _ = std::fs::remove_file(&archive_path);
                 return Err(error);
             }
         };
@@ -727,7 +713,6 @@ impl ScreenshotService {
 
         Ok(ScreenshotResult {
             path: archive_path,
-            ocr_source_path: Some(ocr_source_path),
             timestamp,
             width,
             height,
@@ -742,14 +727,8 @@ impl ScreenshotService {
         time_str: &str,
         timestamp: i64,
     ) -> Result<ScreenshotResult> {
-        let (archive_path, ocr_source_path) =
-            capture_output_paths(&self.data_dir, screenshots_dir, time_str);
-        ensure_parent_dir(&ocr_source_path)?;
+        let archive_path = screenshots_dir.join(format!("{time_str}.jpg"));
         let persist_result = (|| -> Result<(u32, u32)> {
-            dynamic_image
-                .save_with_format(&ocr_source_path, image::ImageFormat::Png)
-                .map_err(|e| AppError::Screenshot(format!("保存 OCR 临时图失败: {e}")))?;
-
             let archive_image = prepare_archive_image_with_config(dynamic_image, &self.config);
             let width = archive_image.width();
             let height = archive_image.height();
@@ -763,7 +742,7 @@ impl ScreenshotService {
         let (width, height) = match persist_result {
             Ok(dimensions) => dimensions,
             Err(error) => {
-                cleanup_failed_capture_outputs(&archive_path, &ocr_source_path);
+                let _ = std::fs::remove_file(&archive_path);
                 return Err(error);
             }
         };
@@ -781,7 +760,6 @@ impl ScreenshotService {
 
         Ok(ScreenshotResult {
             path: archive_path,
-            ocr_source_path: Some(ocr_source_path),
             timestamp,
             width,
             height,
@@ -1607,7 +1585,7 @@ fn detect_primary_screen_width() -> Option<u32> {
 
 impl ScreenshotConfig {
     /// 根据模式计算实际使用的最大宽度
-    /// auto 模式：取屏幕宽度的 70%，保证 OCR 清晰度同时控制存储
+    /// auto 模式：取屏幕宽度的 70%，兼顾截图清晰度与存储占用
     /// fixed 模式：使用配置的 max_width
     fn compute_max_width(&self) -> u32 {
         match self.width_mode {
@@ -1663,24 +1641,6 @@ fn save_archive_jpeg_with_quality(
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux", test))]
-fn capture_output_paths(
-    data_dir: &Path,
-    screenshots_dir: &Path,
-    time_str: &str,
-) -> (PathBuf, PathBuf) {
-    let date_str = screenshots_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("unknown-date");
-    (
-        screenshots_dir.join(format!("{time_str}.jpg")),
-        ocr_temp_root(data_dir)
-            .join(date_str)
-            .join(format!("{time_str}_ocr.png")),
-    )
-}
-
-#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux", test))]
 struct TemporaryCaptureFile {
     path: PathBuf,
     armed: bool,
@@ -1717,59 +1677,6 @@ impl Drop for TemporaryCaptureFile {
             }
         }
     }
-}
-
-#[cfg(any(target_os = "windows", target_os = "linux"))]
-fn move_or_copy_file(from: &Path, to: &Path) -> Result<()> {
-    if from == to {
-        return Ok(());
-    }
-
-    match std::fs::rename(from, to) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            std::fs::copy(from, to)?;
-            let _ = std::fs::remove_file(from);
-            Ok(())
-        }
-    }
-}
-
-#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux", test))]
-fn ocr_temp_root(data_dir: &Path) -> PathBuf {
-    let mut hasher = DefaultHasher::new();
-    data_dir.to_string_lossy().hash(&mut hasher);
-    std::env::temp_dir()
-        .join("work-review")
-        .join(format!("ocr-{:016x}", hasher.finish()))
-}
-
-#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux", test))]
-fn ensure_parent_dir(path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    Ok(())
-}
-
-#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux", test))]
-fn cleanup_failed_capture_outputs(archive_path: &Path, ocr_source_path: &Path) {
-    for path in [archive_path, ocr_source_path] {
-        if let Err(error) = std::fs::remove_file(path) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                log::warn!("清理失败截图文件 {} 时出错: {error}", path.display());
-            }
-        }
-    }
-}
-
-#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux", test))]
-fn cleanup_stale_ocr_temp_dir(data_dir: &Path) -> Result<()> {
-    let temp_root = ocr_temp_root(data_dir);
-    if temp_root.exists() {
-        std::fs::remove_dir_all(&temp_root)?;
-    }
-    Ok(())
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -2017,7 +1924,7 @@ Monitors: 2
     }
 
     #[test]
-    fn 截图归档应缩放为jpg并将ocr临时图移出截图目录() {
+    fn 截图归档应缩放为jpg且只保存归档图() {
         let unique_suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -2045,16 +1952,12 @@ Monitors: 2
         assert_eq!(archive.width(), 1440);
         assert_eq!(archive.height(), 935);
 
-        let ocr_temp_path = result.ocr_source_path.unwrap();
-        assert!(ocr_temp_path.ends_with("101530_123_ocr.png"));
-        assert!(!ocr_temp_path.starts_with(&screenshots_dir));
-
-        let _ = fs::remove_dir_all(&data_dir);
-        let _ = fs::remove_dir_all(super::ocr_temp_root(&data_dir));
+        assert_eq!(fs::read_dir(&screenshots_dir).unwrap().count(), 1);
+        let _ = fs::remove_dir_all(data_dir);
     }
 
     #[test]
-    fn 截图归档失败时应清理ocr临时图和不完整归档() {
+    fn 截图归档失败时不得遗留不完整归档() {
         let unique_suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -2065,8 +1968,7 @@ Monitors: 2
 
         let invalid_screenshots_dir = data_dir.join("screenshots-file");
         fs::write(&invalid_screenshots_dir, b"not-a-directory").unwrap();
-        let (archive_path, ocr_temp_path) =
-            super::capture_output_paths(&data_dir, &invalid_screenshots_dir, "101530_456");
+        let archive_path = invalid_screenshots_dir.join("101530_456.jpg");
         let service = ScreenshotService::new(&data_dir, &StorageConfig::default(), "device-a");
         let image =
             DynamicImage::ImageRgba8(RgbaImage::from_pixel(64, 64, Rgba([24, 48, 96, 255])));
@@ -2074,11 +1976,9 @@ Monitors: 2
         assert!(service
             .persist_dynamic_image_capture(image, &invalid_screenshots_dir, "101530_456", 0,)
             .is_err());
-        assert!(!ocr_temp_path.exists(), "失败后不得遗留 OCR 临时图");
         assert!(!archive_path.exists(), "失败后不得遗留不完整归档");
 
         let _ = fs::remove_dir_all(&data_dir);
-        let _ = fs::remove_dir_all(super::ocr_temp_root(&data_dir));
     }
 
     #[test]
@@ -2149,6 +2049,5 @@ Monitors: 2
         assert_eq!(actual, expected);
 
         let _ = fs::remove_dir_all(&data_dir);
-        let _ = fs::remove_dir_all(super::ocr_temp_root(&data_dir));
     }
 }

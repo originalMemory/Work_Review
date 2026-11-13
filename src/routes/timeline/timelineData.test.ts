@@ -15,7 +15,6 @@ function activity(overrides: Partial<TimelineActivity>): TimelineActivity {
     app_name: '',
     window_title: '',
     screenshot_path: '',
-    ocr_text: null,
     category: '',
     duration: 0,
     browser_url: null,

@@ -84,9 +84,6 @@ impl StorageManager {
         // 1. 清理过期的截图文件
         let mut screenshots_deleted = self.cleanup_old_screenshots(database)?;
 
-        // 2. 清理过期的 OCR 日志文件
-        let ocr_logs_deleted = self.cleanup_old_ocr_logs()?;
-
         // 3. 检查存储空间是否超限
         let current_size = self.calculate_storage_size()?;
 
@@ -99,7 +96,7 @@ impl StorageManager {
         let total_size_mb = self.calculate_storage_size()? as f64 / 1024.0 / 1024.0;
 
         log::info!(
-            "存储清理完成: 删除 {screenshots_deleted} 个截图目录, {ocr_logs_deleted} 个 OCR 日志, 当前占用 {total_size_mb:.1} MB"
+            "存储清理完成: 删除 {screenshots_deleted} 个截图目录, 当前占用 {total_size_mb:.1} MB"
         );
 
         Ok(CleanupResult {
@@ -156,49 +153,6 @@ impl StorageManager {
                         log::info!("已删除过期截图目录: {}", path.display());
                     }
                     Err(e) => log::warn!("删除目录失败 {}: {e}", path.display()),
-                }
-            }
-        }
-
-        Ok(deleted_count)
-    }
-
-    /// 清理过期 OCR 日志文件
-    /// 日志文件格式: ocr_logs/YYYY-MM-DD.txt，与截图使用相同的保留天数
-    fn cleanup_old_ocr_logs(&self) -> Result<u32> {
-        // 0 表示"永久保留"——与 cleanup_old_screenshots 保持一致
-        if self.config.screenshot_retention_days == 0 {
-            return Ok(0);
-        }
-
-        let ocr_dir = self.data_dir.join("ocr_logs");
-        if !ocr_dir.exists() {
-            return Ok(0);
-        }
-
-        let cutoff_date = Local::now().date_naive()
-            - Duration::days(self.config.screenshot_retention_days as i64);
-        let mut deleted_count = 0u32;
-
-        for entry in fs::read_dir(&ocr_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-
-            if path.is_file() {
-                if let Some(stem) = path.file_stem().and_then(|n| n.to_str()) {
-                    if let Ok(date) = NaiveDate::parse_from_str(stem, "%Y-%m-%d") {
-                        if date < cutoff_date {
-                            match fs::remove_file(&path) {
-                                Ok(_) => {
-                                    deleted_count += 1;
-                                    log::info!("已删除过期 OCR 日志: {stem}.txt");
-                                }
-                                Err(e) => {
-                                    log::warn!("删除 OCR 日志失败 {stem}: {e}");
-                                }
-                            }
-                        }
-                    }
                 }
             }
         }
@@ -352,7 +306,6 @@ mod tests {
                 app_name: "Editor".into(),
                 window_title: "old shot".into(),
                 screenshot_path: relative_path.clone(),
-                ocr_text: None,
                 category: "development".into(),
                 duration: 30,
                 browser_url: None,
@@ -398,7 +351,6 @@ mod tests {
                 app_name: "Editor".into(),
                 window_title: "Private project".into(),
                 screenshot_path: String::new(),
-                ocr_text: Some("Private OCR".into()),
                 category: "development".into(),
                 duration: 1,
                 browser_url: Some("https://example.org".into()),

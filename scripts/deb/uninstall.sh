@@ -1,7 +1,7 @@
 #!/bin/bash
 # Uninstaller for the .deb install of Work Review.
 # Removes the apt package and the GNOME extension. User data is PRESERVED
-# by default — pass --purge to wipe it. apt Depends (tesseract, screenshot
+# by default — pass --purge to wipe it. apt Depends (screenshot
 # tools, webkit, ...) are left alone (use `sudo apt autoremove` yourself).
 #
 # Usage:
@@ -118,10 +118,10 @@ log "4/4 done"
 cat <<NOTES
 
 Not touched (on purpose):
-  - apt dependencies pulled in by the .deb (tesseract-ocr*, gnome-screenshot,
+  - apt dependencies pulled in by the .deb (gnome-screenshot,
     grim, libwebkit2gtk-4.1-0, xdotool, xprintidle, ...). They're generic
     tools other apps may use. To see them:
-        apt-mark showauto | grep -E '^(tesseract|xdotool|xprintidle|grim|libwebkit)'
+        apt-mark showauto | grep -E '^(xdotool|xprintidle|grim|libwebkit)'
     And to prune only the ones no other package needs:
         sudo apt-get autoremove
 NOTES

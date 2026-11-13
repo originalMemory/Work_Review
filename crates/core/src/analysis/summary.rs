@@ -633,25 +633,6 @@ impl SummaryAnalyzer {
                     keywords.push(item);
                 }
             }
-
-            if let Some(ocr_text) = &activity.ocr_text {
-                let ocr_words = ocr_text
-                    .split(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
-                    .filter(|word| {
-                        let len = word.chars().count();
-                        (2..=20).contains(&len)
-                            && word.chars().all(|c| c.is_alphabetic() || c >= '\u{4e00}')
-                    })
-                    .take(5)
-                    .collect::<Vec<_>>();
-
-                for word in ocr_words {
-                    let item = word.to_string();
-                    if !keywords.contains(&item) && keywords.len() < 30 {
-                        keywords.push(item);
-                    }
-                }
-            }
         }
 
         keywords.truncate(30);

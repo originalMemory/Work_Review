@@ -53,7 +53,6 @@
           "xprintidle",
           "x11-utils",
           "libglib2.0-bin",
-          "tesseract-ocr",
           "gnome-screenshot | grim | scrot | maim | imagemagick",
           "procps"
         ]
@@ -64,7 +63,6 @@
           "xprintidle",
           "xorg-x11-utils",
           "glib2",
-          "tesseract",
           "gnome-screenshot",
           "procps-ng"
         ]

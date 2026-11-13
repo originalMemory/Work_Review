@@ -59,7 +59,7 @@ async fn main() {
         data_dir: args.data_dir,
     });
 
-    // Axum 默认 body 上限约 2MB；增量 push 可能含大量 OCR 文本，需放宽。
+    // Axum 默认 body 上限约 2MB；增量 push 可能包含较多活动记录，需放宽。
     const PUSH_BODY_LIMIT: usize = 32 * 1024 * 1024;
 
     let api_routes = Router::new()

@@ -116,7 +116,7 @@ impl LocalAnalyzer {
 
         let keywords = activities
             .iter()
-            .filter_map(|activity| activity.ocr_text.as_ref())
+            .map(|activity| &activity.window_title)
             .flat_map(|text| {
                 text.split(|c: char| !c.is_alphanumeric() && c != '-')
                     .filter(|word| {

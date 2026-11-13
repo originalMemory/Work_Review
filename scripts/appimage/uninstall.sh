@@ -75,7 +75,7 @@ do_rm "$ICON_DIR/Work_Review.png"
 
 # ---- 3. shims + launcher --------------------------------------------------
 log "3/6 shims + launcher in $BIN_DIR"
-for f in work-review gdbus gnome-screenshot grim spectacle tesseract; do
+for f in work-review gdbus gnome-screenshot grim spectacle; do
     do_rm "$BIN_DIR/$f"
 done
 # If ~/bin is now empty, offer to remove it (non-destructive — we only rmdir,
@@ -129,7 +129,7 @@ cat <<NOTES
 
 Not touched (on purpose):
   - apt packages (libfuse2, gnome-screenshot, grim, kde-spectacle,
-    tesseract-ocr*, desktop-file-utils, git). Remove manually if desired:
+    desktop-file-utils, git). Remove manually if desired:
       sudo apt-get remove <package>
 NOTES
 if [ "$PURGE" -eq 0 ] && [ -d "$DATA_DIR" ]; then
