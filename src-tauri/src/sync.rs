@@ -238,7 +238,8 @@ impl SyncService {
             .await
             .map_err(|error| format!("读取截图失败 {}: {error}", local_path.display()))?;
         if thumbnail {
-            bytes = resize_thumbnail(&bytes).unwrap_or(bytes);
+            bytes =
+                resize_thumbnail(&bytes).map_err(|error| format!("生成同步缩略图失败: {error}"))?;
         }
         let response = self
             .authenticated(self.client.put(format!(
@@ -246,7 +247,7 @@ impl SyncService {
                 self.server_url,
                 subpath.to_string_lossy().replace('\\', "/")
             )))
-            .header(reqwest::header::CONTENT_TYPE, "image/jpeg")
+            .header(reqwest::header::CONTENT_TYPE, "image/webp")
             .body(bytes)
             .send()
             .await
@@ -603,14 +604,9 @@ pub async fn sync_background_task(state: Arc<Mutex<crate::AppState>>) {
     }
 }
 
-fn resize_thumbnail(data: &[u8]) -> Option<Vec<u8>> {
-    let image = image::load_from_memory(data).ok()?;
-    let thumbnail = image.thumbnail(640, 480);
-    let mut output = std::io::Cursor::new(Vec::new());
-    thumbnail
-        .write_to(&mut output, image::ImageFormat::Jpeg)
-        .ok()?;
-    Some(output.into_inner())
+fn resize_thumbnail(data: &[u8]) -> work_review_core::error::Result<Vec<u8>> {
+    let image = image::load_from_memory(data)?;
+    crate::screenshot::encode_webp(&image.thumbnail(640, 480))
 }
 
 #[cfg(test)]
@@ -619,34 +615,52 @@ mod tests {
 
     #[test]
     fn screenshot_path_must_be_device_date_file() {
-        assert!(screenshot_subpath("screenshots/mac-a/2026-08-03/120000.jpg").is_ok());
+        assert!(screenshot_subpath("screenshots/mac-a/2026-08-03/120000.webp").is_ok());
         assert!(screenshot_subpath("screenshots/../secret.txt").is_err());
-        assert!(screenshot_subpath("/tmp/secret.jpg").is_err());
+        assert!(screenshot_subpath("/tmp/secret.webp").is_err());
     }
 
     #[test]
     fn zero_retention_downloads_all_valid_screenshots() {
         let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 3).unwrap();
         assert!(should_download_screenshot(
-            "screenshots/device-a/2020-01-01/old.jpg",
+            "screenshots/device-a/2020-01-01/old.webp",
             0,
             today,
         ));
-        assert!(!should_download_screenshot("../old.jpg", 0, today));
+        assert!(!should_download_screenshot("../old.webp", 0, today));
     }
 
     #[test]
     fn finite_retention_skips_expired_screenshots() {
         let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 3).unwrap();
         assert!(should_download_screenshot(
-            "screenshots/device-a/2026-07-27/kept.jpg",
+            "screenshots/device-a/2026-07-27/kept.webp",
             7,
             today,
         ));
         assert!(!should_download_screenshot(
-            "screenshots/device-a/2026-07-26/expired.jpg",
+            "screenshots/device-a/2026-07-26/expired.webp",
             7,
             today,
         ));
+    }
+    #[test]
+    fn 同步缩略图应保持webp格式与尺寸上限() {
+        let image = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            1280,
+            720,
+            image::Rgb([24, 48, 96]),
+        ));
+        let full = crate::screenshot::encode_webp(&image).unwrap();
+        let thumbnail = super::resize_thumbnail(&full).unwrap();
+        assert_eq!(
+            image::guess_format(&thumbnail).unwrap(),
+            image::ImageFormat::WebP
+        );
+        assert_eq!(&thumbnail[12..16], b"VP8 ");
+        let decoded = image::load_from_memory(&thumbnail).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (640, 360));
+        assert!(super::resize_thumbnail(b"invalid image").is_err());
     }
 }

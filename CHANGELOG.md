@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### 变更
+- 新截图、缩略图、详情、即时截图 API、远程上传和多设备同步统一使用质量 85 的有损 WebP；不转换旧截图。
 - 移除 OCR 识别、专用临时原图、正文同步和导出选项；截图、活动时长、多设备同步及空闲豁免继续保留。
 - 升级时在事务中删除历史 `ocr_text` 列并重建活动全文索引，清空包含旧正文的派生语义索引；保留活动、设备标识、截图路径与日报。迁移事务提交后自动执行一次 VACUUM 并截断 WAL，将空闲空间归还磁盘。
 

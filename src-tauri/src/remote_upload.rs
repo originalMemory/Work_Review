@@ -191,12 +191,11 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     mac.finalize().into_bytes().to_vec()
 }
 
-/// 依据文件扩展名推导 Content-Type（截图上传目前只涉及 jpg/png）。
+/// 依据上传对象的扩展名推导 Content-Type。
 fn content_type_for_extension(path: &str) -> &'static str {
     let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     match ext.as_str() {
-        "jpg" | "jpeg" => "image/jpeg",
-        "png" => "image/png",
+        "webp" => "image/webp",
         "json" => "application/json",
         _ => "application/octet-stream",
     }
@@ -444,17 +443,13 @@ mod tests {
 
     #[test]
     fn 内容类型应按扩展名推导() {
-        assert_eq!(content_type_for_extension("a/b/shot.jpg"), "image/jpeg");
-        assert_eq!(content_type_for_extension("shot.JPEG"), "image/jpeg");
-        assert_eq!(content_type_for_extension("shot.png"), "image/png");
+        assert_eq!(content_type_for_extension("a/b/shot.webp"), "image/webp");
+        assert_eq!(content_type_for_extension("shot.WEBP"), "image/webp");
         assert_eq!(
             content_type_for_extension("work-review/app-config.json"),
             "application/json"
         );
-        assert_eq!(
-            content_type_for_extension("shot.webp"),
-            "application/octet-stream"
-        );
+        assert_eq!(content_type_for_extension("shot.webp"), "image/webp");
         assert_eq!(
             content_type_for_extension("noext"),
             "application/octet-stream"
@@ -488,12 +483,12 @@ mod tests {
     #[test]
     fn 远程对象路径应包含路径前缀并统一分隔符() {
         assert_eq!(
-            remote_object_path(" workreview/ ", r"screenshots\2026-05-22\shot.jpg"),
-            "workreview/screenshots/2026-05-22/shot.jpg"
+            remote_object_path(" workreview/ ", r"screenshots\2026-05-22\shot.webp"),
+            "workreview/screenshots/2026-05-22/shot.webp"
         );
         assert_eq!(
-            remote_object_path("", "screenshots/2026-05-22/shot.jpg"),
-            "screenshots/2026-05-22/shot.jpg"
+            remote_object_path("", "screenshots/2026-05-22/shot.webp"),
+            "screenshots/2026-05-22/shot.webp"
         );
     }
 
@@ -502,18 +497,18 @@ mod tests {
         assert_eq!(
             public_url_or_fallback(
                 Some(" https://cdn.example.com/workreview/ "),
-                "archive/screenshots/shot.jpg",
-                "https://webdav.example.com/archive/screenshots/shot.jpg",
+                "archive/screenshots/shot.webp",
+                "https://webdav.example.com/archive/screenshots/shot.webp",
             ),
-            "https://cdn.example.com/workreview/archive/screenshots/shot.jpg"
+            "https://cdn.example.com/workreview/archive/screenshots/shot.webp"
         );
         assert_eq!(
             public_url_or_fallback(
                 Some("   "),
-                "archive/screenshots/shot.jpg",
-                "https://webdav.example.com/archive/screenshots/shot.jpg",
+                "archive/screenshots/shot.webp",
+                "https://webdav.example.com/archive/screenshots/shot.webp",
             ),
-            "https://webdav.example.com/archive/screenshots/shot.jpg"
+            "https://webdav.example.com/archive/screenshots/shot.webp"
         );
     }
 }

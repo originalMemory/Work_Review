@@ -90,7 +90,7 @@ test('本地 mac 打包脚本应关闭 updater 产物签名，避免缺少私钥
 
   assert.equal(
     packageJson.scripts['tauri:build:local-mac'],
-    'tauri build --target aarch64-apple-darwin --bundles app --config src-tauri/tauri.local.conf.json'
+    "APPLE_SIGNING_IDENTITY='WorkReview Self-Signed' tauri build --target aarch64-apple-darwin --bundles app --config src-tauri/tauri.local.conf.json"
   );
   assert.equal(localTauriConfig.bundle.createUpdaterArtifacts, false);
 });

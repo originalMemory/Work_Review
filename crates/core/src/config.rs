@@ -581,8 +581,6 @@ pub struct StorageConfig {
     pub metadata_cleanup_enabled: bool,
     /// 存储空间上限（MB），超过后自动清理最旧的数据
     pub storage_limit_mb: u32,
-    /// JPEG 质量 (1-100)
-    pub jpeg_quality: u8,
     /// 最大图片宽度（超过会缩放）
     pub max_image_width: u32,
     /// 是否启用截图
@@ -607,7 +605,6 @@ impl Default for StorageConfig {
             metadata_retention_days: 30,  // 启用自动清理后的默认保留天数
             metadata_cleanup_enabled: false,
             storage_limit_mb: 2048, // 默认2GB上限
-            jpeg_quality: 85,       // 85%质量，更清晰
             max_image_width: 1280,  // 最大宽度1280px
             screenshots_enabled: true,
             screenshot_display_mode: ScreenshotDisplayMode::ActiveWindow,

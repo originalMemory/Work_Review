@@ -508,7 +508,7 @@ export default {
       apiExamplesHint: '复制命令快速调用本地 API',
       exampleHealthDesc: '健康检查（无需认证）',
       exampleDeviceDesc: '获取设备信息',
-      exampleCaptureScreenshotDesc: '立即截取当前活动界面并返回 JPEG Base64（需已启用截图）',
+      exampleCaptureScreenshotDesc: '立即截取当前活动界面并返回 WebP Base64（需已启用截图）',
       exampleReportsDesc: '获取日报列表',
       exampleReportByDateDesc: '获取指定日期日报',
       exampleGenerateDesc: '生成指定日期日报',

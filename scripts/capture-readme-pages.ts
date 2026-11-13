@@ -402,7 +402,6 @@ const config = {
     screenshot_retention_days: 14,
     metadata_retention_days: 60,
     storage_limit_mb: 4096,
-    jpeg_quality: 85,
     max_image_width: 1920,
     screenshots_enabled: true,
     screenshot_display_mode: 'active_window',

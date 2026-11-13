@@ -332,7 +332,7 @@ Authorization: Bearer <token>
 | GET | `/v1/hourly-app-breakdown/{date}` | 每小時應用分佈 |
 | GET | `/v1/weekly-review` | 週報（`?date_from=&date_to=&limit=`） |
 | GET | `/v1/storage/stats` | 儲存統計 |
-| POST | `/v1/screenshots/capture` | 立即擷取目前活動介面並回傳 JPEG Base64（需已啟用截圖） |
+| POST | `/v1/screenshots/capture` | 立即擷取目前活動介面並回傳 WebP Base64（需已啟用截圖） |
 
 截圖回應包含 `capturedAt`、`width`、`height`、`mimeType`、`imageBase64` 和相對於資料目錄的 `relativePath`。此介面會略過定時截圖間隔，但不會略過截圖隱私開關，也不會自動上傳圖像。
 

@@ -705,7 +705,7 @@ export default {
       apiExamplesHint: 'Copy commands to call the local API',
       exampleHealthDesc: 'Health check (no auth)',
       exampleDeviceDesc: 'Get device info',
-      exampleCaptureScreenshotDesc: 'Capture the active screen now and return JPEG Base64 (screenshots must be enabled)',
+      exampleCaptureScreenshotDesc: 'Capture the active screen now and return WebP Base64 (screenshots must be enabled)',
       exampleReportsDesc: 'List saved reports',
       exampleReportByDateDesc: 'Get report by date',
       exampleGenerateDesc: 'Generate report for a date',

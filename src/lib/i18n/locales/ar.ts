@@ -696,7 +696,7 @@ export default {
       apiExamplesHint: 'انسخ الأوامر لتجربة الواجهة',
       exampleHealthDesc: 'فحص الصحة (بدون مصادقة)',
       exampleDeviceDesc: 'الحصول على معلومات الجهاز',
-      exampleCaptureScreenshotDesc: 'التقاط الواجهة النشطة فوراً وإرجاع JPEG بصيغة Base64 (يجب تفعيل اللقطات)',
+      exampleCaptureScreenshotDesc: 'التقاط الواجهة النشطة فوراً وإرجاع WebP بصيغة Base64 (يجب تفعيل اللقطات)',
       exampleReportsDesc: 'استعراض التقارير المحفوظة',
       exampleReportByDateDesc: 'جلب تقرير حسب التاريخ',
       exampleGenerateDesc: 'إنشاء تقرير ليوم محدد',

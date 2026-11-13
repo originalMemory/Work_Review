@@ -332,7 +332,7 @@ Authorization: Bearer <token>
 | GET | `/v1/hourly-app-breakdown/{date}` | 按小时应用分布 |
 | GET | `/v1/weekly-review` | 周报（`?date_from=&date_to=&limit=`） |
 | GET | `/v1/storage/stats` | 存储统计 |
-| POST | `/v1/screenshots/capture` | 立即截取当前活动界面并返回 JPEG Base64（需已启用截图） |
+| POST | `/v1/screenshots/capture` | 立即截取当前活动界面并返回 WebP Base64（需已启用截图） |
 
 截图响应包含 `capturedAt`、`width`、`height`、`mimeType`、`imageBase64` 和相对于数据目录的 `relativePath`。该接口会绕过定时截图间隔，但不会绕过截图隐私开关，也不会自动上传图像。
 

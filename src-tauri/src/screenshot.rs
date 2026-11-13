@@ -3,14 +3,13 @@ use crate::linux_session::{current_linux_desktop_environment, current_linux_desk
 #[cfg(any(target_os = "linux", test))]
 use crate::linux_session::{LinuxDesktopEnvironment, LinuxDesktopSession};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use image::imageops::FilterType;
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 use image::DynamicImage;
 #[cfg(target_os = "macos")]
 use image::RgbaImage;
-use image::{imageops::FilterType, ColorType};
 #[cfg(any(target_os = "linux", test))]
 use regex::Regex;
-use std::io::Cursor;
 use std::path::{Path, PathBuf};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::{Command, Output, Stdio};
@@ -153,8 +152,6 @@ pub struct ScreenshotResult {
 pub struct ScreenshotConfig {
     /// 最大宽度（超过此宽度会按比例缩放）
     pub max_width: u32,
-    /// JPEG 质量 (1-100)
-    pub jpeg_quality: u8,
     /// 截图范围模式
     pub display_mode: ScreenshotDisplayMode,
     /// 截图宽度模式
@@ -165,7 +162,6 @@ impl Default for ScreenshotConfig {
     fn default() -> Self {
         Self {
             max_width: 1440,
-            jpeg_quality: 70,
             display_mode: ScreenshotDisplayMode::ActiveWindow,
             width_mode: ScreenshotWidthMode::Auto,
         }
@@ -176,7 +172,6 @@ impl From<&StorageConfig> for ScreenshotConfig {
     fn from(value: &StorageConfig) -> Self {
         Self {
             max_width: value.max_image_width.max(320),
-            jpeg_quality: value.jpeg_quality.clamp(30, 95),
             display_mode: value.screenshot_display_mode,
             width_mode: value.screenshot_width_mode,
         }
@@ -677,7 +672,7 @@ impl ScreenshotService {
         time_str: &str,
         timestamp: i64,
     ) -> Result<ScreenshotResult> {
-        let archive_path = screenshots_dir.join(format!("{time_str}.jpg"));
+        let archive_path = screenshots_dir.join(format!("{time_str}.webp"));
         let persist_result = (|| -> Result<(u32, u32)> {
             let image = image::open(temp_png)
                 .map_err(|e| AppError::Screenshot(format!("读取截图失败: {e}")))?;
@@ -685,11 +680,7 @@ impl ScreenshotService {
             let width = archive_image.width();
             let height = archive_image.height();
 
-            save_archive_jpeg_with_quality(
-                &archive_image,
-                &archive_path,
-                self.config.jpeg_quality,
-            )?;
+            std::fs::write(&archive_path, encode_webp(&archive_image)?)?;
             Ok((width, height))
         })();
         let (width, height) = match persist_result {
@@ -727,16 +718,12 @@ impl ScreenshotService {
         time_str: &str,
         timestamp: i64,
     ) -> Result<ScreenshotResult> {
-        let archive_path = screenshots_dir.join(format!("{time_str}.jpg"));
+        let archive_path = screenshots_dir.join(format!("{time_str}.webp"));
         let persist_result = (|| -> Result<(u32, u32)> {
             let archive_image = prepare_archive_image_with_config(dynamic_image, &self.config);
             let width = archive_image.width();
             let height = archive_image.height();
-            save_archive_jpeg_with_quality(
-                &archive_image,
-                &archive_path,
-                self.config.jpeg_quality,
-            )?;
+            std::fs::write(&archive_path, encode_webp(&archive_image)?)?;
             Ok((width, height))
         })();
         let (width, height) = match persist_result {
@@ -1174,18 +1161,7 @@ impl ScreenshotService {
         let img = image::open(path)?;
         let thumbnail = img.thumbnail(max_size, max_size);
 
-        let rgb_thumbnail = thumbnail.to_rgb8();
-        let mut buffer = Vec::new();
-        let mut cursor = Cursor::new(&mut buffer);
-        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, 60);
-        encoder.encode(
-            rgb_thumbnail.as_raw(),
-            thumbnail.width(),
-            thumbnail.height(),
-            ColorType::Rgb8.into(),
-        )?;
-
-        Ok(BASE64_STANDARD.encode(&buffer))
+        Ok(BASE64_STANDARD.encode(encode_webp(&thumbnail)?))
     }
 
     pub fn generate_full_image_base64(&self, path: &Path) -> Result<String> {
@@ -1621,23 +1597,12 @@ fn prepare_archive_image_with_config(
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux", test))]
-fn save_archive_jpeg_with_quality(
-    dynamic_image: &DynamicImage,
-    archive_path: &Path,
-    jpeg_quality: u8,
-) -> Result<()> {
-    let rgb_image = dynamic_image.to_rgb8();
-    let mut output_file = std::fs::File::create(archive_path)?;
-    let mut encoder =
-        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut output_file, jpeg_quality);
-    encoder.encode(
-        rgb_image.as_raw(),
-        rgb_image.width(),
-        rgb_image.height(),
-        ColorType::Rgb8.into(),
-    )?;
-    Ok(())
+pub(crate) fn encode_webp(image: &DynamicImage) -> Result<Vec<u8>> {
+    let rgb = image.to_rgb8();
+    webpx::Encoder::new_rgb(rgb.as_raw(), rgb.width(), rgb.height())
+        .quality(85.0)
+        .encode(webpx::Unstoppable)
+        .map_err(|error| AppError::Screenshot(format!("WebP 编码失败: {error}")))
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux", test))]
@@ -1811,7 +1776,6 @@ mod tests {
     #[test]
     fn 截图服务应继承存储配置中的显示模式与压缩参数() {
         let storage = StorageConfig {
-            jpeg_quality: 92,
             max_image_width: 2048,
             screenshot_display_mode: ScreenshotDisplayMode::All,
             ..StorageConfig::default()
@@ -1819,7 +1783,6 @@ mod tests {
 
         let service = ScreenshotService::new(Path::new("."), &storage, "");
 
-        assert_eq!(service.config.jpeg_quality, 92);
         assert_eq!(service.config.max_width, 2048);
         assert!(should_capture_all_displays(&service.config));
     }
@@ -1924,7 +1887,7 @@ Monitors: 2
     }
 
     #[test]
-    fn 截图归档应缩放为jpg且只保存归档图() {
+    fn 截图归档应缩放为有损webp且只保存归档图() {
         let unique_suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1934,7 +1897,6 @@ Monitors: 2
         fs::create_dir_all(&screenshots_dir).unwrap();
 
         let storage = StorageConfig {
-            jpeg_quality: 85,
             max_image_width: 1440,
             screenshot_width_mode: ScreenshotWidthMode::Fixed,
             ..StorageConfig::default()
@@ -1946,9 +1908,15 @@ Monitors: 2
         let result = service
             .persist_dynamic_image_capture(image, &screenshots_dir, "101530_123", 0)
             .unwrap();
+        let encoded = fs::read(&result.path).unwrap();
+        assert_eq!(
+            image::guess_format(&encoded).unwrap(),
+            image::ImageFormat::WebP
+        );
+        assert_eq!(&encoded[12..16], b"VP8 ", "归档必须使用有损 WebP");
         let archive = image::open(&result.path).unwrap();
 
-        assert_eq!(result.path, screenshots_dir.join("101530_123.jpg"));
+        assert_eq!(result.path, screenshots_dir.join("101530_123.webp"));
         assert_eq!(archive.width(), 1440);
         assert_eq!(archive.height(), 935);
 
@@ -1968,7 +1936,7 @@ Monitors: 2
 
         let invalid_screenshots_dir = data_dir.join("screenshots-file");
         fs::write(&invalid_screenshots_dir, b"not-a-directory").unwrap();
-        let archive_path = invalid_screenshots_dir.join("101530_456.jpg");
+        let archive_path = invalid_screenshots_dir.join("101530_456.webp");
         let service = ScreenshotService::new(&data_dir, &StorageConfig::default(), "device-a");
         let image =
             DynamicImage::ImageRgba8(RgbaImage::from_pixel(64, 64, Rgba([24, 48, 96, 255])));
@@ -2018,7 +1986,7 @@ Monitors: 2
     }
 
     #[test]
-    fn 详情图base64应返回归档jpg原始内容() {
+    fn 详情图base64应返回归档webp原始内容() {
         let unique_suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -2029,7 +1997,6 @@ Monitors: 2
         fs::create_dir_all(&screenshots_dir).unwrap();
 
         let storage = StorageConfig {
-            jpeg_quality: 85,
             max_image_width: 1440,
             screenshot_width_mode: ScreenshotWidthMode::Fixed,
             ..StorageConfig::default()
@@ -2049,5 +2016,39 @@ Monitors: 2
         assert_eq!(actual, expected);
 
         let _ = fs::remove_dir_all(&data_dir);
+    }
+    #[test]
+    fn 截图缩略图也应返回可解码的有损webp() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "work-review-webp-thumbnail-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&data_dir).unwrap();
+        let source = DynamicImage::ImageRgb8(image::RgbImage::from_fn(800, 600, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, 128])
+        }));
+        let path = data_dir.join("shot.webp");
+        let bytes = super::encode_webp(&source).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        let service = ScreenshotService::new(&data_dir, &StorageConfig::default(), "device-a");
+        let thumbnail = super::BASE64_STANDARD
+            .decode(service.generate_thumbnail_base64(&path, 400).unwrap())
+            .unwrap();
+        assert_eq!(
+            image::guess_format(&thumbnail).unwrap(),
+            image::ImageFormat::WebP
+        );
+        assert_eq!(&thumbnail[12..16], b"VP8 ");
+        let decoded = image::load_from_memory(&thumbnail).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (400, 300));
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            bytes,
+            "读取缩略图不得重写归档文件"
+        );
+        fs::remove_dir_all(data_dir).unwrap();
     }
 }

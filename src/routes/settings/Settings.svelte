@@ -43,7 +43,6 @@
     privacy: PrivacyConfig['privacy'] & { sensitive_keywords?: string[] };
     storage: StorageConfig['storage'] & {
       metadata_retention_days: number;
-      jpeg_quality: number;
     };
   }
 
@@ -284,7 +283,6 @@
           metadata_cleanup_enabled: false,
           metadata_retention_days: 30,
           storage_limit_mb: 2048,
-          jpeg_quality: 85,
           max_image_width: 1280,
           screenshots_enabled: true,
           screenshot_display_mode: 'active_window',

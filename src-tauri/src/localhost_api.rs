@@ -761,7 +761,7 @@ fn build_capture_payload(
         .filter(|path| !path.as_os_str().is_empty())
         .map(Path::to_path_buf)
         .or_else(|| result.path.file_name().map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("capture.jpg"))
+        .unwrap_or_else(|| PathBuf::from("capture.webp"))
         .to_string_lossy()
         .replace('\\', "/");
 
@@ -769,7 +769,7 @@ fn build_capture_payload(
         captured_at: result.timestamp,
         width: result.width,
         height: result.height,
-        mime_type: "image/jpeg",
+        mime_type: "image/webp",
         image_base64,
         relative_path,
     }
@@ -1333,21 +1333,21 @@ mod tests {
         let payload = build_capture_payload(
             Path::new("/tmp/work-review-data"),
             ScreenshotResult {
-                path: PathBuf::from("/tmp/work-review-data/screenshots/2026-08-10/shot.jpg"),
+                path: PathBuf::from("/tmp/work-review-data/screenshots/2026-08-10/shot.webp"),
                 timestamp: 1_786_334_400,
                 width: 1440,
                 height: 900,
             },
-            "encoded-jpeg".to_string(),
+            "encoded-webp".to_string(),
         );
         let json = serde_json::to_value(payload).expect("截图响应应可序列化");
 
         assert_eq!(json["capturedAt"], 1_786_334_400);
         assert_eq!(json["width"], 1440);
         assert_eq!(json["height"], 900);
-        assert_eq!(json["mimeType"], "image/jpeg");
-        assert_eq!(json["imageBase64"], "encoded-jpeg");
-        assert_eq!(json["relativePath"], "screenshots/2026-08-10/shot.jpg");
+        assert_eq!(json["mimeType"], "image/webp");
+        assert_eq!(json["imageBase64"], "encoded-webp");
+        assert_eq!(json["relativePath"], "screenshots/2026-08-10/shot.webp");
         assert!(json.get("path").is_none(), "不得暴露绝对文件路径");
     }
 
@@ -1356,16 +1356,16 @@ mod tests {
         let payload = build_capture_payload(
             Path::new("/tmp/work-review-data"),
             ScreenshotResult {
-                path: PathBuf::from("/private/tmp/unexpected-shot.jpg"),
+                path: PathBuf::from("/private/tmp/unexpected-shot.webp"),
                 timestamp: 1_786_334_400,
                 width: 1440,
                 height: 900,
             },
-            "encoded-jpeg".to_string(),
+            "encoded-webp".to_string(),
         );
         let json = serde_json::to_value(payload).expect("截图响应应可序列化");
 
-        assert_eq!(json["relativePath"], "unexpected-shot.jpg");
+        assert_eq!(json["relativePath"], "unexpected-shot.webp");
         assert!(!json["relativePath"]
             .as_str()
             .unwrap_or_default()

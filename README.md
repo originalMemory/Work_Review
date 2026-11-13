@@ -332,7 +332,7 @@ Or via query parameter: `?token=<token>`
 | GET | `/v1/hourly-app-breakdown/{date}` | Hourly app breakdown |
 | GET | `/v1/weekly-review` | Weekly review (`?date_from=&date_to=&limit=`) |
 | GET | `/v1/storage/stats` | Storage stats |
-| POST | `/v1/screenshots/capture` | Capture the active screen immediately and return JPEG Base64 (requires screenshots enabled) |
+| POST | `/v1/screenshots/capture` | Capture the active screen immediately and return WebP Base64 (requires screenshots enabled) |
 
 The capture response contains `capturedAt`, `width`, `height`, `mimeType`, `imageBase64`, and a data-directory-relative `relativePath`. It bypasses the scheduled capture interval but never bypasses the screenshot privacy switch, and it does not upload the image.
 

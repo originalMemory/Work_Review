@@ -693,7 +693,7 @@
     }
     try {
       const base64 = await invoke<string>('get_screenshot_thumbnail', { path: screenshotPath });
-      const dataUrl = `data:image/jpeg;base64,${base64}`;
+      const dataUrl = `data:image/webp;base64,${base64}`;
       lruSet(thumbnailCache, thumbnailKeys, THUMBNAIL_CACHE_LIMIT, screenshotPath, dataUrl);
       thumbnailCache = { ...thumbnailCache };
       return dataUrl;
@@ -713,7 +713,7 @@
     }
     try {
       const base64 = await invoke<string>('get_screenshot_full', { path: screenshotPath });
-      const dataUrl = `data:image/jpeg;base64,${base64}`;
+      const dataUrl = `data:image/webp;base64,${base64}`;
       lruSet(fullImageCache, fullImageKeys, FULLIMAGE_CACHE_LIMIT, screenshotPath, dataUrl);
       return dataUrl;
     } catch (e) {

@@ -692,7 +692,7 @@ export default {
       apiExamplesHint: '複製命令快速呼叫本地 API',
       exampleHealthDesc: '健康檢查（無需認證）',
       exampleDeviceDesc: '取得裝置資訊',
-      exampleCaptureScreenshotDesc: '立即擷取目前活動介面並回傳 JPEG Base64（需已啟用截圖）',
+      exampleCaptureScreenshotDesc: '立即擷取目前活動介面並回傳 WebP Base64（需已啟用截圖）',
       exampleReportsDesc: '取得日報列表',
       exampleReportByDateDesc: '取得指定日期日報',
       exampleGenerateDesc: '產生指定日期日報',

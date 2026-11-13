@@ -298,10 +298,7 @@ pub async fn prune_screenshots_for_day(
             continue;
         };
         let lower = fname.to_ascii_lowercase();
-        let is_image = lower.ends_with(".jpg")
-            || lower.ends_with(".jpeg")
-            || lower.ends_with(".png")
-            || lower.ends_with(".webp");
+        let is_image = lower.ends_with(".webp");
         if !is_image {
             continue;
         }
@@ -346,14 +343,7 @@ pub async fn download_screenshot(
     }
 
     let data = std::fs::read(&path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let content_type = if filename.to_ascii_lowercase().ends_with(".png") {
-        "image/png"
-    } else if filename.to_ascii_lowercase().ends_with(".webp") {
-        "image/webp"
-    } else {
-        "image/jpeg"
-    };
-    Ok(([(header::CONTENT_TYPE, content_type)], data))
+    Ok(([(header::CONTENT_TYPE, "image/webp")], data))
 }
 
 /// POST /api/devices/register
@@ -390,5 +380,41 @@ mod tests {
         assert!(validate_range(-1, 100).is_err());
         assert!(validate_range(200, 100).is_err());
         assert!(validate_range(100, 100).is_ok());
+    }
+    #[tokio::test]
+    async fn screenshot_roundtrip_returns_webp_content_type() {
+        use axum::{
+            body::{to_bytes, Bytes},
+            extract::{Path, State},
+            http::{header, StatusCode},
+            response::IntoResponse,
+        };
+        use std::sync::Arc;
+        let dir = std::env::temp_dir().join(format!(
+            "work-review-sync-webp-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let state = Arc::new(super::ServerState {
+            db: crate::db::Database::new(&dir),
+            data_dir: dir.clone(),
+        });
+        let path = (
+            "device-a".to_string(),
+            "2026-11-13".to_string(),
+            "shot.webp".to_string(),
+        );
+        let body = Bytes::from_static(b"webp roundtrip payload");
+        assert_eq!(
+            super::upload_screenshot(State(state.clone()), Path(path.clone()), body.clone()).await,
+            StatusCode::CREATED
+        );
+        let response = super::download_screenshot(State(state.clone()), Path(path))
+            .await
+            .unwrap()
+            .into_response();
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/webp");
+        assert_eq!(to_bytes(response.into_body(), 1024).await.unwrap(), body);
+        drop(state);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
