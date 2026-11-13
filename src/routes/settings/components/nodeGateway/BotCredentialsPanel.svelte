@@ -1,19 +1,54 @@
-<script>
-  import { t } from '$lib/i18n/index.js';
+<script lang="ts">
+  import { t } from '$lib/i18n/index.ts';
   import { createEventDispatcher } from 'svelte';
 
-  export let config;
-  export let enabledKey;       // e.g. 'feishu_bot_enabled'
-  export let titleKey;         // e.g. 'nodeGatewayPage.feishuBot'
-  export let enabledLabelKey;  // e.g. 'nodeGatewayPage.feishuEnabled'
-  export let hintKey = null;   // e.g. 'nodeGatewayPage.feishuBotHint'
+  type EnabledKey =
+    | 'feishu_bot_enabled'
+    | 'wecom_bot_enabled'
+    | 'dingtalk_bot_enabled';
+
+  type CredentialFieldKey =
+    | 'feishu_app_id'
+    | 'feishu_app_secret'
+    | 'feishu_verification_token'
+    | 'wecom_corp_id'
+    | 'wecom_token'
+    | 'wecom_encoding_aes_key'
+    | 'dingtalk_app_secret';
+
+  interface BotCredentialsConfig {
+    feishu_bot_enabled: boolean;
+    wecom_bot_enabled: boolean;
+    dingtalk_bot_enabled: boolean;
+    feishu_app_id: string;
+    feishu_app_secret: string;
+    feishu_verification_token: string;
+    wecom_corp_id: string;
+    wecom_token: string;
+    wecom_encoding_aes_key: string;
+    dingtalk_app_secret: string;
+  }
+
+  interface CredentialField {
+    key: CredentialFieldKey;
+    labelKey: string;
+    placeholder?: string;
+    secret?: boolean;
+    cols?: number;
+  }
+
+  export let config: BotCredentialsConfig;
+  export let enabledKey: EnabledKey;
+  export let titleKey: string;
+  export let enabledLabelKey: string;
+  export let hintKey: string | null = null;
   export let iconColor = '#6366f1';
-  export let iconPath = '';    // SVG path
-  export let fields = [];      // [{ key, labelKey, placeholder, secret?, cols? }]
+  export let iconPath = '';
+  export let fields: CredentialField[] = [];
   export let saving = false;
 
-  const dispatch = createEventDispatcher();
-  let secretVisible = {};
+  const dispatch = createEventDispatcher<{ save: null }>();
+  let secretVisible: Partial<Record<CredentialFieldKey, boolean>> = {};
 
   function toggle() {
     config[enabledKey] = !config[enabledKey];
@@ -21,7 +56,7 @@
   }
 </script>
 
-<div class="rounded-xl bg-white/70 px-3.5 py-3 ring-1 ring-slate-200/70 dark:bg-[#161b22]/20 dark:ring-[#30363d]/70">
+<div class="settings-subsection">
   <div class="flex items-center justify-between gap-3">
     <div class="flex items-center gap-2">
       {#if iconPath}

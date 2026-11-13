@@ -5,13 +5,15 @@
 //! 2. execute 函数    → Execute（真正干活的代码）
 //! 3. ToolRegistry    → Registry（工具注册中心）
 
-use crate::database::Database;
-use crate::work_intelligence;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use work_review_core::categorize::{categorize_app, get_category_name, normalize_display_app_name};
+use work_review_core::database::Database;
 use work_review_core::database::MemorySearchItem;
+use work_review_core::work_intelligence;
+
+use super::AssistantRequestMode;
 
 // ══════════════════════════════════════════════════════════
 // 共享 Helper 函数
@@ -74,8 +76,7 @@ fn resolve_category_key(input: &str) -> Option<String> {
 
 /// 一个工具的完整定义（Schema + 执行函数）
 ///
-/// 对应 Python 里的：
-///   search_memory_schema() + search_memory_execute() 的组合
+/// 将供模型读取的参数 Schema 与实际执行函数绑定在一起。
 pub struct ToolDefinition {
     /// 工具名称
     pub name: &'static str,
@@ -127,14 +128,117 @@ impl WebToolsConfig {
 // ══════════════════════════════════════════════════════════
 
 /// 助手可执行的写操作。全部需要用户在前端确认后才会真正执行。
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum AssistantAction {
-    CreateTodo { text: String },
-    SetAppCategory { app_name: String, category: String },
+    CreateTodo {
+        text: String,
+    },
+    SetAppCategory {
+        app_name: String,
+        category: String,
+    },
     PauseRecording,
     ResumeRecording,
-    OpenTimeline { date: String },
-    GenerateDailyReport { date: String, force: bool },
+    OpenTimeline {
+        date: String,
+    },
+    GenerateDailyReport {
+        date: String,
+        force: bool,
+    },
+    RememberUserMemory {
+        memory_type: String,
+        memory_key: String,
+        value_text: String,
+        recall_policy: String,
+        sensitivity: String,
+        expires_at: Option<i64>,
+    },
+    UpdateUserMemory {
+        id: i64,
+        expected_revision: i64,
+        memory_type: String,
+        memory_key: String,
+        value_text: String,
+        recall_policy: String,
+        sensitivity: String,
+        expires_at: Option<i64>,
+    },
+    ForgetUserMemory {
+        id: i64,
+        expected_revision: i64,
+    },
+}
+
+impl std::fmt::Debug for AssistantAction {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CreateTodo { text } => formatter
+                .debug_struct("CreateTodo")
+                .field("text", text)
+                .finish(),
+            Self::SetAppCategory { app_name, category } => formatter
+                .debug_struct("SetAppCategory")
+                .field("app_name", app_name)
+                .field("category", category)
+                .finish(),
+            Self::PauseRecording => formatter.write_str("PauseRecording"),
+            Self::ResumeRecording => formatter.write_str("ResumeRecording"),
+            Self::OpenTimeline { date } => formatter
+                .debug_struct("OpenTimeline")
+                .field("date", date)
+                .finish(),
+            Self::GenerateDailyReport { date, force } => formatter
+                .debug_struct("GenerateDailyReport")
+                .field("date", date)
+                .field("force", force)
+                .finish(),
+            Self::RememberUserMemory {
+                memory_type,
+                memory_key: _,
+                recall_policy,
+                sensitivity,
+                expires_at,
+                ..
+            } => formatter
+                .debug_struct("RememberUserMemory")
+                .field("memory_type", memory_type)
+                .field("memory_key", &"<redacted>")
+                .field("value_text", &"<redacted>")
+                .field("recall_policy", recall_policy)
+                .field("sensitivity", sensitivity)
+                .field("expires_at", expires_at)
+                .finish(),
+            Self::UpdateUserMemory {
+                id,
+                expected_revision,
+                memory_type,
+                memory_key: _,
+                recall_policy,
+                sensitivity,
+                expires_at,
+                ..
+            } => formatter
+                .debug_struct("UpdateUserMemory")
+                .field("id", id)
+                .field("expected_revision", expected_revision)
+                .field("memory_type", memory_type)
+                .field("memory_key", &"<redacted>")
+                .field("value_text", &"<redacted>")
+                .field("recall_policy", recall_policy)
+                .field("sensitivity", sensitivity)
+                .field("expires_at", expires_at)
+                .finish(),
+            Self::ForgetUserMemory {
+                id,
+                expected_revision,
+            } => formatter
+                .debug_struct("ForgetUserMemory")
+                .field("id", id)
+                .field("expected_revision", expected_revision)
+                .finish(),
+        }
+    }
 }
 
 /// 行动执行 Future（'static：桥接闭包内部只捕获 owned 句柄）。
@@ -188,6 +292,41 @@ pub struct AssistantRuntime {
     pub cancel: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
+/// 当前请求允许注册的长期记忆工具。
+///
+/// 写权限只根据 commands 层收到的原始用户消息计算，并通过 Tokio task-local
+/// 传递到 Executor 内部的工具注册阶段，避免 OCR、网页或工具输出扩大权限。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct UserMemoryToolCapabilities {
+    pub search: bool,
+    pub remember: bool,
+    pub update: bool,
+    pub forget: bool,
+}
+
+tokio::task_local! {
+    static USER_MEMORY_TOOL_CAPABILITIES: UserMemoryToolCapabilities;
+}
+
+/// 在当前异步请求内绑定长期记忆工具权限。
+pub async fn with_user_memory_tool_capabilities<F>(
+    capabilities: UserMemoryToolCapabilities,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    USER_MEMORY_TOOL_CAPABILITIES
+        .scope(capabilities, future)
+        .await
+}
+
+fn current_user_memory_tool_capabilities() -> UserMemoryToolCapabilities {
+    USER_MEMORY_TOOL_CAPABILITIES
+        .try_with(|capabilities| *capabilities)
+        .unwrap_or_default()
+}
+
 /// 需要用户确认的工具名单（全部写操作）。
 const CONFIRM_REQUIRED_TOOLS: &[&str] = &[
     "create_todo",
@@ -196,11 +335,61 @@ const CONFIRM_REQUIRED_TOOLS: &[&str] = &[
     "resume_recording",
     "open_timeline",
     "generate_daily_report",
+    "remember_user_memory",
+    "update_user_memory",
+    "forget_user_memory",
 ];
 
 /// 该工具执行前是否需要用户确认。
 pub fn requires_confirmation(tool: &str) -> bool {
     CONFIRM_REQUIRED_TOOLS.contains(&tool)
+}
+
+/// 生成确认卡片中的长期记忆键预览。
+///
+/// 确认发生在数据库校验之前，因此这里必须把模型参数视为不可信输入：
+/// 认证秘密完全隐藏，无效字符不回显，合法键也限制展示长度。
+fn user_memory_key_confirm_preview(args: &Value) -> String {
+    let memory_key = args
+        .get("memory_key")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if text_contains_auth_secret(memory_key) {
+        return "<已隐藏的敏感 key>".to_string();
+    }
+    if memory_key.is_empty()
+        || memory_key
+            .chars()
+            .any(|character| !character.is_alphanumeric() && !matches!(character, '_' | '-' | '.'))
+    {
+        return "<已隐藏的无效 key>".to_string();
+    }
+
+    let mut characters = memory_key.chars();
+    let preview: String = characters.by_ref().take(64).collect();
+    if characters.next().is_some() {
+        format!("{preview}…")
+    } else {
+        preview
+    }
+}
+
+/// 只展示数据库允许的枚举值，防止确认卡片在校验前被控制字符或伪造文本污染。
+fn user_memory_enum_confirm_preview(
+    args: &Value,
+    key: &str,
+    allowed_values: &[&str],
+    default: &str,
+) -> String {
+    let value = args.get(key).and_then(Value::as_str).unwrap_or("").trim();
+    if value.is_empty() {
+        default.to_string()
+    } else if allowed_values.contains(&value) {
+        value.to_string()
+    } else {
+        "<无效>".to_string()
+    }
 }
 
 /// 确认卡片上展示的操作摘要（人话描述模型想做什么）。
@@ -211,6 +400,13 @@ pub fn action_confirm_summary(tool: &str, args: &Value) -> String {
             .unwrap_or("")
             .trim()
             .to_string()
+    };
+    let expires_at = || match args.get("expires_at") {
+        None | Some(Value::Null) => "永久".to_string(),
+        Some(value) => value
+            .as_i64()
+            .map(|timestamp| format!("Unix {timestamp}"))
+            .unwrap_or_else(|| "无效".to_string()),
     };
     match tool {
         "create_todo" => format!("新建待办：{}", s("text")),
@@ -238,7 +434,183 @@ pub fn action_confirm_summary(tool: &str, args: &Value) -> String {
                 format!("生成 {date} 的日报")
             }
         }
+        "remember_user_memory" => format!(
+            "新增长期记忆：{} / {}（召回策略：{}，敏感级别：{}，过期：{}）",
+            user_memory_enum_confirm_preview(
+                args,
+                "memory_type",
+                &[
+                    "preference",
+                    "workflow",
+                    "profile",
+                    "goal",
+                    "project",
+                    "constraint"
+                ],
+                "未提供",
+            ),
+            user_memory_key_confirm_preview(args),
+            user_memory_enum_confirm_preview(
+                args,
+                "recall_policy",
+                &["always", "relevant", "manual"],
+                "relevant",
+            ),
+            user_memory_enum_confirm_preview(args, "sensitivity", &["normal", "caution"], "normal",),
+            expires_at()
+        ),
+        "update_user_memory" => format!(
+            "更新长期记忆 #{}（revision {}）：{} / {}（召回策略：{}，敏感级别：{}，过期：{}）",
+            args.get("id")
+                .and_then(|value| value.as_i64())
+                .unwrap_or_default(),
+            args.get("expected_revision")
+                .and_then(|value| value.as_i64())
+                .unwrap_or_default(),
+            user_memory_enum_confirm_preview(
+                args,
+                "memory_type",
+                &[
+                    "preference",
+                    "workflow",
+                    "profile",
+                    "goal",
+                    "project",
+                    "constraint"
+                ],
+                "未提供",
+            ),
+            user_memory_key_confirm_preview(args),
+            user_memory_enum_confirm_preview(
+                args,
+                "recall_policy",
+                &["always", "relevant", "manual"],
+                "未提供",
+            ),
+            user_memory_enum_confirm_preview(args, "sensitivity", &["normal", "caution"], "未提供",),
+            expires_at()
+        ),
+        "forget_user_memory" => format!(
+            "永久删除长期记忆 #{}（仅删除结构化长期记忆，revision {}）",
+            args.get("id")
+                .and_then(|value| value.as_i64())
+                .unwrap_or_default(),
+            args.get("expected_revision")
+                .and_then(|value| value.as_i64())
+                .unwrap_or_default()
+        ),
         _ => format!("执行操作 {tool}"),
+    }
+}
+
+/// 对单个字段保守检测认证秘密。命中时只返回布尔值，不回显原文。
+fn text_contains_auth_secret(text: &str) -> bool {
+    let lower_text = text.trim().to_lowercase();
+    let compact: String = lower_text
+        .chars()
+        .filter(|character| {
+            !character.is_whitespace() && !matches!(character, '-' | '_' | ':' | '：' | '/' | '\\')
+        })
+        .collect();
+
+    let secret_labels = [
+        "password",
+        "passwd",
+        "passcode",
+        "apikey",
+        "accesskey",
+        "secretkey",
+        "accesstoken",
+        "refreshtoken",
+        "bearertoken",
+        "privatekey",
+        "seedphrase",
+        "mnemonicphrase",
+        "recoverycode",
+        "backupcode",
+        "authcookie",
+        "authenticationcookie",
+        "sessioncookie",
+        "密码",
+        "口令",
+        "密钥",
+        "访问令牌",
+        "刷新令牌",
+        "私钥",
+        "助记词",
+        "恢复码",
+        "备用码",
+        "认证cookie",
+        "登录cookie",
+        "会话cookie",
+    ];
+    if secret_labels.iter().any(|label| compact.contains(label)) {
+        return true;
+    }
+
+    if lower_text.contains("-----begin private key-----")
+        || lower_text.contains("-----begin rsa private key-----")
+        || lower_text.contains("-----begin ec private key-----")
+        || lower_text.contains("authorization: bearer ")
+        || lower_text.contains("sessionid=")
+        || lower_text.contains("access_token=")
+        || lower_text.contains("refresh_token=")
+        || lower_text.contains("auth_token=")
+        || lower_text.contains("cookie:")
+    {
+        return true;
+    }
+
+    lower_text
+        .split(|character: char| {
+            character.is_whitespace()
+                || matches!(character, ',' | ';' | '，' | '；' | '"' | '\'' | '(' | ')')
+        })
+        .any(|token| {
+            let token = token.trim_matches(|character: char| {
+                matches!(character, '.' | ':' | '=' | '[' | ']' | '{' | '}')
+            });
+            let known_secret_prefix = [
+                "sk-",
+                "ghp_",
+                "glpat-",
+                "gho_",
+                "ghu_",
+                "ghs_",
+                "ghr_",
+                "github_pat_",
+                "xapp-",
+                "xoxb-",
+                "xoxp-",
+                "akia",
+                "aiza",
+                "ya29.",
+            ]
+            .iter()
+            .any(|prefix| token.starts_with(prefix) && token.len() >= prefix.len() + 12);
+            let jwt_like =
+                token.starts_with("eyj") && token.split('.').count() == 3 && token.len() >= 32;
+            known_secret_prefix || jwt_like
+        })
+}
+
+/// memory_key 和 value_text 使用完全相同的认证秘密格式检测。
+pub(crate) fn contains_auth_secret(memory_key: &str, value_text: &str) -> bool {
+    text_contains_auth_secret(memory_key) || text_contains_auth_secret(value_text)
+}
+
+/// 新增和修改长期记忆前的统一认证秘密护栏。
+pub(crate) fn ensure_user_memory_value_is_safe(
+    memory_key: &str,
+    value_text: &str,
+) -> Result<(), String> {
+    if contains_auth_secret(memory_key, value_text) {
+        Err(
+            "出于安全原因，长期记忆不能保存密码、API Key、访问令牌、私钥、恢复码或认证 Cookie"
+                .to_string(),
+        )
+    } else {
+        Ok(())
     }
 }
 
@@ -273,8 +645,8 @@ impl<'a> ToolContext<'a> {
     /// 的窗口标题，否则会违背"本地优先、不经第三方"的隐私承诺。
     pub fn filter_activities(
         &self,
-        activities: Vec<crate::database::Activity>,
-    ) -> Vec<crate::database::Activity> {
+        activities: Vec<work_review_core::database::Activity>,
+    ) -> Vec<work_review_core::database::Activity> {
         crate::commands::filter_activities_by_privacy(
             activities,
             &self.ignored_apps,
@@ -331,9 +703,6 @@ impl<'a> ToolContext<'a> {
 // ══════════════════════════════════════════════════════════
 
 /// search_memory 工具的 Schema
-///
-/// 对应 Python: search_memory_schema()
-/// 输出的 JSON 和 Python 版完全一致
 fn search_memory_parameters() -> Value {
     json!({
         "type": "object",
@@ -356,8 +725,6 @@ fn search_memory_parameters() -> Value {
 }
 
 /// analyze_intents 工具的 Schema
-///
-/// 对应 Python: analyze_intents_schema()
 fn analyze_intents_parameters() -> Value {
     json!({
         "type": "object",
@@ -458,14 +825,85 @@ fn trend_comparison_parameters() -> Value {
     })
 }
 
+fn user_memory_write_parameters(include_identity: bool) -> Value {
+    let mut properties = serde_json::Map::new();
+    if include_identity {
+        properties.insert(
+            "id".to_string(),
+            json!({ "type": "integer", "description": "长期记忆 ID" }),
+        );
+        properties.insert(
+            "expected_revision".to_string(),
+            json!({ "type": "integer", "description": "当前 revision，用于防止覆盖并发修改" }),
+        );
+    }
+    properties.insert(
+        "memory_type".to_string(),
+        json!({
+            "type": "string",
+            "enum": ["preference", "workflow", "profile", "goal", "project", "constraint"],
+            "description": "长期记忆类型"
+        }),
+    );
+    properties.insert(
+        "memory_key".to_string(),
+        json!({ "type": "string", "description": "稳定、简短且不含秘密的 key" }),
+    );
+    properties.insert(
+        "value_text".to_string(),
+        json!({ "type": "string", "description": "用户明确要求保存或更新的完整内容；不得包含认证秘密" }),
+    );
+    properties.insert(
+        "recall_policy".to_string(),
+        json!({
+            "type": "string",
+            "enum": ["always", "relevant", "manual"],
+            "description": if include_identity {
+                "召回策略；更新时必须提供当前值或新值"
+            } else {
+                "召回策略，默认 relevant"
+            }
+        }),
+    );
+    properties.insert(
+        "sensitivity".to_string(),
+        json!({
+            "type": "string",
+            "enum": ["normal", "caution"],
+            "description": if include_identity {
+                "敏感级别；更新时必须提供当前值或新值，caution 不能 always 召回"
+            } else {
+                "敏感级别，默认 normal；caution 不能 always 召回"
+            }
+        }),
+    );
+    properties.insert(
+        "expires_at".to_string(),
+        json!({
+            "type": ["integer", "null"],
+            "description": "可选 Unix 秒级过期时间；永久保存传 null"
+        }),
+    );
+
+    let mut required = vec!["memory_type", "memory_key", "value_text"];
+    if include_identity {
+        required.splice(0..0, ["id", "expected_revision"]);
+        required.extend(["recall_policy", "sensitivity", "expires_at"]);
+    }
+    json!({
+        "type": "object",
+        "properties": properties,
+        "required": required
+    })
+}
+
 // ══════════════════════════════════════════════════════════
 // 第四部分：具体工具的 Execute 函数
 // ══════════════════════════════════════════════════════════
 
 /// search_memory 的执行函数
 ///
-/// 对应 Python: search_memory_execute()
-/// 但这里调用的是真实的 database.search_memory()！
+/// 调用正式数据库实现，并在返回模型前执行隐私过滤。
 fn search_memory_execute(ctx: &ToolContext, args: Value) -> Result<String, String> {
     let query = args["query"]
         .as_str()
@@ -549,8 +987,7 @@ fn search_memory_execute(ctx: &ToolContext, args: Value) -> Result<String, Strin
 
 /// analyze_intents 的执行函数
 ///
-/// 对应 Python: analyze_intents_execute()
-/// 调用真实的 work_intelligence.analyze_intents()
+/// 调用正式的工作意图分析实现。
 fn analyze_intents_execute(ctx: &ToolContext, args: Value) -> Result<String, String> {
     let date_from = args["date_from"]
         .as_str()
@@ -825,7 +1262,7 @@ fn trend_comparison_execute(ctx: &ToolContext, args: Value) -> Result<String, St
     let activities_b = ctx.filter_activities(activities_b);
 
     // 按分类聚合
-    let compute_cats = |acts: &[crate::database::Activity]| -> HashMap<String, i64> {
+    let compute_cats = |acts: &[work_review_core::database::Activity]| -> HashMap<String, i64> {
         let mut map: HashMap<String, i64> = HashMap::new();
         for a in acts {
             let cat = categorize_app(&a.app_name, &a.window_title);
@@ -1665,6 +2102,42 @@ fn required_str_arg(args: &Value, key: &str) -> Result<String, String> {
     Ok(value)
 }
 
+fn required_i64_arg(args: &Value, key: &str) -> Result<i64, String> {
+    args.get(key)
+        .and_then(|value| value.as_i64())
+        .ok_or_else(|| format!("缺少或无效的整数参数: {key}"))
+}
+
+fn optional_str_arg(args: &Value, key: &str, default: &str) -> String {
+    args.get(key)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(default)
+        .to_string()
+}
+
+fn optional_i64_arg(args: &Value, key: &str) -> Result<Option<i64>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| format!("无效的整数参数: {key}")),
+    }
+}
+
+fn required_nullable_i64_arg(args: &Value, key: &str) -> Result<Option<i64>, String> {
+    match args.get(key) {
+        None => Err(format!("缺少必需参数: {key}")),
+        Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| format!("无效的整数参数: {key}")),
+    }
+}
+
 async fn create_todo_action(ctx: &ToolContext<'_>, args: Value) -> Result<String, String> {
     let text = required_str_arg(&args, "text")?;
     run_action(ctx, AssistantAction::CreateTodo { text }).await
@@ -1703,6 +2176,100 @@ async fn generate_daily_report_action(
     run_action(ctx, AssistantAction::GenerateDailyReport { date, force }).await
 }
 
+/// 只返回长期记忆元数据，避免完整内容进入工具结果、摘要或日志。
+fn search_user_memories_execute(ctx: &ToolContext<'_>, args: Value) -> Result<String, String> {
+    let query = args
+        .get("query")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim();
+    let limit = args
+        .get("limit")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(20)
+        .clamp(1, 50) as usize;
+    let memories = ctx
+        .database
+        .search_user_memories(query, limit)
+        .map_err(|error| error.to_string())?;
+    let metadata: Vec<Value> = memories
+        .iter()
+        .map(|memory| {
+            json!({
+                "id": memory.id,
+                "memory_type": memory.memory_type,
+                "memory_key": memory.memory_key,
+                "recall_policy": memory.recall_policy,
+                "sensitivity": memory.sensitivity,
+                "expires_at": memory.expires_at,
+                "revision": memory.revision,
+            })
+        })
+        .collect();
+    Ok(json!({ "count": metadata.len(), "memories": metadata }).to_string())
+}
+
+async fn remember_user_memory_action(ctx: &ToolContext<'_>, args: Value) -> Result<String, String> {
+    let memory_type = required_str_arg(&args, "memory_type")?;
+    let memory_key = required_str_arg(&args, "memory_key")?;
+    let value_text = required_str_arg(&args, "value_text")?;
+    let recall_policy = optional_str_arg(&args, "recall_policy", "relevant");
+    let sensitivity = optional_str_arg(&args, "sensitivity", "normal");
+    let expires_at = optional_i64_arg(&args, "expires_at")?;
+    ensure_user_memory_value_is_safe(&memory_key, &value_text)?;
+    run_action(
+        ctx,
+        AssistantAction::RememberUserMemory {
+            memory_type,
+            memory_key,
+            value_text,
+            recall_policy,
+            sensitivity,
+            expires_at,
+        },
+    )
+    .await
+}
+
+async fn update_user_memory_action(ctx: &ToolContext<'_>, args: Value) -> Result<String, String> {
+    let id = required_i64_arg(&args, "id")?;
+    let expected_revision = required_i64_arg(&args, "expected_revision")?;
+    let memory_type = required_str_arg(&args, "memory_type")?;
+    let memory_key = required_str_arg(&args, "memory_key")?;
+    let value_text = required_str_arg(&args, "value_text")?;
+    let recall_policy = required_str_arg(&args, "recall_policy")?;
+    let sensitivity = required_str_arg(&args, "sensitivity")?;
+    let expires_at = required_nullable_i64_arg(&args, "expires_at")?;
+    ensure_user_memory_value_is_safe(&memory_key, &value_text)?;
+    run_action(
+        ctx,
+        AssistantAction::UpdateUserMemory {
+            id,
+            expected_revision,
+            memory_type,
+            memory_key,
+            value_text,
+            recall_policy,
+            sensitivity,
+            expires_at,
+        },
+    )
+    .await
+}
+
+async fn forget_user_memory_action(ctx: &ToolContext<'_>, args: Value) -> Result<String, String> {
+    let id = required_i64_arg(&args, "id")?;
+    let expected_revision = required_i64_arg(&args, "expected_revision")?;
+    run_action(
+        ctx,
+        AssistantAction::ForgetUserMemory {
+            id,
+            expected_revision,
+        },
+    )
+    .await
+}
+
 /// semantic_search — 屏幕记忆语义检索（经 commands 层桥接）。
 /// 结果含 OCR 摘要（源自任意网页），按不可信内容包裹防注入。
 async fn semantic_search_tool(ctx: &ToolContext<'_>, args: Value) -> Result<String, String> {
@@ -1730,18 +2297,22 @@ async fn semantic_search_tool(ctx: &ToolContext<'_>, args: Value) -> Result<Stri
 
 /// 工具注册中心
 ///
-/// 对应 Python: ToolRegistry 类
-/// 职责完全一样：注册工具 → 返回定义给 LLM → 执行 LLM 选择的工具
+/// 负责注册工具、向模型提供定义并执行模型选择的工具。
 pub struct ToolRegistry {
     tools: HashMap<&'static str, ToolDefinition>,
 }
 
 impl ToolRegistry {
+    /// 创建空 Registry。普通聊天从零权限开始，仅按显式配置追加通用联网工具。
+    fn empty() -> Self {
+        Self {
+            tools: HashMap::new(),
+        }
+    }
+
     /// 创建一个注册了所有内置（本地）工具的 Registry
     pub fn new() -> Self {
-        let mut registry = Self {
-            tools: HashMap::new(),
-        };
+        let mut registry = Self::empty();
         registry.register_builtin_tools();
         registry
     }
@@ -1785,7 +2356,32 @@ impl ToolRegistry {
                 executor: ToolExecutor::Async(|ctx, args| Box::pin(semantic_search_tool(ctx, args))),
             });
         }
+        registry.register_user_memory_tools(current_user_memory_tool_capabilities(), with_actions);
         registry
+    }
+
+    /// 按请求模式注册工具。
+    ///
+    /// - 工作复盘保留完整的本机工作、行动、语义记忆、长期记忆和联网能力；
+    /// - 普通聊天从空工具集开始，只允许用户显式开启的通用联网工具。
+    pub fn for_request(
+        mode: AssistantRequestMode,
+        web: Option<&WebToolsConfig>,
+        with_actions: bool,
+        with_semantic: bool,
+    ) -> Self {
+        match mode {
+            AssistantRequestMode::WorkReview => {
+                Self::for_assistant(web, with_actions, with_semantic)
+            }
+            AssistantRequestMode::GeneralChat => {
+                let mut registry = Self::empty();
+                if let Some(web) = web {
+                    registry.register_web_tools(web);
+                }
+                registry
+            }
+        }
     }
 
     /// 注册内置工具
@@ -1966,6 +2562,70 @@ impl ToolRegistry {
         });
     }
 
+    fn register_user_memory_tools(
+        &mut self,
+        capabilities: UserMemoryToolCapabilities,
+        with_actions: bool,
+    ) {
+        if capabilities.search {
+            self.register(ToolDefinition {
+                name: "search_user_memories",
+                description: "搜索用户明确确认并保存在本机的长期记忆。仅返回 ID、memory_type、memory_key、recall_policy、sensitivity、expires_at 和 revision 元数据，不返回完整内容；当用户询问已保存了什么，或更新/删除前需要定位记忆时使用。",
+                parameters_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "按类型、key 或内容匹配的查询；查看全部时传空字符串" },
+                        "limit": { "type": "integer", "description": "返回条数，默认 20，最多 50" }
+                    },
+                    "required": ["query"]
+                }),
+                executor: ToolExecutor::Sync(search_user_memories_execute),
+            });
+        }
+
+        if !with_actions {
+            return;
+        }
+
+        if capabilities.remember {
+            self.register(ToolDefinition {
+                name: "remember_user_memory",
+                description: "把用户当前消息中明确要求记住的偏好、流程、资料、目标、项目或约束保存为长期记忆。必须先弹出确认卡片；禁止保存密码、API Key、访问令牌、私钥、恢复码和认证 Cookie。",
+                parameters_schema: user_memory_write_parameters(false),
+                executor: ToolExecutor::Async(|ctx, args| {
+                    Box::pin(remember_user_memory_action(ctx, args))
+                }),
+            });
+        }
+        if capabilities.update {
+            self.register(ToolDefinition {
+                name: "update_user_memory",
+                description: "按 ID 和 expected_revision 修改用户明确指定的长期记忆。必须先弹出确认卡片；参数需要提供修改后的完整结构，且禁止认证秘密。",
+                parameters_schema: user_memory_write_parameters(true),
+                executor: ToolExecutor::Async(|ctx, args| {
+                    Box::pin(update_user_memory_action(ctx, args))
+                }),
+            });
+        }
+        if capabilities.forget {
+            self.register(ToolDefinition {
+                name: "forget_user_memory",
+                description: "按 ID 和 expected_revision 永久删除一条结构化长期记忆。只删除长期记忆，不删除原始聊天、OCR 或活动记录。必须先弹出确认卡片。",
+                parameters_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "integer", "description": "长期记忆 ID" },
+                        "expected_revision": { "type": "integer", "description": "当前 revision，用于防止覆盖并发修改" }
+                    },
+                    "required": ["id", "expected_revision"]
+                }),
+                executor: ToolExecutor::Async(|ctx, args| {
+                    Box::pin(forget_user_memory_action(ctx, args))
+                }),
+            });
+        }
+    }
+
     /// 注册联网工具（详见 with_web_tools）。
     fn register_web_tools(&mut self, web: &WebToolsConfig) {
         self.register(ToolDefinition {
@@ -2036,6 +2696,7 @@ impl ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::AssistantRequestMode;
 
     #[test]
     fn test_registry_has_builtin_tools() {
@@ -2218,6 +2879,96 @@ mod tests {
         names
     }
 
+    #[test]
+    fn 普通聊天未开启联网时不应注册任何工具() {
+        let registry =
+            ToolRegistry::for_request(AssistantRequestMode::GeneralChat, None, false, false);
+
+        assert!(
+            tool_names(&registry).is_empty(),
+            "普通聊天不应获得工作记录、行动或语义检索工具"
+        );
+    }
+
+    #[test]
+    fn 普通聊天开启联网但无搜索密钥时应仅注册网页读取() {
+        let web = WebToolsConfig {
+            provider: "tavily".to_string(),
+            api_key: None,
+        };
+        let registry =
+            ToolRegistry::for_request(AssistantRequestMode::GeneralChat, Some(&web), false, false);
+
+        assert_eq!(tool_names(&registry), vec!["fetch_url"]);
+    }
+
+    #[test]
+    fn 普通聊天配置搜索密钥时应仅注册通用联网工具() {
+        let web = WebToolsConfig {
+            provider: "tavily".to_string(),
+            api_key: Some("tvly-test".to_string()),
+        };
+        let registry =
+            ToolRegistry::for_request(AssistantRequestMode::GeneralChat, Some(&web), false, false);
+
+        assert_eq!(tool_names(&registry), vec!["fetch_url", "web_search"]);
+    }
+
+    #[tokio::test]
+    async fn 普通聊天即使开启工作能力也不应暴露工作工具() {
+        let registry = with_user_memory_tool_capabilities(
+            UserMemoryToolCapabilities {
+                search: true,
+                remember: true,
+                update: true,
+                forget: true,
+            },
+            async {
+                ToolRegistry::for_request(AssistantRequestMode::GeneralChat, None, true, true)
+            },
+        )
+        .await;
+
+        assert!(
+            tool_names(&registry).is_empty(),
+            "行动、语义检索和长期记忆能力不得扩大普通聊天的工具权限"
+        );
+    }
+
+    #[tokio::test]
+    async fn 工作复盘应保持现有工具能力() {
+        let web = WebToolsConfig {
+            provider: "tavily".to_string(),
+            api_key: Some("tvly-test".to_string()),
+        };
+        let (expected, actual) = with_user_memory_tool_capabilities(
+            UserMemoryToolCapabilities {
+                search: true,
+                remember: true,
+                update: true,
+                forget: true,
+            },
+            async {
+                (
+                    ToolRegistry::for_assistant(Some(&web), true, true),
+                    ToolRegistry::for_request(
+                        AssistantRequestMode::WorkReview,
+                        Some(&web),
+                        true,
+                        true,
+                    ),
+                )
+            },
+        )
+        .await;
+
+        assert_eq!(
+            tool_names(&actual),
+            tool_names(&expected),
+            "工作复盘模式应完整保留既有本地、联网、行动、语义检索和长期记忆能力"
+        );
+    }
+
     /// 联网工具注册门控：默认不注册；开联网注册 fetch_url；有搜索 provider 才注册 web_search。
     #[test]
     fn 联网工具应按配置门控注册() {
@@ -2296,6 +3047,315 @@ mod tests {
             &json!({"app_name": "Xcode", "category": "开发"}),
         );
         assert!(summary.contains("Xcode") && summary.contains("开发"));
+    }
+
+    #[test]
+    fn 长期记忆应保守拒绝认证秘密() {
+        for (key, value) in [
+            ("api_key", "sk-live-1234567890abcdef"),
+            ("登录密码", "correct horse battery staple"),
+            ("access token", "ghp_abcdefghijklmnopqrstuvwxyz"),
+            ("私钥", "-----BEGIN PRIVATE KEY-----"),
+            ("恢复码", "1234-5678-9012"),
+            ("认证 Cookie", "sessionid=abcdef123456"),
+            ("session", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature"),
+        ] {
+            assert!(
+                contains_auth_secret(key, value),
+                "应拒绝认证秘密: key={key}"
+            );
+        }
+
+        assert!(!contains_auth_secret(
+            "回答风格",
+            "优先给结论，再列出三条依据"
+        ));
+    }
+
+    #[test]
+    fn 长期记忆秘密格式检测应同时覆盖键和内容() {
+        for prefix in ["glpat-", "gho_", "ghu_", "ghs_", "ghr_", "xapp-"] {
+            let token = format!("{prefix}abcdefghijklmnopqrstuvwxyz");
+            assert!(
+                contains_auth_secret(&token, "普通偏好"),
+                "memory_key 中的 {prefix} 令牌应被拒绝"
+            );
+            assert!(
+                contains_auth_secret("answer_style", &token),
+                "value_text 中的 {prefix} 令牌应被拒绝"
+            );
+        }
+    }
+
+    #[test]
+    fn 更新长期记忆参数协议应要求完整结构() {
+        let schema = user_memory_write_parameters(true);
+        let required = schema["required"].as_array().expect("required 应为数组");
+        for field in [
+            "id",
+            "expected_revision",
+            "memory_type",
+            "memory_key",
+            "value_text",
+            "recall_policy",
+            "sensitivity",
+            "expires_at",
+        ] {
+            assert!(
+                required.iter().any(|value| value == field),
+                "更新参数应要求字段 {field}"
+            );
+        }
+        assert_eq!(
+            schema["properties"]["expires_at"]["type"],
+            json!(["integer", "null"])
+        );
+    }
+
+    #[tokio::test]
+    async fn 更新长期记忆执行器不得默认补齐字段() {
+        let db = Database::new(std::path::Path::new(":memory:")).expect("内存数据库创建失败");
+        let ctx = ToolContext {
+            database: &db,
+            ignored_apps: vec![],
+            excluded_domains: vec![],
+            web: None,
+            collected_references: Arc::new(Mutex::new(Vec::new())),
+            runtime: AssistantRuntime::default(),
+        };
+        let complete = json!({
+            "id": 1,
+            "expected_revision": 1,
+            "memory_type": "preference",
+            "memory_key": "answer_style",
+            "value_text": "先给结论",
+            "recall_policy": "relevant",
+            "sensitivity": "normal",
+            "expires_at": null
+        });
+
+        for field in ["recall_policy", "sensitivity", "expires_at"] {
+            let mut args = complete.clone();
+            args.as_object_mut().expect("参数应为对象").remove(field);
+            let error = update_user_memory_action(&ctx, args)
+                .await
+                .expect_err("缺少完整字段时必须拒绝更新");
+            assert!(
+                error.contains(field),
+                "缺少 {field} 时应返回对应参数错误，实际为: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn 搜索长期记忆应返回更新元数据但不得泄漏内容() {
+        let db = Database::new(std::path::Path::new(":memory:")).expect("内存数据库创建失败");
+        let secret_value = "仅在最终答案中先给结论，再列三条依据";
+        let expires_at = chrono::Utc::now().timestamp() + 3600;
+        db.create_user_memory(
+            "preference",
+            "answer_style",
+            secret_value,
+            "relevant",
+            "caution",
+            "explicit_chat",
+            None,
+            None,
+            Some(expires_at),
+        )
+        .expect("创建长期记忆失败");
+        let ctx = ToolContext {
+            database: &db,
+            ignored_apps: vec![],
+            excluded_domains: vec![],
+            web: None,
+            collected_references: Arc::new(Mutex::new(Vec::new())),
+            runtime: AssistantRuntime::default(),
+        };
+
+        let output =
+            search_user_memories_execute(&ctx, json!({"query": "answer_style", "limit": 10}))
+                .expect("搜索长期记忆失败");
+        let parsed: Value = serde_json::from_str(&output).expect("工具结果应为 JSON");
+        let memory = &parsed["memories"][0];
+        assert_eq!(memory["memory_type"], "preference");
+        assert_eq!(memory["memory_key"], "answer_style");
+        assert_eq!(memory["recall_policy"], "relevant");
+        assert_eq!(memory["sensitivity"], "caution");
+        assert_eq!(memory["expires_at"], expires_at);
+        assert_eq!(memory["revision"], 1);
+        assert!(memory.get("value_text").is_none());
+        assert!(!output.contains(secret_value));
+    }
+
+    #[tokio::test]
+    async fn 长期记忆工具应按能力门控且写工具必须确认() {
+        let disabled =
+            with_user_memory_tool_capabilities(UserMemoryToolCapabilities::default(), async {
+                ToolRegistry::for_assistant(None, true, false)
+            })
+            .await;
+        let disabled_names = tool_names(&disabled);
+        assert!(!disabled_names
+            .iter()
+            .any(|name| name.contains("user_memory")));
+        assert!(!disabled_names
+            .iter()
+            .any(|name| name.contains("user_memories")));
+
+        let read_only = with_user_memory_tool_capabilities(
+            UserMemoryToolCapabilities {
+                search: true,
+                ..Default::default()
+            },
+            async { ToolRegistry::for_assistant(None, true, false) },
+        )
+        .await;
+        let read_only_names = tool_names(&read_only);
+        assert!(read_only_names
+            .iter()
+            .any(|name| name == "search_user_memories"));
+        for write_tool in [
+            "remember_user_memory",
+            "update_user_memory",
+            "forget_user_memory",
+        ] {
+            assert!(!read_only_names.iter().any(|name| name == write_tool));
+        }
+
+        let all = with_user_memory_tool_capabilities(
+            UserMemoryToolCapabilities {
+                search: true,
+                remember: true,
+                update: true,
+                forget: true,
+            },
+            async { ToolRegistry::for_assistant(None, true, false) },
+        )
+        .await;
+        let all_names = tool_names(&all);
+        for write_tool in [
+            "remember_user_memory",
+            "update_user_memory",
+            "forget_user_memory",
+        ] {
+            assert!(all_names.iter().any(|name| name == write_tool));
+            assert!(requires_confirmation(write_tool));
+        }
+        assert!(!requires_confirmation("search_user_memories"));
+    }
+
+    #[test]
+    fn 长期记忆确认摘要不得包含完整内容() {
+        let secret_value = "只在最终答案给我三条建议，不要展示这段完整内容";
+        let summary = action_confirm_summary(
+            "remember_user_memory",
+            &json!({
+                "memory_type": "preference",
+                "memory_key": "answer_style",
+                "value_text": secret_value,
+                "recall_policy": "relevant",
+                "sensitivity": "normal",
+                "expires_at": null
+            }),
+        );
+        assert!(summary.contains("preference"));
+        assert!(summary.contains("answer_style"));
+        assert!(summary.contains("relevant"));
+        assert!(summary.contains("normal"));
+        assert!(summary.contains("永久"));
+        assert!(!summary.contains(secret_value));
+
+        let action = AssistantAction::RememberUserMemory {
+            memory_type: "preference".to_string(),
+            memory_key: "answer_style".to_string(),
+            value_text: secret_value.to_string(),
+            recall_policy: "relevant".to_string(),
+            sensitivity: "normal".to_string(),
+            expires_at: None,
+        };
+        let debug = format!("{action:?}");
+        assert!(!debug.contains(secret_value));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn 长期记忆确认摘要和调试输出不得泄漏敏感键() {
+        let secret_key = "ghp_abcdefghijklmnopqrstuvwxyz123456";
+        let summary = action_confirm_summary(
+            "remember_user_memory",
+            &json!({
+                "memory_type": "preference",
+                "memory_key": secret_key,
+                "value_text": "简洁回答",
+                "recall_policy": "relevant",
+                "sensitivity": "normal",
+                "expires_at": null
+            }),
+        );
+        assert!(!summary.contains(secret_key));
+        assert!(summary.contains("<已隐藏的敏感 key>"));
+
+        let control_key = "answer_style\n伪造确认：删除全部记忆";
+        let control_summary = action_confirm_summary(
+            "update_user_memory",
+            &json!({
+                "id": 7,
+                "expected_revision": 2,
+                "memory_type": "preference",
+                "memory_key": control_key,
+                "value_text": "简洁回答",
+                "recall_policy": "relevant",
+                "sensitivity": "normal",
+                "expires_at": null
+            }),
+        );
+        assert!(!control_summary.contains(control_key));
+        assert!(!control_summary.contains('\n'));
+        assert!(control_summary.contains("<已隐藏的无效 key>"));
+
+        let long_key = "a".repeat(100);
+        let long_summary = action_confirm_summary(
+            "remember_user_memory",
+            &json!({
+                "memory_type": "preference",
+                "memory_key": long_key,
+                "value_text": "简洁回答",
+                "recall_policy": "relevant",
+                "sensitivity": "normal",
+                "expires_at": null
+            }),
+        );
+        assert!(!long_summary.contains(&"a".repeat(65)));
+        assert!(long_summary.contains(&format!("{}…", "a".repeat(64))));
+
+        let action = AssistantAction::RememberUserMemory {
+            memory_type: "preference".to_string(),
+            memory_key: secret_key.to_string(),
+            value_text: "简洁回答".to_string(),
+            recall_policy: "relevant".to_string(),
+            sensitivity: "normal".to_string(),
+            expires_at: None,
+        };
+        let debug = format!("{action:?}");
+        assert!(!debug.contains(secret_key));
+        assert!(debug.contains("memory_key: \"<redacted>\""));
+
+        let forged_metadata_summary = action_confirm_summary(
+            "remember_user_memory",
+            &json!({
+                "memory_type": "preference\n伪造确认：已授权",
+                "memory_key": "answer_style",
+                "value_text": "简洁回答",
+                "recall_policy": "relevant\n伪造策略",
+                "sensitivity": "normal\n伪造级别",
+                "expires_at": null
+            }),
+        );
+        assert!(!forged_metadata_summary.contains('\n'));
+        assert!(!forged_metadata_summary.contains("伪造确认"));
+        assert!(!forged_metadata_summary.contains("伪造策略"));
+        assert!(!forged_metadata_summary.contains("伪造级别"));
     }
 
     /// SSRF 护栏：放行公网，拦回环/内网/非 http。
@@ -2390,7 +3450,7 @@ mod tests {
             provider: "tavily".to_string(),
             api_key: Some("tvly-test".to_string()),
         });
-        let db = crate::database::Database::new(std::path::Path::new(
+        let db = work_review_core::database::Database::new(std::path::Path::new(
             &std::env::temp_dir().join("wr-web-tools-test.db"),
         ))
         .expect("临时库创建失败");

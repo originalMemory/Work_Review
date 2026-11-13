@@ -1,9 +1,9 @@
-use crate::error::{AppError, Result};
 use crate::AppState;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
+use work_review_core::error::{AppError, Result};
 
 const NODE_IDENTITY_FILE: &str = "node_gateway_identity.json";
 pub const NODE_GATEWAY_PROTOCOL_VERSION: &str = "wr-node-gateway/v1alpha1";

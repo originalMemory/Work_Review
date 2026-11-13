@@ -1,7 +1,9 @@
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use std::sync::Mutex;
 use tauri::{
-    AppHandle, Emitter, LogicalSize, Manager, Monitor, PhysicalPosition, Position, Size,
-    WebviewUrl, WebviewWindow, WebviewWindowBuilder,
+    AppHandle, Emitter, LogicalSize, Manager, Monitor, PhysicalPosition, PhysicalSize, Position,
+    Size, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
 };
 
 pub const AVATAR_WINDOW_LABEL: &str = "avatar";
@@ -25,6 +27,25 @@ const AVATAR_WINDOW_WIDTH: f64 = AVATAR_WINDOW_BASE_WIDTH * AVATAR_SCALE_DEFAULT
 #[cfg(test)]
 const AVATAR_WINDOW_HEIGHT: f64 = AVATAR_WINDOW_BASE_HEIGHT * AVATAR_SCALE_DEFAULT;
 const AVATAR_WINDOW_MARGIN: f64 = 8.0;
+const AVATAR_INTERACTIVE_REGION_TOLERANCE: f64 = 6.0;
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AvatarInteractiveRegion {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AvatarInteractiveHitState {
+    precise: bool,
+    regions: Vec<AvatarInteractiveRegion>,
+}
+
+static AVATAR_INTERACTIVE_HIT_STATE: Lazy<Mutex<AvatarInteractiveHitState>> =
+    Lazy::new(|| Mutex::new(AvatarInteractiveHitState::default()));
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Rect {
@@ -158,8 +179,8 @@ pub fn derive_avatar_state(
 }
 
 pub fn derive_avatar_state_with_rules(
-    rules: &[crate::config::AppCategoryRule],
-    custom_categories: &[crate::config::CustomCategory],
+    rules: &[work_review_core::config::AppCategoryRule],
+    custom_categories: &[work_review_core::config::CustomCategory],
     app_name: &str,
     window_title: &str,
     browser_url: Option<&str>,
@@ -169,20 +190,24 @@ pub fn derive_avatar_state_with_rules(
     let app_name = normalize_app_name(app_name);
     let title_lower = window_title.trim().to_lowercase();
     let url_lower = browser_url.unwrap_or_default().trim().to_lowercase();
-    let manual_base_category =
-        crate::monitor::find_category_override(rules, app_name.as_str(), custom_categories);
-    let base_category = crate::monitor::categorize_app_with_rules(
+    let manual_base_category = work_review_core::categorize::find_collected_category_override(
+        rules,
+        app_name.as_str(),
+        custom_categories,
+    );
+    let base_category = work_review_core::categorize::categorize_collected_app_with_rules(
         rules,
         app_name.as_str(),
         window_title,
         custom_categories,
     );
-    let classification = crate::activity_classifier::classify_activity_with_base_category(
-        app_name.as_str(),
-        window_title,
-        browser_url,
-        &base_category,
-    );
+    let classification =
+        work_review_core::activity_classifier::classify_activity_with_base_category(
+            app_name.as_str(),
+            window_title,
+            browser_url,
+            &base_category,
+        );
 
     if is_generating_report {
         return AvatarStatePayload {
@@ -430,8 +455,13 @@ pub fn sync_avatar_window(
             };
             let effective_position =
                 remembered_avatar_position(had_existing_window, current_position, saved_position);
-            let (x, y) =
-                default_avatar_position(app, normalized_scale, effective_position, body_hidden);
+            let (x, y) = default_avatar_position(
+                app,
+                normalized_scale,
+                effective_position,
+                expanded,
+                body_hidden,
+            );
             resize_avatar_window(&window, normalized_scale, expanded, body_hidden);
             let _ = window.set_always_on_top(true);
             let _ = window.set_visible_on_all_workspaces(true);
@@ -445,6 +475,8 @@ pub fn sync_avatar_window(
             }
             let _ = window.unminimize();
             let _ = window.show();
+            #[cfg(target_os = "windows")]
+            crate::avatar_transparency::schedule(app);
         }
     } else if let Some(window) = app.get_webview_window(AVATAR_WINDOW_LABEL) {
         let _ = window.hide();
@@ -473,29 +505,117 @@ fn point_in_rect(cx: i64, cy: i64, x: i64, y: i64, w: i64, h: i64) -> bool {
     cx >= x && cy >= y && cx < x + w && cy < y + h
 }
 
-/// 全局鼠标是否落在桌宠窗口矩形内（物理像素）。用于智能穿透命中测试。
-/// 注意：用 `outer_size()`（物理），不用 `avatar_window_size`（逻辑），避免 DPR≠1 偏移。
-pub fn avatar_window_hit_by_cursor(app: &AppHandle) -> bool {
-    let Some(window) = app.get_webview_window(AVATAR_WINDOW_LABEL) else {
+fn is_valid_avatar_interactive_region(region: &AvatarInteractiveRegion) -> bool {
+    region.x.is_finite()
+        && region.y.is_finite()
+        && region.width.is_finite()
+        && region.height.is_finite()
+        && region.width > 0.0
+        && region.height > 0.0
+        && (region.x + region.width).is_finite()
+        && (region.y + region.height).is_finite()
+}
+
+/// 更新前端上报的桌宠交互区域。无效矩形不会进入运行时状态。
+pub fn update_avatar_interactive_regions(precise: bool, regions: Vec<AvatarInteractiveRegion>) {
+    let regions = regions
+        .into_iter()
+        .filter(is_valid_avatar_interactive_region)
+        .collect();
+    let mut state = AVATAR_INTERACTIVE_HIT_STATE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    *state = AvatarInteractiveHitState { precise, regions };
+}
+
+/// 隐藏桌宠时，前端启用精确交互区域命中。
+pub fn avatar_precise_hit_testing_enabled() -> bool {
+    AVATAR_INTERACTIVE_HIT_STATE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .precise
+}
+
+fn avatar_interactive_hit_state() -> AvatarInteractiveHitState {
+    AVATAR_INTERACTIVE_HIT_STATE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone()
+}
+
+/// 将全局物理坐标转换为窗口客户区逻辑坐标，并检查是否命中前端交互矩形。
+fn point_in_avatar_interactive_regions(
+    cursor_x: i64,
+    cursor_y: i64,
+    window_x: i32,
+    window_y: i32,
+    scale_factor: f64,
+    regions: &[AvatarInteractiveRegion],
+) -> bool {
+    if !scale_factor.is_finite() || scale_factor <= 0.0 || regions.is_empty() {
         return false;
-    };
-    let Ok(pos) = window.outer_position() else {
+    }
+
+    let local_x = (cursor_x as f64 - window_x as f64) / scale_factor;
+    let local_y = (cursor_y as f64 - window_y as f64) / scale_factor;
+    if !local_x.is_finite() || !local_y.is_finite() {
         return false;
-    };
-    let Ok(size) = window.outer_size() else {
-        return false;
-    };
-    let Some((cx, cy)) = crate::avatar_input::global_cursor_position(app) else {
-        return false;
-    };
-    point_in_rect(
+    }
+
+    regions.iter().any(|region| {
+        if !is_valid_avatar_interactive_region(region) {
+            return false;
+        }
+
+        let left = region.x - AVATAR_INTERACTIVE_REGION_TOLERANCE;
+        let top = region.y - AVATAR_INTERACTIVE_REGION_TOLERANCE;
+        let right = region.x + region.width + AVATAR_INTERACTIVE_REGION_TOLERANCE;
+        let bottom = region.y + region.height + AVATAR_INTERACTIVE_REGION_TOLERANCE;
+        left.is_finite()
+            && top.is_finite()
+            && right.is_finite()
+            && bottom.is_finite()
+            && local_x >= left
+            && local_y >= top
+            && local_x < right
+            && local_y < bottom
+    })
+}
+
+/// 全局鼠标是否命中桌宠。精确模式仅命中前端上报的交互区域；
+/// 非精确模式保留原有整窗物理矩形判断。
+pub fn avatar_window_hit_by_cursor(app: &AppHandle) -> Option<bool> {
+    let window = app.get_webview_window(AVATAR_WINDOW_LABEL)?;
+    let scale_factor = window.scale_factor().ok()?;
+    let (cx, cy) = crate::avatar_input::global_cursor_position(app, scale_factor)?;
+    let hit_state = avatar_interactive_hit_state();
+
+    if hit_state.precise {
+        // getBoundingClientRect() 相对 WebView 客户区，优先使用客户区物理原点。
+        let pos = window
+            .inner_position()
+            .or_else(|_| window.outer_position())
+            .ok()?;
+        return Some(point_in_avatar_interactive_regions(
+            cx,
+            cy,
+            pos.x,
+            pos.y,
+            scale_factor,
+            &hit_state.regions,
+        ));
+    }
+
+    let pos = window.outer_position().ok()?;
+    let size = window.outer_size().ok()?;
+    Some(point_in_rect(
         cx,
         cy,
         pos.x as i64,
         pos.y as i64,
         size.width as i64,
         size.height as i64,
-    )
+    ))
 }
 
 pub fn apply_avatar_window_expansion(
@@ -533,9 +653,14 @@ fn clamp_window_within_current_monitor(
         width: work_area.size.width as i32,
         height: work_area.size.height as i32,
     };
-    let (window_width, window_height) = avatar_window_size(scale, expanded, body_hidden);
-    let (clamped_x, clamped_y) =
-        clamp_avatar_position_with_size(bounds, current.x, current.y, window_width, window_height);
+    let size = avatar_window_physical_size(scale, expanded, body_hidden, monitor.scale_factor());
+    let (clamped_x, clamped_y) = clamp_avatar_position_with_size(
+        bounds,
+        current.x,
+        current.y,
+        size.width as f64,
+        size.height as f64,
+    );
     if (clamped_x, clamped_y) != (current.x, current.y) {
         let _ = window.set_position(Position::Physical(PhysicalPosition::new(
             clamped_x, clamped_y,
@@ -618,13 +743,21 @@ fn default_avatar_position(
     app: &AppHandle,
     scale: f64,
     saved_position: Option<(i32, i32)>,
+    expanded: bool,
     body_hidden: bool,
 ) -> (i32, i32) {
     // 多屏适配：已保存位置时，优先用该位置所在的显示器来 clamp，
     // 避免副屏坐标被主屏的工作区边界强行拉回（issue #120）。
     if let Some((saved_x, saved_y)) = saved_position {
-        if let Some(bounds) = monitor_bounds_for_point(app, saved_x, saved_y) {
-            return resolve_avatar_position(bounds, None, saved_position, scale, body_hidden);
+        if let Some(monitor) = monitor_for_point(app, saved_x, saved_y) {
+            return compute_avatar_position(
+                monitor,
+                None,
+                saved_position,
+                scale,
+                expanded,
+                body_hidden,
+            );
         }
     }
 
@@ -640,20 +773,33 @@ fn default_avatar_position(
                 _ => None,
             };
 
-            return compute_avatar_position(monitor, anchor, saved_position, scale, body_hidden);
+            return compute_avatar_position(
+                monitor,
+                anchor,
+                saved_position,
+                scale,
+                expanded,
+                body_hidden,
+            );
         }
     }
 
     if let Ok(Some(monitor)) = app.primary_monitor() {
-        return compute_avatar_position(monitor, None, saved_position, scale, body_hidden);
+        return compute_avatar_position(
+            monitor,
+            None,
+            saved_position,
+            scale,
+            expanded,
+            body_hidden,
+        );
     }
 
     saved_position.unwrap_or((40, 40))
 }
 
-/// 在所有可用显示器中，找到包含 (x, y) 的那个，返回其工作区物理像素 bounds。
-/// 用于多屏场景下根据桌宠保存位置定位正确的显示器。
-fn monitor_bounds_for_point(app: &AppHandle, x: i32, y: i32) -> Option<Rect> {
+/// 根据保存的物理坐标选择显示器，保留其工作区与 DPI 信息。
+fn monitor_for_point(app: &AppHandle, x: i32, y: i32) -> Option<Monitor> {
     let monitors = app.available_monitors().ok()?;
     for monitor in monitors {
         let position = monitor.position();
@@ -672,13 +818,7 @@ fn monitor_bounds_for_point(app: &AppHandle, x: i32, y: i32) -> Option<Rect> {
             bounds.width as i64,
             bounds.height as i64,
         ) {
-            let work_area = monitor.work_area();
-            return Some(Rect {
-                x: work_area.position.x,
-                y: work_area.position.y,
-                width: work_area.size.width as i32,
-                height: work_area.size.height as i32,
-            });
+            return Some(monitor);
         }
     }
     None
@@ -689,6 +829,7 @@ fn compute_avatar_position(
     anchor: Option<Rect>,
     saved_position: Option<(i32, i32)>,
     scale: f64,
+    expanded: bool,
     body_hidden: bool,
 ) -> (i32, i32) {
     let work_area = monitor.work_area();
@@ -699,17 +840,17 @@ fn compute_avatar_position(
         height: work_area.size.height as i32,
     };
 
-    resolve_avatar_position(bounds, anchor, saved_position, scale, body_hidden)
+    let size = avatar_window_physical_size(scale, expanded, body_hidden, monitor.scale_factor());
+    resolve_avatar_position(bounds, anchor, saved_position, size)
 }
 
 fn resolve_avatar_position(
     bounds: Rect,
     anchor: Option<Rect>,
     saved_position: Option<(i32, i32)>,
-    scale: f64,
-    body_hidden: bool,
+    size: PhysicalSize<u32>,
 ) -> (i32, i32) {
-    let (window_width, window_height) = avatar_window_size(scale, false, body_hidden);
+    let (window_width, window_height) = (size.width as f64, size.height as f64);
 
     if let Some((saved_x, saved_y)) = saved_position {
         return clamp_avatar_position_with_size(
@@ -762,6 +903,16 @@ fn clamp_avatar_position_with_size(
         preferred_x.clamp(bounds.x, max_x),
         preferred_y.clamp(bounds.y, max_y),
     )
+}
+
+fn avatar_window_physical_size(
+    scale: f64,
+    expanded: bool,
+    body_hidden: bool,
+    scale_factor: f64,
+) -> PhysicalSize<u32> {
+    let (width, height) = avatar_window_size(scale, expanded, body_hidden);
+    LogicalSize::new(width, height).to_physical(scale_factor)
 }
 
 fn avatar_window_size(scale: f64, expanded: bool, body_hidden: bool) -> (f64, f64) {
@@ -830,11 +981,12 @@ fn avatar_state(
 mod tests {
     use super::{
         avatar_window_size, clamp_avatar_position, clamp_avatar_position_with_size,
-        default_avatar_state, derive_avatar_state, derive_avatar_state_with_rules, point_in_rect,
-        remembered_avatar_position, resolve_avatar_position, Rect, AVATAR_WINDOW_HEIGHT,
+        default_avatar_state, derive_avatar_state, derive_avatar_state_with_rules,
+        point_in_avatar_interactive_regions, point_in_rect, remembered_avatar_position,
+        resolve_avatar_position, AvatarInteractiveRegion, Rect, AVATAR_WINDOW_HEIGHT,
         AVATAR_WINDOW_WIDTH,
     };
-    use crate::config::AppCategoryRule;
+    use work_review_core::config::AppCategoryRule;
 
     #[test]
     fn point_in_rect_边界判定() {
@@ -846,6 +998,80 @@ mod tests {
         assert!(!point_in_rect(5, 10, 0, 0, 10, 10), "下边外不应命中");
         assert!(point_in_rect(-5, -5, -10, -10, 8, 8), "负坐标内部应命中");
         assert!(!point_in_rect(0, 0, 0, 0, 0, 0), "零尺寸矩形不应命中");
+    }
+
+    #[test]
+    fn 隐藏桌宠精确命中应排除窗口内透明区域并支持高分屏负坐标() {
+        let regions = vec![AvatarInteractiveRegion {
+            x: 15.0,
+            y: 8.0,
+            width: 120.0,
+            height: 48.0,
+        }];
+
+        assert!(point_in_avatar_interactive_regions(
+            -450, 140, -500, 100, 2.0, &regions,
+        ));
+        assert!(!point_in_avatar_interactive_regions(
+            -60, 140, -500, 100, 2.0, &regions,
+        ));
+        assert!(!point_in_avatar_interactive_regions(
+            -450,
+            140,
+            -500,
+            100,
+            2.0,
+            &[],
+        ));
+    }
+
+    #[test]
+    fn 隐藏桌宠精确命中应拒绝非法缩放与无效区域() {
+        let valid_region = vec![AvatarInteractiveRegion {
+            x: 15.0,
+            y: 8.0,
+            width: 120.0,
+            height: 48.0,
+        }];
+        assert!(!point_in_avatar_interactive_regions(
+            20,
+            20,
+            0,
+            0,
+            0.0,
+            &valid_region,
+        ));
+        assert!(!point_in_avatar_interactive_regions(
+            20,
+            20,
+            0,
+            0,
+            f64::NAN,
+            &valid_region,
+        ));
+
+        let invalid_regions = vec![
+            AvatarInteractiveRegion {
+                x: 0.0,
+                y: 0.0,
+                width: 0.0,
+                height: 20.0,
+            },
+            AvatarInteractiveRegion {
+                x: f64::NAN,
+                y: 0.0,
+                width: 20.0,
+                height: 20.0,
+            },
+        ];
+        assert!(!point_in_avatar_interactive_regions(
+            10,
+            10,
+            0,
+            0,
+            1.0,
+            &invalid_regions,
+        ));
     }
 
     #[test]
@@ -1080,6 +1306,48 @@ mod tests {
     }
 
     #[test]
+    fn 高dpi下紧凑和展开桌宠应完整留在正负坐标屏幕内() {
+        for scale_factor in [1.0, 1.5, 2.0] {
+            for expanded in [false, true] {
+                let size = super::avatar_window_physical_size(1.0, expanded, false, scale_factor);
+                let (logical_width, logical_height) = if expanded {
+                    (380.0, 440.0)
+                } else {
+                    (276.0, 248.0)
+                };
+                assert_eq!(size.width, (logical_width * scale_factor) as u32);
+                assert_eq!(size.height, (logical_height * scale_factor) as u32);
+
+                for (screen_x, screen_y) in [(0, 0), (-2000, -1200)] {
+                    let bounds = Rect {
+                        x: screen_x,
+                        y: screen_y,
+                        width: 2000,
+                        height: 1200,
+                    };
+                    let max_x = bounds.x + bounds.width - size.width as i32;
+                    let max_y = bounds.y + bounds.height - size.height as i32;
+                    let (x, y) = resolve_avatar_position(
+                        bounds,
+                        None,
+                        Some((bounds.x + bounds.width, bounds.y + bounds.height)),
+                        size,
+                    );
+                    assert_eq!((x, y), (max_x, max_y));
+                    assert_eq!(
+                        resolve_avatar_position(bounds, Some(bounds), None, size),
+                        (max_x - 8, max_y - 8)
+                    );
+                }
+            }
+        }
+        let fractional_size = super::avatar_window_physical_size(0.9, false, false, 2.0);
+        assert_eq!((fractional_size.width, fractional_size.height), (497, 446));
+        let hidden_size = super::avatar_window_physical_size(1.0, false, true, 2.0);
+        assert_eq!((hidden_size.width, hidden_size.height), (552, 220));
+    }
+
+    #[test]
     fn 已保存桌宠位置应优先于默认吸附位置() {
         let bounds = Rect {
             x: 0,
@@ -1094,7 +1362,8 @@ mod tests {
             height: 600,
         };
 
-        let (x, y) = resolve_avatar_position(bounds, Some(anchor), Some((120, 240)), 0.9, false);
+        let size = super::avatar_window_physical_size(0.9, false, false, 1.0);
+        let (x, y) = resolve_avatar_position(bounds, Some(anchor), Some((120, 240)), size);
 
         assert_eq!((x, y), (120, 240));
     }
@@ -1108,7 +1377,8 @@ mod tests {
             height: 720,
         };
 
-        let (x, y) = resolve_avatar_position(bounds, None, Some((1600, 900)), 0.9, false);
+        let size = super::avatar_window_physical_size(0.9, false, false, 1.0);
+        let (x, y) = resolve_avatar_position(bounds, None, Some((1600, 900)), size);
 
         assert_eq!(
             (x, y),
@@ -1235,7 +1505,8 @@ mod tests {
         };
         let orphan_saved = (5000, 5000);
 
-        let (x, y) = resolve_avatar_position(fallback_bounds, None, Some(orphan_saved), 0.9, false);
+        let size = super::avatar_window_physical_size(0.9, false, false, 1.0);
+        let (x, y) = resolve_avatar_position(fallback_bounds, None, Some(orphan_saved), size);
 
         let (w, h) = avatar_window_size(0.9, false, false);
         assert_eq!(

@@ -1,13 +1,13 @@
-use crate::config::AvatarFollowupItem;
-use crate::database::Activity;
 use crate::monitor::ActiveWindow;
-use crate::work_intelligence::{build_work_sessions, WorkSession};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use tauri::{AppHandle, Emitter};
+use work_review_core::config::AvatarFollowupItem;
+use work_review_core::database::Activity;
+use work_review_core::work_intelligence::{build_work_sessions, WorkSession};
 
 pub const AVATAR_FOLLOWUP_EVENT: &str = "avatar-followup-suggestion";
 const FOLLOWUP_LOOKBACK_DAYS: i64 = 3;
@@ -431,13 +431,13 @@ mod tests {
         session_project_key, should_emit_followup, significant_tokens, AvatarFollowupAction,
         AvatarFollowupRuntime, FOLLOWUP_RUNTIME,
     };
-    use crate::config::AvatarFollowupItem;
-    use crate::database::Activity;
     use crate::monitor::ActiveWindow;
-    use crate::work_intelligence::build_work_sessions;
     use chrono::TimeZone;
     use once_cell::sync::Lazy;
     use std::sync::Mutex;
+    use work_review_core::config::AvatarFollowupItem;
+    use work_review_core::database::Activity;
+    use work_review_core::work_intelligence::build_work_sessions;
 
     static FOLLOWUP_TEST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 

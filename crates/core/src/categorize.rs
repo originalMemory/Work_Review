@@ -113,6 +113,14 @@ pub fn normalize_display_app_name(app_name: &str) -> String {
         return "Work Review Setup".to_string();
     }
 
+    if normalized.starts_with("com.apple.safari")
+        || normalized.starts_with("com.apple.webkit")
+        || normalized.contains("safarisupport")
+        || normalized.contains("webkit.networking")
+    {
+        return "Safari".to_string();
+    }
+
     match normalized.as_str() {
         // ── 本应用 ──
         "work-review" | "work_review" | "workreview" | "work review" => "Work Review".to_string(),
@@ -127,6 +135,7 @@ pub fn normalize_display_app_name(app_name: &str) -> String {
         "chromium" => "Chromium".to_string(),
         "arc" => "Arc".to_string(),
         "zen browser" | "zen" => "Zen Browser".to_string(),
+        "cent" | "cent browser" | "centbrowser" => "Cent Browser".to_string(),
         "qqbrowser" | "qq browser" | "qq浏览器" => "QQ Browser".to_string(),
         "360se" | "360chrome" | "360 browser" | "360浏览器" => "360 Browser".to_string(),
         "sogouexplorer" | "sogou browser" | "搜狗浏览器" => "Sogou Browser".to_string(),
@@ -149,6 +158,7 @@ pub fn normalize_display_app_name(app_name: &str) -> String {
         "rider" | "rider64" => "Rider".to_string(),
         "phpstorm" | "phpstorm64" => "PhpStorm".to_string(),
         "rubymine" | "rubymine64" => "RubyMine".to_string(),
+        "datagrip" | "datagrip64" => "DataGrip".to_string(),
         "fleet" => "Fleet".to_string(),
         "android studio" | "studio64" => "Android Studio".to_string(),
         "devenv" | "visual studio" => "Visual Studio".to_string(),
@@ -260,7 +270,6 @@ pub fn normalize_display_app_name(app_name: &str) -> String {
         "gitkraken" => "GitKraken".to_string(),
         "tableplus" => "TablePlus".to_string(),
         "navicat" | "navicatpremium" => "Navicat".to_string(),
-        "datagrip" => "DataGrip".to_string(),
         "robomongo" | "robo3t" | "studio 3t" => "MongoDB Compass".to_string(),
         "redis-desktop-manager" | "rdm" => "RedisInsight".to_string(),
         // ── 远程桌面 / SSH ──
@@ -294,10 +303,19 @@ pub fn normalize_display_app_name(app_name: &str) -> String {
         "keka" => "Keka".to_string(),
         "daisydisk" => "DaisyDisk".to_string(),
         "onyx" => "OnyX".to_string(),
+        "macpaw" => "MacPaw".to_string(),
         "sensei" => "Sensei".to_string(),
+        "peak" => "Peak".to_string(),
+        "ninjaclean" | "ninja clean" => "Ninja Clean".to_string(),
+        "applink" => "AppLink".to_string(),
+        "eqmac" => "eqMac".to_string(),
         "rectangle" => "Rectangle".to_string(),
         "magnet" => "Magnet".to_string(),
+        "spectacle" => "Spectacle".to_string(),
+        "amethyst" => "Amethyst".to_string(),
+        "yabai" => "yabai".to_string(),
         "stats" => "Stats".to_string(),
+        "monitor" => "Monitor".to_string(),
         _ => trimmed.to_string(),
     }
 }
@@ -344,7 +362,6 @@ fn trim_url_candidate(value: &str) -> &str {
     })
 }
 
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn split_host_and_rest(value: &str) -> (&str, &str) {
     if let Some(index) = value.find(|c| ['/', '?', '#'].contains(&c)) {
         (&value[..index], &value[index..])
@@ -396,8 +413,8 @@ fn is_probable_host(value: &str) -> bool {
         || is_probable_ipv4(host_without_port)
 }
 
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-fn normalize_possible_url(value: &str) -> Option<String> {
+/// 将浏览器地址栏或窗口标题中的候选值规范化为 URL。
+pub fn normalize_browser_url_candidate(value: &str) -> Option<String> {
     let candidate = trim_url_candidate(value)
         .trim_matches(|c: char| c.is_control() || c == '\u{200b}' || c == '\u{feff}')
         .trim_end_matches('.');
@@ -426,17 +443,29 @@ fn normalize_possible_url(value: &str) -> Option<String> {
 
     let (host, _) = split_host_and_rest(candidate);
     if is_probable_host(host) {
-        let host_lower = split_host_port(host).0.to_lowercase();
-        let scheme = if host_lower == "localhost" || is_probable_ipv4(split_host_port(host).0) {
-            "http://"
-        } else {
-            "https://"
-        };
-        return Some(format!("{}{}", scheme, candidate.trim_end_matches('/')));
+        let result = format!(
+            "{}{}",
+            if split_host_port(host).0.to_lowercase() == "localhost"
+                || is_probable_ipv4(split_host_port(host).0)
+            {
+                "http://"
+            } else {
+                "https://"
+            },
+            candidate.trim_end_matches('/')
+        );
+        if is_merged_domain(&result) {
+            return None;
+        }
+        return Some(result);
     }
 
     if is_probable_domain(candidate) {
-        return Some(format!("https://{}", candidate.trim_end_matches('/')));
+        let result = format!("https://{}", candidate.trim_end_matches('/'));
+        if is_merged_domain(&result) {
+            return None;
+        }
+        return Some(result);
     }
 
     None
@@ -446,7 +475,7 @@ fn normalize_possible_url(value: &str) -> Option<String> {
 fn extract_url_from_text(text: &str) -> Option<String> {
     URL_LIKE_RE
         .find_iter(text)
-        .filter_map(|m| normalize_possible_url(m.as_str()))
+        .filter_map(|m| normalize_browser_url_candidate(m.as_str()))
         .next()
 }
 
@@ -509,9 +538,24 @@ pub fn infer_browser_page_hint_from_text(text: &str) -> Option<String> {
     extract_url_from_text(text).filter(|url| !is_merged_domain(url))
 }
 
+/// 按采集网址、窗口标题、OCR 文本的优先级解析浏览器页面。
+/// 保留页面路径供展示使用；可疑的合并域名不能阻止标题和 OCR 兜底。
+pub fn resolve_browser_page_hint(
+    browser_url: Option<&str>,
+    window_title: &str,
+    ocr_text: Option<&str>,
+) -> Option<String> {
+    browser_url
+        .map(|url| url.trim().trim_end_matches('/'))
+        .filter(|url| !url.is_empty() && !is_merged_domain(url))
+        .map(str::to_string)
+        .or_else(|| infer_browser_page_hint(window_title))
+        .or_else(|| ocr_text.and_then(infer_browser_page_hint_from_text))
+}
+
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub fn browser_page_domain_label(page_hint: &str) -> String {
-    if let Some(url) = normalize_possible_url(page_hint) {
+    if let Some(url) = normalize_browser_url_candidate(page_hint) {
         let without_scheme = url
             .split_once("://")
             .map(|(_, rest)| rest)
@@ -548,6 +592,45 @@ pub fn find_website_semantic_override(
     })
 }
 
+/// 归一化基础分类 key，但保留自定义分类 key（不强制收敛到 other）。
+fn normalize_category_keeping_custom(fallback_category: &str) -> String {
+    let fallback = fallback_category.trim().to_lowercase();
+    let normalized = normalize_category_key(&fallback);
+    if normalized == "other" && !fallback.is_empty() && fallback != "other" {
+        fallback
+    } else {
+        normalized
+    }
+}
+
+/// 将网站语义分类映射到基础分类，便于工作/休息时长统计直接生效。
+/// 对无法识别的语义分类，保留原有基础分类。
+pub fn semantic_category_to_base_category(
+    semantic_category: &str,
+    fallback_category: &str,
+) -> String {
+    let semantic = semantic_category.trim();
+    if semantic.is_empty() {
+        return normalize_category_keeping_custom(fallback_category);
+    }
+
+    let mapped = match semantic {
+        "休息娱乐" | "视频内容" | "音乐音频" => Some("entertainment"),
+        "即时聊天" | "会议沟通" => Some("communication"),
+        "设计创作" => Some("design"),
+        "编码开发" => Some("development"),
+        "内容撰写" => Some("office"),
+        "资料阅读" | "资料调研" | "任务规划" | "AI 协作" | "未知活动" => {
+            Some("browser")
+        }
+        _ => None,
+    };
+
+    mapped
+        .map(str::to_string)
+        .unwrap_or_else(|| normalize_category_keeping_custom(fallback_category))
+}
+
 fn extract_url_from_title(window_title: &str) -> Option<String> {
     let title = window_title.trim();
     if title.is_empty() {
@@ -557,20 +640,24 @@ fn extract_url_from_title(window_title: &str) -> Option<String> {
     if let Some(url) = title
         .split_whitespace()
         .next()
-        .and_then(normalize_possible_url)
+        .and_then(normalize_browser_url_candidate)
     {
         return Some(url);
     }
 
     for part in title.rsplit(" - ") {
-        if let Some(url) = normalize_possible_url(part) {
+        if let Some(url) = normalize_browser_url_candidate(part) {
             return Some(url);
         }
     }
 
     extract_url_from_text(title)
 }
-pub fn categorize_app(app_name: &str, window_title: &str) -> String {
+fn categorize_app_with_policy(
+    app_name: &str,
+    window_title: &str,
+    preserve_collector_behavior: bool,
+) -> String {
     let app_lower = app_name.to_lowercase();
 
     // 开发工具（IDE、编辑器、终端、数据库工具、API 工具、容器、版本控制）
@@ -676,8 +763,9 @@ pub fn categorize_app(app_name: &str, window_title: &str) -> String {
         || app_lower.contains("zoom")
         || app_lower.contains("discord")
         || app_lower.contains("wechat")
-        // 微信读书是阅读应用(知识库归娱乐),不应被"微信"拦进通讯
-        || (app_lower.contains("微信") && !app_lower.contains("微信读书"))
+        // 核心分类器避免把微信读书误归通讯；采集侧兼容模式保留迁移前的历史口径。
+        || (app_lower.contains("微信")
+            && (preserve_collector_behavior || !app_lower.contains("微信读书")))
         || app_lower.contains("wecom")
         || app_lower.contains("企业微信")
         || (app_lower.contains("qq") && !app_lower.contains("qqbrowser"))
@@ -745,8 +833,10 @@ pub fn categorize_app(app_name: &str, window_title: &str) -> String {
 
     // 内置应用知识库兜底：覆盖上方硬编码链之外的常见应用（中文生态/创作/学术等），
     // 词边界匹配防误伤；仍未命中才继续窗口标题兜底与 "other"
-    if let Some(category) = crate::knowledge::builtin_app_category(&app_lower) {
-        return category.to_string();
+    if !preserve_collector_behavior {
+        if let Some(category) = crate::knowledge::builtin_app_category(&app_lower) {
+            return category.to_string();
+        }
     }
 
     // 窗口标题兜底：app_name 无法识别时，用窗口标题中的 IDE/工具关键词做最后一轮匹配
@@ -771,6 +861,16 @@ pub fn categorize_app(app_name: &str, window_title: &str) -> String {
     "other".to_string()
 }
 
+/// 使用核心知识库的统一应用分类。
+pub fn categorize_app(app_name: &str, window_title: &str) -> String {
+    categorize_app_with_policy(app_name, window_title, false)
+}
+
+/// 保留桌面采集器迁移前的分类口径，避免已有统计在纯结构重构后发生变化。
+pub fn categorize_collected_app(app_name: &str, window_title: &str) -> String {
+    categorize_app_with_policy(app_name, window_title, true)
+}
+
 pub fn normalize_category_key(category: &str) -> String {
     match category.trim().to_lowercase().as_str() {
         "development" | "browser" | "communication" | "office" | "design" | "entertainment"
@@ -792,10 +892,11 @@ fn normalized_app_rule_key(app_name: &str) -> String {
     normalize_display_app_name(app_name).to_lowercase()
 }
 
-pub fn find_category_override(
+fn find_category_override_with_policy(
     rules: &[crate::config::AppCategoryRule],
     app_name: &str,
     custom_categories: &[crate::config::CustomCategory],
+    allow_short_fuzzy_match: bool,
 ) -> Option<String> {
     let normalized_app_name = normalized_app_rule_key(app_name);
     let custom_keys: Vec<String> = custom_categories.iter().map(|c| c.key.clone()).collect();
@@ -803,10 +904,10 @@ pub fn find_category_override(
     rules.iter().find_map(|rule| {
         let normalized_rule = normalized_app_rule_key(&rule.app_name);
         let exact = normalized_app_name == normalized_rule;
-        let app_contains_rule =
-            normalized_rule.len() >= 3 && normalized_app_name.contains(&normalized_rule);
-        let rule_contains_app =
-            normalized_app_name.len() >= 3 && normalized_rule.contains(&normalized_app_name);
+        let app_contains_rule = (allow_short_fuzzy_match || normalized_rule.len() >= 3)
+            && normalized_app_name.contains(&normalized_rule);
+        let rule_contains_app = (allow_short_fuzzy_match || normalized_app_name.len() >= 3)
+            && normalized_rule.contains(&normalized_app_name);
         if exact || app_contains_rule || rule_contains_app {
             Some(crate::config::normalize_category_key_private(
                 &rule.category,
@@ -818,6 +919,23 @@ pub fn find_category_override(
     })
 }
 
+pub fn find_category_override(
+    rules: &[crate::config::AppCategoryRule],
+    app_name: &str,
+    custom_categories: &[crate::config::CustomCategory],
+) -> Option<String> {
+    find_category_override_with_policy(rules, app_name, custom_categories, false)
+}
+
+/// 保留桌面采集器迁移前对短应用名称的模糊匹配行为。
+pub fn find_collected_category_override(
+    rules: &[crate::config::AppCategoryRule],
+    app_name: &str,
+    custom_categories: &[crate::config::CustomCategory],
+) -> Option<String> {
+    find_category_override_with_policy(rules, app_name, custom_categories, true)
+}
+
 pub fn categorize_app_with_rules(
     rules: &[crate::config::AppCategoryRule],
     app_name: &str,
@@ -826,6 +944,17 @@ pub fn categorize_app_with_rules(
 ) -> String {
     find_category_override(rules, app_name, custom_categories)
         .unwrap_or_else(|| categorize_app(app_name, window_title))
+}
+
+/// 使用迁移前桌面采集器的分类与手动规则匹配口径。
+pub fn categorize_collected_app_with_rules(
+    rules: &[crate::config::AppCategoryRule],
+    app_name: &str,
+    window_title: &str,
+    custom_categories: &[crate::config::CustomCategory],
+) -> String {
+    find_collected_category_override(rules, app_name, custom_categories)
+        .unwrap_or_else(|| categorize_collected_app(app_name, window_title))
 }
 
 /// 获取分类的中文名称
@@ -871,9 +1000,251 @@ mod tests {
 
     #[test]
     fn normalize_display_app_name_returns_canonical_for_tencent_lemon() {
-        // 显示名归一化在 categorize.rs 与 monitor.rs 各有一份，确保腾讯柠檬走到这条规则
+        // 显示名归一化已集中在核心模块，确保腾讯柠檬走到统一规则。
         assert_eq!(normalize_display_app_name("Lemon"), "Tencent Lemon");
         assert_eq!(normalize_display_app_name("Tencent Lemon"), "Tencent Lemon");
         assert_eq!(normalize_display_app_name("LEMON.exe"), "Tencent Lemon");
+    }
+
+    #[test]
+    fn normalize_display_app_name_returns_canonical_for_cent_browser() {
+        assert_eq!(normalize_display_app_name("cent"), "Cent Browser");
+        assert_eq!(normalize_display_app_name("cent browser"), "Cent Browser");
+        assert_eq!(normalize_display_app_name("centbrowser"), "Cent Browser");
+        assert_eq!(
+            normalize_display_app_name("centbrowser.exe"),
+            "Cent Browser"
+        );
+    }
+
+    #[test]
+    fn 归一化后的浏览器显示名仍能归类为浏览器() {
+        assert_eq!(categorize_app("Microsoft Edge", "example.com"), "browser");
+        assert_eq!(categorize_app("QQ Browser", "example.com"), "browser");
+        assert_eq!(categorize_app("360 Browser", "example.com"), "browser");
+        assert_eq!(categorize_app("Sogou Browser", "example.com"), "browser");
+    }
+
+    #[test]
+    fn 手动分类规则应优先于内置分类() {
+        let rules = vec![crate::config::AppCategoryRule {
+            app_name: "MuMu".to_string(),
+            category: "entertainment".to_string(),
+        }];
+
+        assert_eq!(
+            categorize_app_with_rules(&rules, "MuMu模拟器", "项目设计稿", &[]),
+            "entertainment"
+        );
+        assert_eq!(categorize_app("MuMu模拟器", "项目设计稿"), "other");
+    }
+
+    #[test]
+    fn 手动分类规则匹配应兼容应用名归一化() {
+        let rules = vec![crate::config::AppCategoryRule {
+            app_name: "Firefox".to_string(),
+            category: "office".to_string(),
+        }];
+
+        assert_eq!(
+            categorize_app_with_rules(&rules, "firefox", "搜索页", &[]),
+            "office"
+        );
+    }
+
+    #[test]
+    fn 采集侧分类迁移应保留微信读书的原有分类() {
+        assert_eq!(categorize_collected_app("微信读书", ""), "communication");
+        assert_eq!(categorize_app("微信读书", ""), "entertainment");
+    }
+
+    #[test]
+    fn 采集侧手动规则迁移应保留短名称模糊匹配() {
+        let rules = vec![crate::config::AppCategoryRule {
+            app_name: "QQ".to_string(),
+            category: "entertainment".to_string(),
+        }];
+
+        assert_eq!(
+            find_collected_category_override(&rules, "QQ Music", &[]),
+            Some("entertainment".to_string())
+        );
+        assert_eq!(find_category_override(&rules, "QQ Music", &[]), None);
+    }
+
+    #[test]
+    fn 常见系统与桌面应用名应归一化为稳定显示名() {
+        assert_eq!(normalize_display_app_name("discover"), "Discover");
+        assert_eq!(normalize_display_app_name("mail"), "Mail");
+        assert_eq!(normalize_display_app_name("邮件"), "Mail");
+        assert_eq!(
+            normalize_display_app_name("coreautha"),
+            "System Authentication"
+        );
+        assert_eq!(
+            normalize_display_app_name("Work_Review.v1.0.35_x64-setup"),
+            "Work Review Setup"
+        );
+        assert_eq!(normalize_display_app_name("xfltd"), "XFLTD");
+    }
+
+    #[test]
+    fn 网站语义分类应映射为可统计的基础分类并保留自定义兜底() {
+        assert_eq!(
+            semantic_category_to_base_category("休息娱乐", "browser"),
+            "entertainment"
+        );
+        assert_eq!(
+            semantic_category_to_base_category("编码开发", "browser"),
+            "development"
+        );
+        assert_eq!(
+            semantic_category_to_base_category("资料阅读", "browser"),
+            "browser"
+        );
+        assert_eq!(
+            semantic_category_to_base_category("未知自定义语义", "custom-focus"),
+            "custom-focus"
+        );
+    }
+
+    #[test]
+    fn 规范化地址栏候选值并过滤合并域名() {
+        assert_eq!(
+            normalize_browser_url_candidate("https://example.com/path"),
+            Some("https://example.com/path".to_string())
+        );
+        assert_eq!(
+            normalize_browser_url_candidate("example.com"),
+            Some("https://example.com".to_string())
+        );
+        assert_eq!(
+            normalize_browser_url_candidate("bing.com/search?q=test"),
+            Some("https://bing.com/search?q=test".to_string())
+        );
+        assert_eq!(
+            normalize_browser_url_candidate("localhost:3000/dashboard"),
+            Some("http://localhost:3000/dashboard".to_string())
+        );
+        assert_eq!(
+            normalize_browser_url_candidate("chrome://settings"),
+            Some("chrome://settings".to_string())
+        );
+        assert_eq!(normalize_browser_url_candidate("搜索内容"), None);
+        assert_eq!(normalize_browser_url_candidate("1.2.3"), None);
+        assert_eq!(normalize_browser_url_candidate("linux.dolatest"), None);
+    }
+
+    #[test]
+    fn 从标题提取域名时避免误判() {
+        assert_eq!(
+            extract_url_from_title("项目文档 - docs.example.com - Google Chrome"),
+            Some("https://docs.example.com".to_string())
+        );
+        assert_eq!(
+            extract_url_from_title("bing.com/search?q=test - Google Chrome"),
+            Some("https://bing.com/search?q=test".to_string())
+        );
+        assert_eq!(extract_url_from_title("版本 1.2.3 - Google Chrome"), None);
+        assert!(is_probable_domain("sub.example.com"));
+        assert!(!is_probable_domain("1.2.3"));
+        assert_eq!(infer_browser_page_hint("https://linux.dolatest"), None);
+    }
+
+    #[test]
+    fn 浏览器页面解析应统一网址标题和ocr的优先级() {
+        let cases = [
+            (
+                Some(" https://example.com/from-url/ "),
+                "https://title.example/page - Chrome",
+                Some("https://ocr.example/page"),
+                Some("https://example.com/from-url"),
+            ),
+            (
+                None,
+                "title.example - Chrome",
+                Some("https://ocr.example/page"),
+                Some("https://title.example"),
+            ),
+            (
+                Some(" \t\n "),
+                "title.example - Chrome",
+                None,
+                Some("https://title.example"),
+            ),
+            (
+                Some(""),
+                "页面加载中",
+                Some("当前页面 https://ocr.example/page"),
+                Some("https://ocr.example/page"),
+            ),
+            (
+                Some("https://linux.dolatest/"),
+                "title.example - Chrome",
+                Some("https://ocr.example/page"),
+                Some("https://title.example"),
+            ),
+            (
+                Some("linux.dolatest"),
+                "页面加载中",
+                Some("当前页面 https://ocr.example/page"),
+                Some("https://ocr.example/page"),
+            ),
+            (None, "页面加载中", None, None),
+        ];
+
+        for (browser_url, title, ocr_text, expected) in cases {
+            assert_eq!(
+                resolve_browser_page_hint(browser_url, title, ocr_text).as_deref(),
+                expected,
+                "网址={browser_url:?}，标题={title}，OCR={ocr_text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn 网站域名规则应规范化后精确匹配() {
+        assert_eq!(
+            normalize_domain_rule(" HTTPS://Docs.Example.com:443/path?q=1 "),
+            Some("docs.example.com".to_string())
+        );
+        assert_eq!(normalize_domain_rule("   "), None);
+
+        let rules = vec![
+            crate::config::WebsiteSemanticRule {
+                domain: "docs.example.com".to_string(),
+                semantic_category: " 资料阅读 ".to_string(),
+            },
+            crate::config::WebsiteSemanticRule {
+                domain: "example.com".to_string(),
+                semantic_category: "资料调研".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            find_website_semantic_override(&rules, Some("https://docs.example.com/guide")),
+            Some("资料阅读".to_string())
+        );
+        assert_eq!(
+            find_website_semantic_override(&rules, Some("https://api.example.com")),
+            None
+        );
+    }
+
+    #[test]
+    fn normalize_display_app_name_covers_collector_specific_aliases() {
+        assert_eq!(
+            normalize_display_app_name("com.apple.SafariPlatformSupport.Helper"),
+            "Safari"
+        );
+        assert_eq!(
+            normalize_display_app_name("com.apple.WebKit.Networking"),
+            "Safari"
+        );
+        assert_eq!(normalize_display_app_name("datagrip64"), "DataGrip");
+        assert_eq!(normalize_display_app_name("ninjaclean"), "Ninja Clean");
+        assert_eq!(normalize_display_app_name("eqmac"), "eqMac");
+        assert_eq!(normalize_display_app_name("yabai"), "yabai");
+        assert_eq!(normalize_display_app_name("Safari"), "Safari");
     }
 }

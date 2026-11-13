@@ -1,17 +1,15 @@
 //! Auto-extracted from the historical `commands.rs`. Behavior unchanged.
 
-use crate::config::AvatarFollowupItem;
-use crate::error::AppError;
 #[cfg(target_os = "linux")]
-use crate::linux_session::{
-    current_linux_desktop_environment, current_linux_desktop_session, LinuxDesktopSession,
-};
+use crate::linux_session::{current_linux_desktop_environment, current_linux_desktop_session};
 use crate::AppState;
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Manager, State};
+use work_review_core::config::AvatarFollowupItem;
+use work_review_core::error::AppError;
 
 use super::shared::persist_app_config;
 
@@ -138,6 +136,17 @@ pub async fn set_avatar_window_expanded(
     };
     crate::avatar_engine::apply_avatar_window_expansion(&app, scale, expanded, body_hidden)
         .map_err(|e| AppError::Unknown(format!("调整桌宠窗口尺寸失败: {e}")))
+}
+
+/// 更新隐藏桌宠时可交互的气泡/卡片区域。
+#[tauri::command]
+pub async fn set_avatar_interactive_regions(
+    precise: bool,
+    regions: Vec<crate::avatar_engine::AvatarInteractiveRegion>,
+) -> Result<(), AppError> {
+    crate::avatar_engine::update_avatar_interactive_regions(precise, regions);
+    crate::avatar_input::force_resync_click_through();
+    Ok(())
 }
 
 /// 从桌面助手窗口读取当前位置并持久化
@@ -291,13 +300,13 @@ pub async fn install_gnome_avatar_extension() -> Result<GnomeAvatarExtensionInst
             "GNOME 桌宠扩展文件已写入，请确认系统已安装 gnome-extensions 并手动启用扩展".to_string()
         };
 
-        return Ok(GnomeAvatarExtensionInstallResult {
+        Ok(GnomeAvatarExtensionInstallResult {
             installed: true,
             enabled,
             requires_relogin,
             extension_dir: install_dir.to_string_lossy().to_string(),
             message,
-        });
+        })
     }
 
     #[cfg(not(target_os = "linux"))]

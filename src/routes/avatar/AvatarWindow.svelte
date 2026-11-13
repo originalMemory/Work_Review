@@ -1,23 +1,76 @@
-<script>
-  import { onMount } from 'svelte';
+<script lang="ts">
+  import { onMount, tick } from 'svelte';
+  import type { Unsubscriber } from 'svelte/store';
   import { invoke } from '@tauri-apps/api/core';
   import { emitTo, listen } from '@tauri-apps/api/event';
+  import type { PhysicalPosition } from '@tauri-apps/api/dpi';
   import { getCurrentWindow, currentMonitor } from '@tauri-apps/api/window';
   import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
   import AvatarCanvas from '../../lib/components/Avatar/AvatarCanvas.svelte';
   import AvatarFollowupCard from '../../lib/components/Avatar/AvatarFollowupCard.svelte';
   import AvatarPopover from '../../lib/components/Avatar/AvatarPopover.svelte';
-  import { applyLocaleToDocument, initializeLocale, locale, t } from '$lib/i18n/index.js';
+  import {
+    applyLocaleToDocument,
+    initializeLocale,
+    locale,
+    t,
+    type Locale,
+  } from '$lib/i18n/index.ts';
   import {
     getAvatarMotionStepDelay,
     getAvatarStateBubble,
     getAvatarTransitionMeta,
-  } from '../../lib/components/Avatar/avatarStateMeta.js';
+    type AvatarPersona,
+    type AvatarTransitionClass,
+  } from '../../lib/components/Avatar/avatarStateMeta.ts';
+  import {
+    normalizeAvatarInputActivity,
+    parseAvatarBubblePayload,
+    parseAvatarFollowupPayload,
+    parseAvatarState,
+    type AvatarBubblePayload,
+    type AvatarFollowupPayload,
+    type AvatarInputActivity,
+    type AvatarState,
+  } from './avatarPayload.ts';
+
+  type AvatarFollowupAction = 'timeline' | 'focus' | 'remember' | 'snooze' | 'dismiss';
+
+  interface AvatarFocusSession {
+    projectKey: string;
+    title: string;
+    endsAtMs: number;
+  }
+
+  interface AvatarExpansionOptions {
+    force?: boolean;
+  }
+
+  interface FollowupPersonaTheme {
+    badgeClass: string;
+    primaryClass: string;
+    surfaceClass: string;
+    strategyKey: string;
+    focusKey: string;
+    focusFullKey: string;
+    rememberKey: string;
+    rememberFullKey: string;
+    snoozeKey: string;
+    snoozeFullKey: string;
+    timelineOpeningKey: string;
+    rememberedKey: string;
+    snoozedKey: string;
+    focusStartedKey: string;
+    focusStoppedKey: string;
+    focusFinishedKey: string;
+  }
+
+  type AvatarPointerEvent = MouseEvent | CustomEvent<{ originalEvent: MouseEvent }>;
 
   const appWindow = getCurrentWebviewWindow();
   const nativeWindow = getCurrentWindow();
 
-  let state = {
+  let state: AvatarState = {
     mode: 'idle',
     appName: 'Work Review',
     contextLabel: '待命中',
@@ -29,7 +82,7 @@
     avatarPersona: 'assistant',
     avatarBodyHidden: false,
   };
-  let inputActivity = {
+  let inputActivity: AvatarInputActivity = {
     keyboardActive: false,
     mouseActive: false,
     keyboardGroup: 'idle',
@@ -40,33 +93,39 @@
     lastKeyboardInputAtMs: 0,
     lastMouseInputAtMs: 0,
   };
-  let bubbleSource = null;
+  let bubbleSource: AvatarBubblePayload | null = null;
   // 气泡边缘锚点：窗口靠近屏幕右侧时气泡向左展开，避免靠右下角时被裁剪（#137 诉求一）
   let bubbleFlipLeft = false;
-  let bubble = null;
-  let bubbleTimer = null;
-  let followup = null;
-  let focusSession = null;
-  let focusTimer = null;
+  let bubble: AvatarBubblePayload | null = null;
+  let bubbleTimer: ReturnType<typeof setTimeout> | null = null;
+  let followup: AvatarFollowupPayload | null = null;
+  let focusSession: AvatarFocusSession | null = null;
+  let focusTimer: ReturnType<typeof setInterval> | null = null;
   let focusNowMs = 0;
   let lastStateBubbleAt = 0;
-  let transitionClass = '';
-  let transitionTimer = null;
+  let transitionClass: AvatarTransitionClass = '';
+  let transitionTimer: ReturnType<typeof setTimeout> | null = null;
   let motionBeat = 0;
-  let motionTimer = null;
-  let positionSaveTimer = null;
-  let sizeCorrectionTimer = null;
-  let resizeGuardTimer = null;
+  let motionTimer: ReturnType<typeof setTimeout> | null = null;
+  let positionSaveTimer: ReturnType<typeof setTimeout> | null = null;
+  let sizeCorrectionTimer: ReturnType<typeof setTimeout> | null = null;
+  let resizeGuardTimer: ReturnType<typeof setTimeout> | null = null;
   let suppressNextResizeCorrection = false;
-  let lastSavedPositionKey = null;
-  let unsubscribeLocale = () => {};
-  let handleVisibilityChange = null;
-  let handleContextMenu = null;
-  let handleKeydown = null;
-  let avatarExpanded = null;
+  let lastSavedPositionKey: string | null = null;
+  let unsubscribeLocale: Unsubscriber = () => {};
+  let handleVisibilityChange: (() => void) | null = null;
+  let handleContextMenu: ((event: MouseEvent) => void) | null = null;
+  let handleKeydown: ((event: KeyboardEvent) => void) | null = null;
+  let avatarExpanded = null as boolean | null;
+  let interactiveRegionObserver: ResizeObserver | null = null;
+  let interactiveRegionFrame: number | null = null;
+  let interactiveRegionElements: Element[] = [];
+  let interactiveRegionSyncPending = false;
+  let interactiveRegionSyncRequested = false;
+  let interactiveRegionsMounted = false;
   $: currentLocale = $locale;
 
-  const RUNTIME_BUBBLE_MESSAGES = {
+  const RUNTIME_BUBBLE_MESSAGES: Partial<Record<string, Partial<Record<Locale, string>>>> = {
     __avatar_nudge_switch_companion__: {
       'zh-CN': '你切得有点快，我陪你回主线。',
       'zh-TW': '你切得有點快，我陪你回主線。',
@@ -117,19 +176,19 @@
     },
   };
 
-  const FOLLOWUP_PERSONA_LABEL_KEY = {
+  const FOLLOWUP_PERSONA_LABEL_KEY: Record<AvatarPersona, string> = {
     companion: 'settingsAppearance.avatarPersonaCompanionTitle',
     assistant: 'settingsAppearance.avatarPersonaAssistantTitle',
     coach: 'settingsAppearance.avatarPersonaCoachTitle',
   };
 
-  const FOLLOWUP_LEAD_KEY = {
+  const FOLLOWUP_LEAD_KEY: Record<AvatarPersona, string> = {
     companion: 'settingsAppearance.avatarFollowupCompanionLead',
     assistant: 'settingsAppearance.avatarFollowupAssistantLead',
     coach: 'settingsAppearance.avatarFollowupCoachLead',
   };
 
-  const FOLLOWUP_PERSONA_THEME = {
+  const FOLLOWUP_PERSONA_THEME: Record<AvatarPersona, FollowupPersonaTheme> = {
     companion: {
       badgeClass: 'bg-emerald-500/12 text-emerald-700',
       primaryClass: 'bg-emerald-500 hover:bg-emerald-600 text-white',
@@ -186,7 +245,7 @@
     },
   };
 
-  function localizeBacklogNudgeMessage(message, nextLocale) {
+  function localizeBacklogNudgeMessage(message: string, nextLocale: Locale): string | null {
     if (!message?.startsWith('__avatar_backlog_nudge__:')) {
       return null;
     }
@@ -203,7 +262,10 @@
     return t(key, { count, locale: nextLocale });
   }
 
-  function localizeBubblePayload(payload, nextLocale = currentLocale) {
+  function localizeBubblePayload(
+    payload: AvatarBubblePayload | null,
+    nextLocale: Locale = currentLocale,
+  ): AvatarBubblePayload | null {
     if (!payload) {
       return null;
     }
@@ -223,7 +285,7 @@
     };
   }
 
-  function formatFocusCountdown(ms) {
+  function formatFocusCountdown(ms: number): string {
     const safeMs = Math.max(0, ms);
     const totalSeconds = Math.ceil(safeMs / 1000);
     const minutes = Math.floor(totalSeconds / 60);
@@ -231,7 +293,7 @@
     return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
   }
 
-  function buildFocusBubblePayload(session) {
+  function buildFocusBubblePayload(session: AvatarFocusSession | null): AvatarBubblePayload | null {
     if (!session) {
       return null;
     }
@@ -255,8 +317,102 @@
   $: bubble = localizeBubblePayload(focusBubble || bubbleSource, currentLocale);
   $: followupCopy = buildFollowupCopy(followup);
   $: syncAvatarExpansion(followup != null);
+  $: {
+    // 以下状态均可能改变通知区域的位置或尺寸，DOM 更新后统一重新采集。
+    void bubble;
+    void followup;
+    void bubbleFlipLeft;
+    void currentLocale;
+    void state.avatarBodyHidden;
+    scheduleInteractiveRegionsSync();
+  }
 
-  async function syncAvatarExpansion(expanded, options = {}) {
+  function refreshInteractiveRegionObserver(elements: Element[]): void {
+    const unchanged =
+      elements.length === interactiveRegionElements.length
+      && elements.every((element, index) => element === interactiveRegionElements[index]);
+
+    if (unchanged) {
+      return;
+    }
+
+    interactiveRegionObserver?.disconnect();
+    interactiveRegionElements = elements;
+    for (const element of elements) {
+      interactiveRegionObserver?.observe(element);
+    }
+  }
+
+  async function syncAvatarInteractiveRegions(): Promise<void> {
+    if (interactiveRegionSyncPending) {
+      interactiveRegionSyncRequested = true;
+      return;
+    }
+
+    interactiveRegionSyncPending = true;
+    try {
+      do {
+        interactiveRegionSyncRequested = false;
+        await tick();
+
+        if (!interactiveRegionsMounted) {
+          return;
+        }
+
+        const elements = Array.from(
+          document.querySelectorAll('[data-avatar-hit-region]'),
+        );
+        refreshInteractiveRegionObserver(elements);
+
+        const regions = elements
+          .map((element) => {
+            const rect = element.getBoundingClientRect();
+            return {
+              x: rect.x,
+              y: rect.y,
+              width: rect.width,
+              height: rect.height,
+            };
+          })
+          .filter((region) => region.width > 0 && region.height > 0);
+
+        try {
+          await invoke('set_avatar_interactive_regions', {
+            precise: !!state.avatarBodyHidden,
+            regions,
+          });
+        } catch (e) {
+          console.error('更新桌宠精确交互区域失败:', e);
+        }
+      } while (interactiveRegionSyncRequested && interactiveRegionsMounted);
+    } finally {
+      interactiveRegionSyncPending = false;
+    }
+  }
+
+  function scheduleInteractiveRegionsSync(): void {
+    if (!interactiveRegionsMounted) {
+      return;
+    }
+
+    interactiveRegionSyncRequested = true;
+    if (interactiveRegionSyncPending) {
+      return;
+    }
+
+    if (interactiveRegionFrame !== null) {
+      cancelAnimationFrame(interactiveRegionFrame);
+    }
+    interactiveRegionFrame = requestAnimationFrame(() => {
+      interactiveRegionFrame = null;
+      void syncAvatarInteractiveRegions();
+    });
+  }
+
+  async function syncAvatarExpansion(
+    expanded: boolean,
+    options: AvatarExpansionOptions = {},
+  ): Promise<void> {
     const { force = false } = options;
 
     if (!force && avatarExpanded === expanded) {
@@ -274,16 +430,20 @@
     }
   }
 
-  function scheduleAvatarSizeCorrection() {
+  function scheduleAvatarSizeCorrection(): void {
     if (suppressNextResizeCorrection) {
       return;
     }
 
-    clearTimeout(sizeCorrectionTimer);
+    if (sizeCorrectionTimer !== null) {
+      clearTimeout(sizeCorrectionTimer);
+    }
     sizeCorrectionTimer = setTimeout(async () => {
       const expanded = avatarExpanded === null ? followup != null : avatarExpanded;
       suppressNextResizeCorrection = true;
-      clearTimeout(resizeGuardTimer);
+      if (resizeGuardTimer !== null) {
+        clearTimeout(resizeGuardTimer);
+      }
 
       await syncAvatarExpansion(expanded, { force: true });
 
@@ -294,13 +454,15 @@
     }, 120);
   }
 
-  function clearBubble() {
+  function clearBubble(): void {
     bubbleSource = null;
-    clearTimeout(bubbleTimer);
+    if (bubbleTimer !== null) {
+      clearTimeout(bubbleTimer);
+    }
     bubbleTimer = null;
   }
 
-  function showBubble(payload) {
+  function showBubble(payload: AvatarBubblePayload): void {
     if (payload?.clear) {
       clearBubble();
       return;
@@ -311,7 +473,9 @@
     }
 
     bubbleSource = payload;
-    clearTimeout(bubbleTimer);
+    if (bubbleTimer !== null) {
+      clearTimeout(bubbleTimer);
+    }
 
     if (!payload?.persistent) {
       bubbleTimer = setTimeout(() => {
@@ -321,7 +485,7 @@
     }
   }
 
-  function dismissBubble() {
+  function dismissBubble(): void {
     if (focusSession) {
       stopFocusSession(true);
       return;
@@ -329,15 +493,15 @@
     clearBubble();
   }
 
-  function getFollowupPersonaLabelKey(persona) {
+  function getFollowupPersonaLabelKey(persona: AvatarPersona): string {
     return FOLLOWUP_PERSONA_LABEL_KEY[persona] || FOLLOWUP_PERSONA_LABEL_KEY.assistant;
   }
 
-  function getFollowupLeadKey(persona) {
+  function getFollowupLeadKey(persona: AvatarPersona): string {
     return FOLLOWUP_LEAD_KEY[persona] || FOLLOWUP_LEAD_KEY.assistant;
   }
 
-  function formatFollowupAge(hours) {
+  function formatFollowupAge(hours: number): string {
     const normalizedHours = Number(hours) || 0;
     if (normalizedHours <= 1) {
       return t('settingsAppearance.avatarFollowupAgeRecent');
@@ -345,8 +509,8 @@
     return t('settingsAppearance.avatarFollowupAgeHours', { count: normalizedHours });
   }
 
-  function truncateFollowupTitle(title, maxLength = 34) {
-    const normalized = typeof title === 'string' ? title.trim() : '';
+  function truncateFollowupTitle(title: string, maxLength = 34): string {
+    const normalized = title.trim();
     if (!normalized) {
       return '';
     }
@@ -356,7 +520,7 @@
     return `${normalized.slice(0, Math.max(1, maxLength - 1)).trimEnd()}…`;
   }
 
-  function buildFollowupCopy(payload) {
+  function buildFollowupCopy(payload: AvatarFollowupPayload | null) {
     if (!payload) {
       return null;
     }
@@ -390,11 +554,11 @@
     };
   }
 
-  function getFollowupTheme(persona) {
+  function getFollowupTheme(persona: AvatarPersona): FollowupPersonaTheme {
     return FOLLOWUP_PERSONA_THEME[persona] || FOLLOWUP_PERSONA_THEME.assistant;
   }
 
-  function buildFollowupActionInput(action) {
+  function buildFollowupActionInput(action: AvatarFollowupAction) {
     if (!followup) {
       return null;
     }
@@ -410,27 +574,35 @@
     };
   }
 
-  async function submitFollowupAction(action) {
+  async function submitFollowupAction(
+    action: AvatarFollowupAction,
+  ): Promise<AvatarFollowupPayload | null> {
+    const snapshot = followup;
+    if (!snapshot) {
+      return null;
+    }
+
     const input = buildFollowupActionInput(action);
     if (!input) {
       return null;
     }
 
-    const snapshot = { ...followup };
     await invoke('handle_avatar_followup_action', { input });
     return snapshot;
   }
 
-  function clearFollowup() {
+  function clearFollowup(): void {
     followup = null;
   }
 
-  function clearFocusTimer() {
-    clearInterval(focusTimer);
+  function clearFocusTimer(): void {
+    if (focusTimer !== null) {
+      clearInterval(focusTimer);
+    }
     focusTimer = null;
   }
 
-  function finishFocusSession() {
+  function finishFocusSession(): void {
     const completedSession = focusSession;
     focusSession = null;
     focusNowMs = 0;
@@ -446,7 +618,7 @@
     });
   }
 
-  function ensureFocusTicking() {
+  function ensureFocusTicking(): void {
     clearFocusTimer();
     if (!focusSession) {
       return;
@@ -460,7 +632,7 @@
     }, 1000);
   }
 
-  function stopFocusSession(showEndedBubble = false) {
+  function stopFocusSession(showEndedBubble = false): void {
     if (!focusSession) {
       return;
     }
@@ -596,8 +768,8 @@
     }
   }
 
-  async function startAvatarDrag(event) {
-    const originalEvent = event.detail?.originalEvent ?? event;
+  async function startAvatarDrag(event: AvatarPointerEvent): Promise<void> {
+    const originalEvent = event instanceof CustomEvent ? event.detail.originalEvent : event;
 
     if (originalEvent.button !== 0) {
       return;
@@ -612,12 +784,14 @@
     }
   }
 
-  function scheduleAvatarPositionSave(position) {
+  function scheduleAvatarPositionSave(position: PhysicalPosition): void {
     const nextX = Math.round(position.x);
     const nextY = Math.round(position.y);
     const nextKey = `${nextX},${nextY}`;
 
-    clearTimeout(positionSaveTimer);
+    if (positionSaveTimer !== null) {
+      clearTimeout(positionSaveTimer);
+    }
     positionSaveTimer = setTimeout(async () => {
       if (nextKey === lastSavedPositionKey) {
         return;
@@ -650,8 +824,10 @@
     }
   }
 
-  function scheduleNextMotionStep() {
-    clearTimeout(motionTimer);
+  function scheduleNextMotionStep(): void {
+    if (motionTimer !== null) {
+      clearTimeout(motionTimer);
+    }
     if (document.hidden) {
       motionTimer = null;
       return;
@@ -671,6 +847,11 @@
     let unlistenMoved = () => {};
     let unlistenResized = () => {};
     let unlistenLocaleChanged = () => {};
+    interactiveRegionsMounted = true;
+    interactiveRegionObserver = new ResizeObserver(() => {
+      scheduleInteractiveRegionsSync();
+    });
+    scheduleInteractiveRegionsSync();
     initializeLocale();
     unsubscribeLocale = locale.subscribe((nextLocale) => {
       applyLocaleToDocument(nextLocale);
@@ -684,7 +865,9 @@
 
     handleVisibilityChange = () => {
       if (document.hidden) {
-        clearTimeout(motionTimer);
+        if (motionTimer !== null) {
+          clearTimeout(motionTimer);
+        }
         motionTimer = null;
       } else {
         scheduleNextMotionStep();
@@ -711,13 +894,23 @@
 
     (async () => {
       try {
-        state = await invoke('get_avatar_state');
+        const payload = await invoke<unknown>('get_avatar_state');
+        const nextState = parseAvatarState(payload);
+        if (nextState) {
+          state = nextState;
+        } else {
+          console.warn('桌宠初始状态载荷格式无效，已保留默认状态');
+        }
       } catch (e) {
         console.error('获取桌宠状态失败:', e);
       }
 
-      unlistenState = await appWindow.listen('avatar-state-changed', (event) => {
-        const nextState = event.payload;
+      unlistenState = await appWindow.listen<unknown>('avatar-state-changed', (event) => {
+        const nextState = parseAvatarState(event.payload);
+        if (!nextState) {
+          console.warn('桌宠状态事件载荷格式无效，已忽略');
+          return;
+        }
         const stateChanged =
           nextState.mode !== state.mode || nextState.contextLabel !== state.contextLabel;
         const stateBubble = getAvatarStateBubble(
@@ -750,7 +943,9 @@
           )
         ) {
           transitionClass = transition.className;
-          clearTimeout(transitionTimer);
+          if (transitionTimer !== null) {
+            clearTimeout(transitionTimer);
+          }
           transitionTimer = setTimeout(() => {
             transitionClass = '';
             transitionTimer = null;
@@ -761,27 +956,26 @@
         scheduleNextMotionStep();
       });
 
-      unlistenBubble = await appWindow.listen('avatar-bubble', (event) => {
-        showBubble(event.payload);
+      unlistenBubble = await appWindow.listen<unknown>('avatar-bubble', (event) => {
+        const payload = parseAvatarBubblePayload(event.payload);
+        if (!payload) {
+          console.warn('桌宠气泡事件载荷格式无效，已忽略');
+          return;
+        }
+        showBubble(payload);
       });
 
-      unlistenFollowup = await appWindow.listen('avatar-followup-suggestion', (event) => {
-        followup = event.payload;
+      unlistenFollowup = await appWindow.listen<unknown>('avatar-followup-suggestion', (event) => {
+        const payload = parseAvatarFollowupPayload(event.payload);
+        if (!payload) {
+          console.warn('桌宠跟进事件载荷格式无效，已忽略');
+          return;
+        }
+        followup = payload;
       });
 
-      unlistenInput = await appWindow.listen('avatar-input-changed', (event) => {
-        const payload = event.payload ?? {};
-        inputActivity = {
-          keyboardActive: !!payload.keyboardActive,
-          mouseActive: !!payload.mouseActive,
-          keyboardGroup: payload.keyboardGroup ?? 'idle',
-          keyboardVisualKey: payload.keyboardVisualKey ?? '',
-          mouseGroup: payload.mouseGroup ?? 'idle',
-          cursorRatioX: payload.cursorRatioX ?? 0.5,
-          cursorRatioY: payload.cursorRatioY ?? 0.5,
-          lastKeyboardInputAtMs: payload.lastKeyboardInputAtMs ?? 0,
-          lastMouseInputAtMs: payload.lastMouseInputAtMs ?? 0,
-        };
+      unlistenInput = await appWindow.listen<unknown>('avatar-input-changed', (event) => {
+        inputActivity = normalizeAvatarInputActivity(event.payload);
 
         if (inputActivity.keyboardActive || inputActivity.mouseActive) {
           motionBeat = (motionBeat + 1) % 96;
@@ -805,16 +999,26 @@
       // 这里在 resize 后回正到当前配置尺寸，避免出现“拖一下就变小一圈”。
       unlistenResized = await nativeWindow.onResized(() => {
         scheduleAvatarSizeCorrection();
+        scheduleInteractiveRegionsSync();
       });
     })();
 
     return () => {
-      clearTimeout(bubbleTimer);
-      clearTimeout(transitionTimer);
-      clearTimeout(positionSaveTimer);
-      clearTimeout(motionTimer);
-      clearTimeout(sizeCorrectionTimer);
-      clearTimeout(resizeGuardTimer);
+      interactiveRegionsMounted = false;
+      interactiveRegionSyncRequested = false;
+      if (interactiveRegionFrame !== null) {
+        cancelAnimationFrame(interactiveRegionFrame);
+        interactiveRegionFrame = null;
+      }
+      interactiveRegionObserver?.disconnect();
+      interactiveRegionObserver = null;
+      interactiveRegionElements = [];
+      if (bubbleTimer !== null) clearTimeout(bubbleTimer);
+      if (transitionTimer !== null) clearTimeout(transitionTimer);
+      if (positionSaveTimer !== null) clearTimeout(positionSaveTimer);
+      if (motionTimer !== null) clearTimeout(motionTimer);
+      if (sizeCorrectionTimer !== null) clearTimeout(sizeCorrectionTimer);
+      if (resizeGuardTimer !== null) clearTimeout(resizeGuardTimer);
       clearFocusTimer();
       if (handleVisibilityChange) document.removeEventListener('visibilitychange', handleVisibilityChange);
       if (handleContextMenu) document.removeEventListener('contextmenu', handleContextMenu);
@@ -831,7 +1035,20 @@
   });
 </script>
 
-<div role="presentation" class="relative h-screen w-screen overflow-visible bg-transparent select-none" on:mousedown={(e) => { if (e.target.closest('button, a, section, .avatar-popover-anchor, [role="button"]')) return; startAvatarDrag(e); }}>
+<div
+  role="presentation"
+  class="relative h-screen w-screen overflow-visible bg-transparent select-none"
+  class:pointer-events-none={state.avatarBodyHidden}
+  on:mousedown={(e) => {
+    const target = e.target;
+    if (
+      state.avatarBodyHidden
+      || (target instanceof Element
+        && target.closest('button, a, section, .avatar-popover-anchor, [role="button"]'))
+    ) return;
+    startAvatarDrag(e);
+  }}
+>
   <div class="absolute inset-x-0 top-0 h-[86px] overflow-visible">
     <AvatarPopover {bubble} flipLeft={bubbleFlipLeft} onClose={dismissBubble} />
   </div>
@@ -849,7 +1066,7 @@
 
   {#if !state.avatarBodyHidden}
     <div class="absolute inset-x-0 bottom-0 top-[78px] flex items-end justify-center overflow-visible">
-      <div class="h-full w-[82%]">
+      <div class="h-full w-[82%] pointer-events-auto">
         <AvatarCanvas
           {state}
           {inputActivity}

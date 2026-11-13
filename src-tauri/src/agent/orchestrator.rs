@@ -1,17 +1,17 @@
-//! Stage 5: Orchestrator — Agent 的"指挥官"
+//! Agent 请求编排
 //!
 //! 路由决策：简单 → FastPath，复杂 → AgentPath
-//! 降级策略：Agent 失败 → FastPath → FallbackPath
-//!
-//! 对应 Python: 05_orchestrator.py 里的 Orchestrator 类
+//! 降级策略：工作复盘的 Agent 失败可降级到本地统计，普通聊天只返回通用错误
 
+use super::deadline::Deadline;
 use super::events::{StreamEvent, StreamEventSender};
 use super::executor::{AgentExecutor, AgentRunError};
 use super::model::Message;
-use crate::config::ModelConfig;
-use crate::database::Database;
-use crate::error::AppError;
+use super::{AssistantRequestClassification, AssistantRequestMode};
+use work_review_core::config::ModelConfig;
+use work_review_core::database::Database;
 use work_review_core::database::MemorySearchItem;
+use work_review_core::error::AppError;
 
 // ══════════════════════════════════════════════════════════
 // 路径类型
@@ -34,8 +34,6 @@ pub enum QueryPath {
 #[derive(Debug)]
 pub struct RouteDecision {
     pub path: QueryPath,
-    #[allow(dead_code)] // 路由原因：保留用于调试输出，业务逻辑未读取
-    pub reason: String,
 }
 
 // ══════════════════════════════════════════════════════════
@@ -44,10 +42,13 @@ pub struct RouteDecision {
 
 /// 路由决策 — 根据问题内容判断走哪条路径
 ///
-/// 对应 Python: route_query()
-/// 面试核心：这个函数决定了每个请求的命运。
-/// 规则越简单越好——复杂的判断交给 Agent 自己做。
-pub fn route_query(question: &str, has_model: bool) -> RouteDecision {
+/// 请求模式已由命令入口结合对话历史判定；编排器只执行该决定，不再用另一套
+/// 关键词规则重新猜测模式，避免普通聊天因“今天”等词误入本地工作统计。
+pub fn route_query(
+    question: &str,
+    has_model: bool,
+    request: AssistantRequestClassification,
+) -> RouteDecision {
     let q = question.trim().to_lowercase();
 
     // ── 有模型 → 始终交给 Agent（相信模型）──
@@ -55,12 +56,25 @@ pub fn route_query(question: &str, has_model: bool) -> RouteDecision {
     if has_model {
         return RouteDecision {
             path: QueryPath::Agent,
-            reason: "交给模型判断意图".to_string(),
         };
     }
 
-    // ── 无模型：闲聊 / 身份 / 能力问答 → 直接回答 ──
-    // 基础模板模式仍提供可用的固定回答，避免落入无法使用模型的兜底提示。
+    // 明确动作必须由模型解析并调用动作工具；基础模板不能把它误降级成统计查询。
+    if request.mode == AssistantRequestMode::WorkReview && request.requires_model_action {
+        return RouteDecision {
+            path: QueryPath::Fallback,
+        };
+    }
+
+    // 无模型的工作复盘始终优先使用本地统计。模式已在入口判定，这里不能再被
+    // “天气”等普通聊天词推翻。
+    if request.mode == AssistantRequestMode::WorkReview {
+        return RouteDecision {
+            path: QueryPath::Fast,
+        };
+    }
+
+    // 无模型的普通聊天仅保留无需模型的问候、身份和能力说明。
     let greetings = [
         "你好",
         "嗨",
@@ -88,121 +102,11 @@ pub fn route_query(question: &str, has_model: bool) -> RouteDecision {
     if greetings.iter().any(|g| q.contains(g)) && q.len() < 30 {
         return RouteDecision {
             path: QueryPath::Direct,
-            reason: "身份/问候/能力问答".to_string(),
-        };
-    }
-
-    // ── 无模型（基础模板模式）→ 完整覆盖工作查询的统计模板 ──
-    // 没有模型可用，只能用规则兜底。fast_answer 对任何带时间范围的工作查询都给统一统计
-    // （活动总览 / 分类分布 / Top 应用 / 相关记录），所以这里尽量放宽触发，让"我这周主要做了什么"
-    // "今天怎么样""最近忙啥"等工作查询都能拿到统计；仅明显非工作领域（天气/股票/新闻…）放行到 Fallback。
-    let non_work_signals = [
-        "天气",
-        "股票",
-        "新闻",
-        "笑话",
-        "写诗",
-        "算命",
-        "星座",
-        "汇率",
-        "翻译成",
-    ];
-    if non_work_signals.iter().any(|p| q.contains(p)) {
-        return RouteDecision {
-            path: QueryPath::Fallback,
-            reason: "无模型且明显非工作领域，模板兜底".to_string(),
-        };
-    }
-    let work_signals = [
-        // 时间词（工作查询常带）
-        "今天",
-        "昨天",
-        "前天",
-        "本周",
-        "这周",
-        "上周",
-        "本月",
-        "这个月",
-        "上月",
-        "上个月",
-        "最近",
-        "这几天",
-        "近期",
-        // 「做/干/搞」家族
-        "做了什么",
-        "做了哪些",
-        "主要做了",
-        "干了什么",
-        "搞了什么",
-        // 「忙」家族
-        "忙什么",
-        "忙啥",
-        "忙不忙",
-        "忙吗",
-        // 「总结/小结」家族
-        "总结",
-        "小结",
-        "汇总",
-        // 工作通用
-        "工作",
-        "记录",
-        "待办",
-        "进度",
-        "进展",
-        "回顾",
-        "复盘",
-        "整理",
-        // 「数据/情况/概览」家族
-        "数据",
-        "情况",
-        "概况",
-        "概览",
-        "报告",
-        "汇报",
-        // 「专注/产出」家族
-        "效率",
-        "专注",
-        "产出",
-        "饱和",
-        "摸鱼",
-        "下班",
-        "打卡",
-        "休息",
-        // 「app/软件/程序」家族
-        "应用",
-        "软件",
-        "程序",
-        "工具",
-        "分类",
-        "占比",
-        "比例",
-        // 「时长/多久」家族
-        "时长",
-        "时间",
-        "多久",
-        "小时",
-        "多长",
-        // 「会议」家族
-        "会话",
-        "开会",
-        "会议",
-        "session",
-        // 统计通用
-        "统计",
-        // 「干嘛」家族
-        "干嘛",
-        "干什么",
-    ];
-    if work_signals.iter().any(|p| q.contains(p)) {
-        return RouteDecision {
-            path: QueryPath::Fast,
-            reason: "无模型，工作查询走统计模板".to_string(),
         };
     }
 
     RouteDecision {
         path: QueryPath::Fallback,
-        reason: "无模型，模板兜底".to_string(),
     }
 }
 
@@ -227,11 +131,10 @@ pub struct Orchestrator;
 
 impl Orchestrator {
     /// 处理用户请求的总入口
-    ///
-    /// 对应 Python: Orchestrator.handle()
     #[allow(clippy::too_many_arguments)]
     pub async fn handle(
         question: &str,
+        request: AssistantRequestClassification,
         model_config: Option<&ModelConfig>,
         database: &Database,
         history: &[Message],
@@ -241,13 +144,14 @@ impl Orchestrator {
         web_tools: Option<super::tools::WebToolsConfig>,
         runtime: super::tools::AssistantRuntime,
         event_tx: Option<StreamEventSender>,
+        deadline: Deadline,
     ) -> Result<OrchestratorResult, AppError> {
         let has_model = model_config
             .map(|c| !c.endpoint.trim().is_empty() && !c.model.trim().is_empty())
             .unwrap_or(false);
 
         // ① 路由决策
-        let decision = route_query(question, has_model);
+        let decision = route_query(question, has_model, request);
         ensure_event_receiver_open(&event_tx)?;
 
         // ② 执行对应路径
@@ -284,6 +188,7 @@ impl Orchestrator {
                 // AgentPath：调用 Stage 3 的 AgentExecutor（透传事件通道）
                 match AgentExecutor::run(
                     question,
+                    request.mode,
                     config,
                     database,
                     system_prompt,
@@ -294,6 +199,7 @@ impl Orchestrator {
                     web_tools,
                     runtime,
                     event_tx.clone(),
+                    deadline,
                 )
                 .await
                 {
@@ -311,17 +217,24 @@ impl Orchestrator {
                         Err(event_delivery_error(message))
                     }
                     Err(AgentRunError::Execution(e)) => {
-                        // Agent 失败 → 降级到 FastPath。
-                        // 降级必须对用户可见（此前静默换成规则模板，用户以为 AI 在回答）：
-                        // 前置一行说明失败类别，完整错误进日志。
-                        log::warn!("Agent 路径失败，降级到本地统计: {e}");
+                        // 只有工作复盘允许读取本地记录并降级；普通聊天仅返回通用
+                        // 模型错误，避免失败路径意外访问或展示用户的工作数据。
+                        log::warn!("Agent 路径失败（模式: {:?}）: {e}", request.mode);
                         ensure_event_receiver_open(&event_tx)?;
-                        let reason = degrade_reason_summary(&e.to_string());
-                        let fast = fast_answer(question, database, ignored_apps, excluded_domains)?;
-                        let answer = format!(
-                            "⚠️ AI 模型调用失败（{reason}），已切换为本地统计模式。可稍后重试或到「设置 → AI 模型」检查配置。\n\n{fast}"
-                        );
-                        let tool_labels = vec!["降级查询".to_string()];
+                        let policy = agent_failure_policy(request.mode);
+                        let local_work_stats = if policy.uses_local_work_stats() {
+                            Some(fast_answer(
+                                question,
+                                database,
+                                ignored_apps,
+                                excluded_domains,
+                            )?)
+                        } else {
+                            None
+                        };
+                        let answer =
+                            policy.user_message(&e.to_string(), local_work_stats.as_deref());
+                        let tool_labels = vec![policy.tool_label().to_string()];
                         emit_done(&event_tx, &answer, &[], &tool_labels).await?;
                         Ok(OrchestratorResult {
                             answer,
@@ -344,6 +257,47 @@ impl Orchestrator {
                     references: vec![],
                 })
             }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentFailurePolicy {
+    LocalWorkStats,
+    GeneralError,
+}
+
+fn agent_failure_policy(request_mode: AssistantRequestMode) -> AgentFailurePolicy {
+    match request_mode {
+        AssistantRequestMode::WorkReview => AgentFailurePolicy::LocalWorkStats,
+        AssistantRequestMode::GeneralChat => AgentFailurePolicy::GeneralError,
+    }
+}
+
+impl AgentFailurePolicy {
+    fn uses_local_work_stats(self) -> bool {
+        matches!(self, Self::LocalWorkStats)
+    }
+
+    fn user_message(self, error: &str, local_work_stats: Option<&str>) -> String {
+        let reason = degrade_reason_summary(error);
+        match self {
+            Self::LocalWorkStats => {
+                let stats = local_work_stats.unwrap_or("本地工作统计暂时也无法读取。");
+                format!(
+                    "⚠️ AI 模型调用失败（{reason}），已切换为本地统计模式。可稍后重试或到「设置 → AI 模型」检查配置。\n\n{stats}"
+                )
+            }
+            Self::GeneralError => format!(
+                "⚠️ AI 模型调用失败（{reason}）。请稍后重试，或到「设置 → AI 模型」检查配置。"
+            ),
+        }
+    }
+
+    fn tool_label(self) -> &'static str {
+        match self {
+            Self::LocalWorkStats => "降级查询",
+            Self::GeneralError => "模型错误",
         }
     }
 }
@@ -666,8 +620,9 @@ fn fallback_answer(question: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::AiProvider;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use crate::agent::AssistantRequestMode;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use work_review_core::config::AiProvider;
 
     fn test_database(name: &str) -> Database {
         let unique = SystemTime::now()
@@ -680,46 +635,101 @@ mod tests {
 
     #[test]
     fn test_route_greeting_without_model() {
-        let d = route_query("你好", false);
+        let d = route_query(
+            "你好",
+            false,
+            AssistantRequestClassification::general_chat(),
+        );
         assert_eq!(d.path, QueryPath::Direct);
     }
 
     #[test]
     fn test_route_simple_time_query() {
         // 简化后：有模型即交给 Agent，由模型决定是否调用工作记录工具。
-        let d = route_query("今天做了什么", true);
+        let d = route_query(
+            "今天做了什么",
+            true,
+            AssistantRequestClassification::work_review(false),
+        );
         assert_eq!(d.path, QueryPath::Agent);
     }
 
     #[test]
     fn test_route_simple_time_query_month() {
-        let d = route_query("这个月的时间分布", true);
+        let d = route_query(
+            "这个月的时间分布",
+            true,
+            AssistantRequestClassification::work_review(false),
+        );
         assert_eq!(d.path, QueryPath::Agent);
     }
 
     #[test]
     fn test_route_non_work_weather_uses_agent() {
         // 非工作问题（天气）也交给模型，不再被时间词"今天"误判为工作查询。
-        let d = route_query("今天天气怎么样", true);
+        let d = route_query(
+            "今天天气怎么样",
+            true,
+            AssistantRequestClassification::general_chat(),
+        );
         assert_eq!(d.path, QueryPath::Agent);
     }
 
     #[test]
     fn test_route_non_work_weather_no_model_fallback() {
         // 无模型时无法由模型判断，走模板兜底。
-        let d = route_query("今天天气怎么样", false);
+        let d = route_query(
+            "今天天气怎么样",
+            false,
+            AssistantRequestClassification::general_chat(),
+        );
         assert_eq!(d.path, QueryPath::Fallback);
     }
 
     #[test]
+    fn 无模型时工作复盘的模糊近况应走本地统计() {
+        let d = route_query(
+            "最近怎么样？",
+            false,
+            AssistantRequestClassification::work_review(false),
+        );
+
+        assert_eq!(d.path, QueryPath::Fast);
+    }
+
+    #[test]
+    fn 无模型时普通聊天不得因时间词误入本地统计() {
+        for question in ["今天几号？", "帮我写诗"] {
+            let d = route_query(
+                question,
+                false,
+                AssistantRequestClassification::general_chat(),
+            );
+            assert_eq!(
+                d.path,
+                QueryPath::Fallback,
+                "普通聊天「{question}」无模型时应走通用兜底"
+            );
+        }
+    }
+
+    #[test]
     fn test_route_complex_comparison() {
-        let d = route_query("对比上个月和这个月的工作效率", true);
+        let d = route_query(
+            "对比上个月和这个月的工作效率",
+            true,
+            AssistantRequestClassification::work_review(false),
+        );
         assert_eq!(d.path, QueryPath::Agent);
     }
 
     #[test]
     fn test_route_complex_why() {
-        let d = route_query("为什么最近编码时间下降了", true);
+        let d = route_query(
+            "为什么最近编码时间下降了",
+            true,
+            AssistantRequestClassification::work_review(false),
+        );
         assert_eq!(d.path, QueryPath::Agent);
     }
 
@@ -727,7 +737,11 @@ mod tests {
     fn test_route_multi_time_periods() {
         // 这个问题同时命中"变化"（规则2）和"上月+这个月"（规则3）
         // 规则2先匹配，所以走 Agent 路径，理由是"复杂意图"
-        let d = route_query("上个月和这个月有什么变化", true);
+        let d = route_query(
+            "上个月和这个月有什么变化",
+            true,
+            AssistantRequestClassification::work_review(false),
+        );
         assert_eq!(d.path, QueryPath::Agent);
         // 两个规则都可能命中，关键是走了 Agent 路径
     }
@@ -735,41 +749,65 @@ mod tests {
     #[test]
     fn test_route_pure_multi_time_periods() {
         // 简化后统一交给模型，不再按时间段数量分流。
-        let d = route_query("上个月和这个月的工作记录", true);
+        let d = route_query(
+            "上个月和这个月的工作记录",
+            true,
+            AssistantRequestClassification::work_review(false),
+        );
         assert_eq!(d.path, QueryPath::Agent);
     }
 
     #[test]
     fn test_route_no_model_time_word_fast() {
         // 放宽后：含时间词的工作查询走 Fast（基础模板给统计），不再 Fallback。
-        let d = route_query("对比上个月和这个月", false);
+        let d = route_query(
+            "对比上个月和这个月",
+            false,
+            AssistantRequestClassification::work_review(false),
+        );
         assert_eq!(d.path, QueryPath::Fast);
     }
 
     #[test]
     fn test_route_no_model_work_query_fast() {
         // 无模型（基础模板）：明确工作查询走 FastPath 统计模板，得到有意义内容。
-        let d = route_query("我这周主要做了什么", false);
+        let d = route_query(
+            "我这周主要做了什么",
+            false,
+            AssistantRequestClassification::work_review(false),
+        );
         assert_eq!(d.path, QueryPath::Fast);
     }
 
     #[test]
     fn test_route_no_model_non_work_fallback() {
         // 无模型且非明确工作查询 → 模板兜底指引。
-        let d = route_query("随便聊聊", false);
+        let d = route_query(
+            "随便聊聊",
+            false,
+            AssistantRequestClassification::general_chat(),
+        );
         assert_eq!(d.path, QueryPath::Fallback);
     }
 
     #[test]
     fn test_route_unknown_with_model() {
-        let d = route_query("帮我看看效率情况", true);
+        let d = route_query(
+            "帮我看看效率情况",
+            true,
+            AssistantRequestClassification::work_review(false),
+        );
         assert_eq!(d.path, QueryPath::Agent); // 兜底走 Agent
     }
 
     #[test]
     fn test_route_unknown_without_model() {
         // 放宽后："效率"是工作信号 → 无模型走 Fast（基础模板给统计）。
-        let d = route_query("帮我看看效率情况", false);
+        let d = route_query(
+            "帮我看看效率情况",
+            false,
+            AssistantRequestClassification::work_review(false),
+        );
         assert_eq!(d.path, QueryPath::Fast);
     }
 
@@ -795,7 +833,7 @@ mod tests {
         ];
         for q in cases {
             assert_eq!(
-                route_query(q, false).path,
+                route_query(q, false, AssistantRequestClassification::work_review(false)).path,
                 QueryPath::Fast,
                 "「{q}」应走 FastPath"
             );
@@ -804,27 +842,99 @@ mod tests {
 
     #[test]
     fn 已选择模型时身份与问候问题应交给_agent() {
-        assert_eq!(route_query("你是谁", true).path, QueryPath::Agent);
-        assert_eq!(route_query("你好", true).path, QueryPath::Agent);
+        assert_eq!(
+            route_query(
+                "你是谁",
+                true,
+                AssistantRequestClassification::general_chat()
+            )
+            .path,
+            QueryPath::Agent
+        );
+        assert_eq!(
+            route_query("你好", true, AssistantRequestClassification::general_chat()).path,
+            QueryPath::Agent
+        );
     }
 
     #[test]
     fn 基础模板模式下身份问题应走直接回答路径() {
         // "你是谁"在基础模板模式下曾被误判到 FallbackPath，
         // 回出"无法使用 AI 模型分析"的蠢回答（issue 截图）。
-        assert_eq!(route_query("你是谁", false).path, QueryPath::Direct);
-        assert_eq!(route_query("你是什么", false).path, QueryPath::Direct);
-        assert_eq!(route_query("你叫什么名字", false).path, QueryPath::Direct);
-        assert_eq!(route_query("who are you", false).path, QueryPath::Direct);
+        assert_eq!(
+            route_query(
+                "你是谁",
+                false,
+                AssistantRequestClassification::general_chat()
+            )
+            .path,
+            QueryPath::Direct
+        );
+        assert_eq!(
+            route_query(
+                "你是什么",
+                false,
+                AssistantRequestClassification::general_chat()
+            )
+            .path,
+            QueryPath::Direct
+        );
+        assert_eq!(
+            route_query(
+                "你叫什么名字",
+                false,
+                AssistantRequestClassification::general_chat()
+            )
+            .path,
+            QueryPath::Direct
+        );
+        assert_eq!(
+            route_query(
+                "who are you",
+                false,
+                AssistantRequestClassification::general_chat()
+            )
+            .path,
+            QueryPath::Direct
+        );
     }
 
     #[test]
     fn 能力类问题应走直接回答路径() {
-        assert_eq!(route_query("你能干什么", false).path, QueryPath::Direct);
-        assert_eq!(route_query("你会什么", false).path, QueryPath::Direct);
-        assert_eq!(route_query("介绍一下你自己", false).path, QueryPath::Direct);
         assert_eq!(
-            route_query("what can you do", false).path,
+            route_query(
+                "你能干什么",
+                false,
+                AssistantRequestClassification::general_chat()
+            )
+            .path,
+            QueryPath::Direct
+        );
+        assert_eq!(
+            route_query(
+                "你会什么",
+                false,
+                AssistantRequestClassification::general_chat()
+            )
+            .path,
+            QueryPath::Direct
+        );
+        assert_eq!(
+            route_query(
+                "介绍一下你自己",
+                false,
+                AssistantRequestClassification::general_chat()
+            )
+            .path,
+            QueryPath::Direct
+        );
+        assert_eq!(
+            route_query(
+                "what can you do",
+                false,
+                AssistantRequestClassification::general_chat()
+            )
+            .path,
             QueryPath::Direct
         );
     }
@@ -866,6 +976,43 @@ mod tests {
     }
 
     #[test]
+    fn 普通聊天模型失败策略不得读取或展示本地工作统计() {
+        let policy = agent_failure_policy(AssistantRequestMode::GeneralChat);
+        assert!(
+            !policy.uses_local_work_stats(),
+            "普通聊天失败后不得查询本地工作统计"
+        );
+
+        let answer = policy.user_message(
+            "连接超时",
+            Some("【不应展示的工作统计】今天使用 Code 8 小时"),
+        );
+        assert!(
+            !answer.contains("不应展示的工作统计") && !answer.contains("Code 8 小时"),
+            "普通聊天失败提示不得泄露工作统计，实际: {answer}"
+        );
+        assert!(
+            answer.contains("AI") || answer.contains("模型"),
+            "普通聊天失败时应返回清晰的通用模型失败提示，实际: {answer}"
+        );
+    }
+
+    #[test]
+    fn 工作复盘模型失败策略应保留本地统计降级() {
+        let policy = agent_failure_policy(AssistantRequestMode::WorkReview);
+        assert!(
+            policy.uses_local_work_stats(),
+            "工作复盘失败后应继续提供本地统计降级"
+        );
+
+        let answer = policy.user_message("连接超时", Some("【本地统计降级】今天使用 Code 8 小时"));
+        assert!(
+            answer.contains("本地统计降级") && answer.contains("Code 8 小时"),
+            "工作复盘失败提示应包含本地统计结果，实际: {answer}"
+        );
+    }
+
+    #[test]
     fn test_direct_answer_greeting() {
         let answer = direct_answer("你好");
         assert!(answer.contains("工作助手"));
@@ -896,6 +1043,7 @@ mod tests {
 
         let handle = Orchestrator::handle(
             "你好",
+            AssistantRequestClassification::general_chat(),
             None,
             &database,
             &history,
@@ -905,6 +1053,7 @@ mod tests {
             None,
             Default::default(),
             Some(tx),
+            Deadline::after(Duration::from_secs(120)),
         );
         let receive = async {
             assert!(matches!(
@@ -935,6 +1084,7 @@ mod tests {
 
         let handle = Orchestrator::handle(
             "你好",
+            AssistantRequestClassification::general_chat(),
             None,
             &database,
             &history,
@@ -944,6 +1094,7 @@ mod tests {
             None,
             Default::default(),
             Some(tx),
+            Deadline::after(Duration::from_secs(120)),
         );
         let reject = async {
             let envelope = rx.recv().await.expect("应收到 Done 事件");
@@ -970,6 +1121,7 @@ mod tests {
             endpoint: "not-a-valid-url".to_string(),
             api_key: None,
             model: "test-model".to_string(),
+            ..ModelConfig::default_text()
         };
         let (tx, rx) = StreamEventSender::channel(1);
         drop(rx);
@@ -978,6 +1130,7 @@ mod tests {
 
         let error = Orchestrator::handle(
             "分析一下我的工作",
+            AssistantRequestClassification::work_review(false),
             Some(&model_config),
             &database,
             &history,
@@ -987,6 +1140,7 @@ mod tests {
             None,
             Default::default(),
             Some(tx),
+            Deadline::after(Duration::from_secs(120)),
         )
         .await
         .expect_err("接收端关闭时应终止，而不是继续模型或降级流程");
@@ -995,5 +1149,37 @@ mod tests {
             error.to_string().contains("事件接收端已关闭"),
             "应保留关闭原因，实际: {error}"
         );
+    }
+
+    #[test]
+    fn 基础模板不能把需要模型的工作动作误执行为统计查询() {
+        for question in [
+            "暂停记录",
+            "恢复记录",
+            "提醒我明天提交周报",
+            "新增待办：整理复盘材料",
+            "修改应用分类",
+            "把 Chrome 归到开发类",
+            "打开时间线",
+            "带我看看昨天的记录",
+            "生成今天的日报",
+            "请记住：我偏好简洁回答",
+            "以后记得先给结论",
+            "保存这个偏好",
+            "保存为长期记忆",
+            "加入长期记忆",
+            "请忘掉记忆 12",
+        ] {
+            assert_eq!(
+                route_query(
+                    question,
+                    false,
+                    AssistantRequestClassification::work_review(true)
+                )
+                .path,
+                QueryPath::Fallback,
+                "需要模型执行的动作不得误走统计模板: {question}"
+            );
+        }
     }
 }

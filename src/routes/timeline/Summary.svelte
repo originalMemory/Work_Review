@@ -1,8 +1,8 @@
-<script>
+<script lang="ts">
   import { onMount } from 'svelte';
   import { replace, params } from 'svelte-spa-router';
-  import { t } from '$lib/i18n/index.js';
-  import { isValidLocalDateString } from '$lib/utils/dateValidation.js';
+  import { t } from '$lib/i18n/index.ts';
+  import { isValidLocalDateString } from '$lib/utils/dateValidation.ts';
 
   function getLocalDateString() {
     const now = new Date();
@@ -45,7 +45,7 @@
     height: 1.25rem;
     border: 2px solid rgba(120, 113, 108, 0.24);
     border-top-color: #d97706;
-    border-radius: 999px;
+    border-radius: var(--radius-full);
     animation: summary-route-spin 700ms linear infinite;
   }
 

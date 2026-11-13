@@ -1,19 +1,40 @@
-<script>
+<script lang="ts">
   import { link, location } from 'svelte-spa-router';
   import { invoke } from '@tauri-apps/api/core';
   import { emitTo } from '@tauri-apps/api/event';
   import { createEventDispatcher } from 'svelte';
-  import { getLocaleLabel, locale, setLocale, t } from '$lib/i18n/index.js';
+  import {
+    getLocaleLabel,
+    locale,
+    setLocale,
+    t,
+    type InterpolationParams,
+    type Locale,
+  } from '$lib/i18n/index.ts';
+
+  type Theme = 'system' | 'light' | 'dark';
+
+  interface NavItem {
+    path: string;
+    labelKey: string;
+    icon: 'home' | 'timeline' | 'report' | 'ask' | 'settings' | 'info';
+  }
+
+  interface LocaleOption {
+    value: Locale;
+    label: string;
+    fullLabelKey: string;
+  }
 
   export let isRecording = true;
   export let isPaused = false;
-  export let theme = 'system';
+  export let theme: Theme = 'system';
   
-  const dispatch = createEventDispatcher();
+  const dispatch = createEventDispatcher<{ themeChange: Theme }>();
   let localeMenuOpen = false;
-  let localeMenuContainer;
+  let localeMenuContainer: HTMLElement | null = null;
 
-  const navItems = [
+  const navItems: NavItem[] = [
     { path: '/', labelKey: 'sidebar.nav.overview', icon: 'home' },
     { path: '/timeline', labelKey: 'sidebar.nav.timeline', icon: 'timeline' },
     { path: '/report', labelKey: 'sidebar.nav.report', icon: 'report' },
@@ -23,11 +44,11 @@
   ];
 
   $: currentLocale = $locale;
-  $: translate = (key, params = {}) => {
+  $: translate = (key: string, params: InterpolationParams = {}) => {
     currentLocale;
     return t(key, params);
   };
-  const localeOptionsBase = [
+  const localeOptionsBase: LocaleOption[] = [
     { value: 'zh-CN', label: 'ZH', fullLabelKey: 'sidebar.localeNames.zhCN' },
     { value: 'en', label: 'EN', fullLabelKey: 'sidebar.localeNames.en' },
     { value: 'zh-TW', label: 'TW', fullLabelKey: 'sidebar.localeNames.zhTW' },
@@ -39,18 +60,18 @@
   }));
   $: currentLocaleLabel = getLocaleLabel(currentLocale);
 
-  function cycleTheme() {
-    const themes = ['system', 'light', 'dark'];
+  function cycleTheme(): void {
+    const themes: Theme[] = ['system', 'light', 'dark'];
     const currentIndex = themes.indexOf(theme);
-    const nextTheme = themes[(currentIndex + 1) % themes.length];
+    const nextTheme = themes[(currentIndex + 1) % themes.length] ?? 'system';
     dispatch('themeChange', nextTheme);
   }
 
-  function toggleLocaleMenu() {
+  function toggleLocaleMenu(): void {
     localeMenuOpen = !localeMenuOpen;
   }
 
-  function selectLocale(nextLocale) {
+  function selectLocale(nextLocale: Locale): void {
     const normalizedLocale = setLocale(nextLocale);
     localeMenuOpen = false;
     emitTo('avatar', 'locale-changed', normalizedLocale).catch((error) => {
@@ -61,15 +82,18 @@
     });
   }
 
-  function handleWindowClick(event) {
-    if (!localeMenuOpen || localeMenuContainer?.contains(event.target)) {
+  function handleWindowClick(event: MouseEvent): void {
+    if (
+      !localeMenuOpen
+      || (event.target instanceof Node && localeMenuContainer?.contains(event.target))
+    ) {
       return;
     }
 
     localeMenuOpen = false;
   }
 
-  function handleWindowKeydown(event) {
+  function handleWindowKeydown(event: KeyboardEvent): void {
     if (event.key === 'Escape') {
       localeMenuOpen = false;
     }
@@ -87,7 +111,7 @@
     }
   }
 
-  $: activeStates = navItems.reduce((acc, item) => {
+  $: activeStates = navItems.reduce<Record<string, boolean>>((acc, item) => {
     const loc = $location || '/';
     if (item.path === '/') {
       acc[item.path] = loc === '/';
@@ -134,7 +158,7 @@
         </div>
         <button
           on:click={toggleRecording}
-          class="sidebar-recording-toggle mt-0.5 shrink-0 px-3 py-1.5 text-[11px] font-semibold rounded-full transition-all
+          class="sidebar-recording-toggle mt-0.5 shrink-0 px-3 py-1.5 text-[11px] font-semibold rounded-lg transition-all
             {isPaused 
               ? 'bg-emerald-100 text-emerald-700 hover:bg-emerald-200 dark:bg-emerald-900/40 dark:text-emerald-300' 
               : 'bg-slate-100 text-slate-700 hover:bg-slate-200 dark:bg-[#30363d] dark:text-[#adbac7]'}"
@@ -165,15 +189,13 @@
         {#each navItems as item}
           <li>
             <a href={item.path} use:link
+              aria-label={translate(item.labelKey)}
+              aria-current={activeStates[item.path] ? 'page' : undefined}
               class="group sidebar-nav-item
                 {activeStates[item.path]
                   ? 'sidebar-nav-item-active'
                   : 'sidebar-nav-item-idle'}">
 
-              {#if activeStates[item.path]}
-                <!-- 当前页指示条：三套 ui-style 各有专属样式（app.css .sidebar-nav-rail） -->
-                <span class="sidebar-nav-rail" aria-hidden="true"></span>
-              {/if}
               <div class="sidebar-nav-main">
                 <!-- SVG 图标 -->
                 <div class="sidebar-nav-icon {activeStates[item.path] ? 'text-indigo-600 dark:text-indigo-400' : 'text-slate-400 group-hover:text-slate-500 dark:group-hover:text-slate-400'}">
@@ -220,7 +242,7 @@
         <div class="relative" bind:this={localeMenuContainer}>
           <button
             type="button"
-            class="sidebar-locale-switch locale-switch inline-flex h-8 min-w-[72px] items-center justify-center gap-1.5 rounded-full border border-slate-200/80 bg-white/90 px-3 text-[11px] font-semibold tracking-normal text-slate-700 shadow-[inset_0_1px_0_rgba(255,255,255,0.6)] outline-none dark:shadow-none transition hover:border-slate-300 hover:text-slate-900 focus:ring-2 focus:ring-slate-300 dark:border-[#30363d]/80 dark:bg-[#161b22]/80 dark:text-[#c9d1d9] dark:hover:border-[#484f58] dark:hover:text-[#e6edf3] dark:focus:ring-primary-600"
+            class="sidebar-locale-switch locale-switch inline-flex h-8 min-w-[72px] items-center justify-center gap-1.5 rounded-lg border border-slate-200/80 bg-white/90 px-3 text-[11px] font-semibold tracking-normal text-slate-700 shadow-[inset_0_1px_0_rgba(255,255,255,0.6)] outline-none dark:shadow-none transition hover:border-slate-300 hover:text-slate-900 focus:ring-2 focus:ring-slate-300 dark:border-[#30363d]/80 dark:bg-[#161b22]/80 dark:text-[#c9d1d9] dark:hover:border-[#484f58] dark:hover:text-[#e6edf3] dark:focus:ring-primary-600"
             aria-label={translate('sidebar.localeButtonTitle')}
             aria-haspopup="menu"
             aria-expanded={localeMenuOpen}
@@ -239,7 +261,7 @@
 
           {#if localeMenuOpen}
             <div
-              class="absolute bottom-full start-0 mb-2 min-w-[148px] rounded-2xl border border-slate-200/80 bg-white/96 p-1.5 shadow-xl dark:shadow-[0_12px_32px_rgba(0,0,0,0.5)] backdrop-blur dark:border-[#30363d]/80 dark:bg-[#161b22]/96"
+              class="absolute bottom-full start-0 mb-2 min-w-[148px] rounded-[var(--radius-md)] border border-slate-200/80 bg-white/96 p-1.5 shadow-xl dark:shadow-[0_12px_32px_rgba(0,0,0,0.5)] backdrop-blur dark:border-[#30363d]/80 dark:bg-[#161b22]/96"
               role="menu"
             >
               {#each localeOptions as option}

@@ -1,24 +1,134 @@
-<script>
+<script lang="ts">
   import { createEventDispatcher } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { ask, open as openDialog } from '@tauri-apps/plugin-dialog';
-  import { cache } from '../../../lib/stores/cache.js';
-  import { locale, t } from '$lib/i18n/index.js';
-  import { showToast } from '$lib/stores/toast.js';
+  import { cache } from '../../../lib/stores/cache.ts';
+  import { locale, t } from '$lib/i18n/index.ts';
+  import { showToast } from '$lib/stores/toast.ts';
   import CollapsibleSection from '../../../lib/components/CollapsibleSection.svelte';
+
+  interface ScreenshotStorageSettings {
+    screenshots_enabled: boolean;
+    screenshot_retention_days: number;
+    metadata_cleanup_enabled: boolean;
+    metadata_retention_days: number;
+    screenshot_display_mode: string;
+    screenshot_width_mode: string;
+    max_image_width: number;
+    storage_limit_mb: number;
+  }
+
+  interface S3StorageSettings {
+    endpoint?: string;
+    bucket?: string;
+    access_key?: string;
+    secret_key?: string;
+    region?: string;
+    path_prefix?: string;
+    public_url_base?: string;
+  }
+
+  interface WebDavStorageSettings {
+    url?: string;
+    username?: string;
+    password?: string;
+    path_prefix?: string;
+    public_url_base?: string;
+  }
+
+  interface RemoteStorageSettings {
+    provider: string;
+    s3: S3StorageSettings;
+    webdav: WebDavStorageSettings;
+    sync_app_config?: boolean;
+  }
+
+  interface SyncConfig {
+    enabled: boolean;
+    server_url: string;
+    sync_token: string;
+    device_id: string;
+    device_name: string;
+    sync_interval_minutes: number;
+    sync_screenshots_mode: string;
+    last_push_timestamp: number;
+    last_pull_timestamp: number;
+    activity_push_cursor: number;
+    activity_pull_cursor: number;
+    report_pull_cursor: number;
+    summary_pull_cursor: number;
+    category_pull_cursor: number;
+    screenshot_push_cursor: number;
+    pending_screenshot_uploads: string[];
+    pending_screenshot_downloads: string[];
+  }
+
+  interface StorageConfig {
+    sync: SyncConfig;
+    screenshot_interval: number;
+    storage: ScreenshotStorageSettings;
+    daily_report_export_dir: string | null;
+    daily_report_auto_export: boolean;
+    remote_storage?: RemoteStorageSettings;
+  }
+
+  interface StorageStats {
+    total_size_mb: number;
+    storage_limit_mb: number;
+    retention_days: number;
+    total_files: number;
+  }
+
+  interface ScreenshotMode {
+    value: string;
+    labelKey: string;
+    descriptionKey: string;
+  }
+
+  interface LocalizedScreenshotMode extends ScreenshotMode {
+    label: string;
+    description: string;
+  }
+
+  interface ChangeDataDirResult {
+    dataDir: string;
+    oldDataDir?: string;
+    copiedFiles: number;
+    replacedExistingData?: boolean;
+    message: string;
+  }
+
+  interface ClearOldActivitiesResult {
+    deleted_activities: number;
+    deleted_screenshots: number;
+    failed_screenshot_paths: string[];
+    kept_dates: string[];
+    message: string;
+  }
+
+  interface CleanupOldDataDirResult {
+    removedEntries: number;
+    preservedEntries: string[];
+    message: string;
+  }
   
-  export let config;
-  export let storageStats = null;
+  export let config: StorageConfig;
+  export let storageStats: StorageStats | null = null;
   export let dataDir = '';
   export let defaultDataDir = '';
   
-  const dispatch = createEventDispatcher();
+  const dispatch = createEventDispatcher<{
+    change: StorageConfig;
+    clearCache: void;
+    dataDirChanged: ChangeDataDirResult;
+  }>();
   $: currentLocale = $locale;
   let isClearing = false;
+  let isConfirmingMetadataCleanup = false;
   let isMigrating = false;
   let isCleaningPreviousDir = false;
   let cleanupCandidateDir = '';
-  let localizedScreenshotModes = [];
+  let localizedScreenshotModes: LocalizedScreenshotMode[] = [];
   let screenshotIntervalLabel = '';
   let retentionDaysLabel = '';
   let storageRetentionLabel = '';
@@ -34,7 +144,7 @@
     { value: 'thumbnail', labelKey: 'settingsStorage.syncScreenshotsThumbnail' },
     { value: 'none', labelKey: 'settingsStorage.syncScreenshotsNone' },
   ];
-  const screenshotModes = [
+  const screenshotModes: ScreenshotMode[] = [
     {
       value: 'active_window',
       labelKey: 'settingsStorage.modeActiveWindow',
@@ -61,6 +171,27 @@
     dispatch('clearCache');
   }
 
+  async function toggleMetadataCleanup() {
+    if (isConfirmingMetadataCleanup) return;
+    if (config.storage.metadata_cleanup_enabled) {
+      config.storage.metadata_cleanup_enabled = false;
+      handleChange();
+      return;
+    }
+    isConfirmingMetadataCleanup = true;
+    try {
+      const confirmed = await ask(t('settingsStorage.metadataCleanupConfirm'), {
+        title: t('settingsStorage.metadataCleanup'),
+        kind: 'warning',
+      });
+      if (!confirmed) return;
+      config.storage.metadata_cleanup_enabled = true;
+      handleChange();
+    } finally {
+      isConfirmingMetadataCleanup = false;
+    }
+  }
+
   async function clearOldData() {
     const confirmed = await ask(t('settingsStorage.clearHistoryConfirmMessage'), {
       title: t('settingsStorage.clearHistoryConfirmTitle'),
@@ -73,7 +204,7 @@
     
     isClearing = true;
     try {
-      await invoke('clear_old_activities');
+      await invoke<ClearOldActivitiesResult>('clear_old_activities');
       showToast(t('settingsStorage.clearDone'), 'success');
       cache.clear();
       dispatch('clearCache');
@@ -84,7 +215,7 @@
     }
   }
 
-  async function migrateToDataDir(targetDir) {
+  async function migrateToDataDir(targetDir: string) {
     const nextDir = targetDir?.trim();
     if (!nextDir) {
       return;
@@ -109,7 +240,7 @@
 
     isMigrating = true;
     try {
-      const result = await invoke('change_data_dir', { targetDir: nextDir });
+      const result = await invoke<ChangeDataDirResult>('change_data_dir', { targetDir: nextDir });
       cleanupCandidateDir = result?.oldDataDir || dataDir;
       showToast(t('settingsStorage.migrated'), 'success');
       dispatch('dataDirChanged', result);
@@ -140,7 +271,7 @@
 
   async function openCurrentDataDir() {
     try {
-      await invoke('open_data_dir');
+      await invoke<void>('open_data_dir');
     } catch (e) {
       showToast(t('settingsStorage.openDirFailed', { error: e }), 'error');
     }
@@ -166,7 +297,7 @@
 
     isCleaningPreviousDir = true;
     try {
-      await invoke('cleanup_old_data_dir', { targetDir });
+      await invoke<CleanupOldDataDirResult>('cleanup_old_data_dir', { targetDir });
       cleanupCandidateDir = '';
       showToast(t('settingsStorage.oldDirCleaned'), 'success');
     } catch (e) {
@@ -176,7 +307,7 @@
     }
   }
 
-  function handleChange() {
+  function handleChange(_event?: Event) {
     dispatch('change', config);
   }
 
@@ -205,7 +336,7 @@
     try {
       // 传入表单当前值直接测试：设置需点「保存」才落盘，若测已保存配置，
       // 用户填完表单未保存就点测试会误报「未配置远程存储」
-      const result = await invoke('test_remote_storage', {
+      const result = await invoke<string>('test_remote_storage', {
         remoteStorage: config.remote_storage,
       });
       showToast(result, 'success');
@@ -216,15 +347,15 @@
     }
   }
 
-  function formatSyncTime(timestamp) {
+  function formatSyncTime(timestamp: number) {
     return timestamp > 0 ? new Date(timestamp * 1000).toLocaleString() : t('settingsStorage.syncNever');
   }
 
   async function triggerSyncNow() {
     isSyncing = true;
     try {
-      const result = await invoke('sync_now');
-      const latest = await invoke('get_config');
+      const result = await invoke<{ pushed: number; pulled: number }>('sync_now');
+      const latest = await invoke<StorageConfig>('get_config');
       config = latest;
       cache.setConfig(latest);
       showToast(t('settingsStorage.syncSuccess', { pushed: result.pushed, pulled: result.pulled }), 'success');
@@ -255,7 +386,7 @@
     cleanupCandidateDir = '';
   }
   $: {
-    if (!config.remote_storage) config.remote_storage = { provider: 'none', s3: {}, webdav: {} };
+    if (!config.remote_storage) config.remote_storage = { provider: 'none', s3: {}, webdav: {}, sync_app_config: false };
     if (!config.remote_storage.s3) config.remote_storage.s3 = {};
     if (!config.remote_storage.webdav) config.remote_storage.webdav = {};
     if (!config.sync) {
@@ -409,6 +540,45 @@
     </div>
 
     <div class="settings-block">
+      <div class="settings-row">
+        <div>
+          <span class="settings-text">{t('settingsStorage.metadataCleanup')}</span>
+          <p class="settings-muted mt-0.5">{t('settingsStorage.metadataCleanupHint')}</p>
+        </div>
+        <button
+          type="button"
+          role="switch"
+          aria-label={t('settingsStorage.metadataCleanup')}
+          aria-checked={Boolean(config.storage.metadata_cleanup_enabled)}
+          disabled={isConfirmingMetadataCleanup}
+          on:click={toggleMetadataCleanup}
+          class="switch-track {config.storage.metadata_cleanup_enabled ? 'bg-emerald-500' : 'bg-slate-300 dark:bg-[#484f58]'}"
+        >
+          <span class="switch-thumb {config.storage.metadata_cleanup_enabled ? 'translate-x-5' : 'translate-x-0'}"></span>
+        </button>
+      </div>
+      {#if config.storage.metadata_cleanup_enabled}
+        <div class="mt-3 flex items-center justify-between gap-3">
+          <label for="metadata-retention-days" class="settings-text">{t('settingsStorage.metadataRetentionDays')}</label>
+          <input
+            id="metadata-retention-days"
+            type="number"
+            min="0"
+            max="9999"
+            step="1"
+            bind:value={config.storage.metadata_retention_days}
+            on:change={() => {
+              config.storage.metadata_retention_days = Math.max(0, Math.min(9999, Math.trunc(Number(config.storage.metadata_retention_days) || 0)));
+              handleChange();
+            }}
+            class="w-20 rounded-md border border-slate-200 bg-white px-2 py-1 text-center text-sm dark:border-[#484f58] dark:bg-[#21262d]"
+          />
+        </div>
+        <p class="settings-muted mt-1">{t('settingsStorage.metadataRetentionHint')}</p>
+      {/if}
+    </div>
+
+    <div class="settings-block">
       <p class="settings-text mb-2">{t('settingsStorage.screenshotMode')}</p>
       <div class="flex gap-2">
         {#each localizedScreenshotModes as mode}
@@ -512,7 +682,7 @@
   <h3 class="settings-card-title">{t('settingsStorage.exportTitle')}</h3>
 
   <div class="settings-block">
-    <div class="rounded-2xl border border-slate-200/80 bg-slate-50/90 p-4 dark:border-[#30363d]/80 dark:bg-[#21262d]/40">
+    <div class="settings-subsection">
       <p class="settings-text">{t('settingsStorage.exportDir')}</p>
       <p class="settings-muted mt-1 break-all">
         {config.daily_report_export_dir || t('settingsStorage.notSet')}
@@ -564,7 +734,7 @@
   storageKey="settings.storage.remoteBackup"
 >
   <div class="settings-section space-y-4">
-    <div class="rounded-2xl border border-slate-200/80 bg-slate-50/90 p-4 dark:border-[#30363d]/80 dark:bg-[#21262d]/40">
+    <div class="settings-subsection">
       <div class="flex items-center gap-2 mb-3">
         <div class="flex h-6 w-6 items-center justify-center rounded-md bg-primary-100 dark:bg-primary-900/30">
           <svg class="w-3.5 h-3.5 text-primary-600 dark:text-primary-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -582,7 +752,7 @@
           <button
             type="button"
             on:click={() => {
-              if (!config.remote_storage) config.remote_storage = { provider: 'none', s3: {}, webdav: {} };
+              if (!config.remote_storage) config.remote_storage = { provider: 'none', s3: {}, webdav: {}, sync_app_config: false };
               config.remote_storage = { ...config.remote_storage, provider: opt.value };
               handleChange();
             }}
@@ -598,7 +768,7 @@
     </div>
 
     {#if config.remote_storage?.provider === 's3'}
-      <div class="rounded-2xl border border-slate-200/80 bg-slate-50/90 p-4 space-y-3 dark:border-[#30363d]/80 dark:bg-[#21262d]/40">
+      <div class="settings-subsection space-y-3">
         <div class="flex items-center gap-2">
           <div class="flex h-6 w-6 items-center justify-center rounded-md bg-amber-100 dark:bg-amber-900/30">
             <svg class="w-3.5 h-3.5 text-amber-600 dark:text-amber-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -756,7 +926,7 @@
     {/if}
 
     {#if config.remote_storage?.provider === 'webdav'}
-      <div class="rounded-2xl border border-slate-200/80 bg-slate-50/90 p-4 space-y-3 dark:border-[#30363d]/80 dark:bg-[#21262d]/40">
+      <div class="settings-subsection space-y-3">
         <div class="flex items-center gap-2">
           <div class="flex h-6 w-6 items-center justify-center rounded-md bg-blue-100 dark:bg-blue-900/30">
             <svg class="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -848,6 +1018,26 @@
             placeholder={t('settingsStorage.webdavPublicUrlBaseHint')}
           />
         </label>
+        <div class="flex items-center justify-between gap-3">
+          <div class="min-w-0">
+            <span class="settings-text text-sm">{t('settingsStorage.syncAppConfig')}</span>
+            <p class="settings-note mt-1">{t('settingsStorage.syncAppConfigHint')}</p>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-label={t('settingsStorage.syncAppConfig')}
+            aria-checked={Boolean(config.remote_storage?.sync_app_config)}
+            class="switch-track {config.remote_storage?.sync_app_config ? 'bg-primary-500' : 'bg-slate-300 dark:bg-[#484f58]'}"
+            on:click={() => {
+              if (!config.remote_storage) return;
+              config.remote_storage.sync_app_config = !config.remote_storage.sync_app_config;
+              handleChange();
+            }}
+          >
+            <span class="switch-thumb {config.remote_storage?.sync_app_config ? 'translate-x-5' : 'translate-x-0'}"></span>
+          </button>
+        </div>
 
         <div class="flex items-center justify-between pt-1">
           <p class="text-[11px] text-slate-400 dark:text-[#636c76]">{t('settingsStorage.publicUrlBaseEffectHint')}</p>
@@ -919,7 +1109,7 @@
       </div>
     </div>
 
-    <div class="settings-block rounded-2xl border border-slate-200/80 bg-slate-50/90 p-4 dark:border-[#30363d]/80 dark:bg-[#21262d]/40">
+    <div class="settings-block rounded-xl border border-slate-200/80 bg-slate-50/90 p-4 dark:border-[#30363d]/80 dark:bg-[#21262d]/40">
       <div class="mb-4 grid gap-3 sm:grid-cols-2">
         <p class="settings-muted">{t('settingsStorage.syncLastPush')}: {formatSyncTime(config.sync.last_push_timestamp)}</p>
         <p class="settings-muted">{t('settingsStorage.syncLastPull')}: {formatSyncTime(config.sync.last_pull_timestamp)}</p>
@@ -936,7 +1126,7 @@
 
   <div class="settings-section">
     <div class="settings-block">
-      <div class="rounded-2xl border border-slate-200/80 bg-slate-50/90 p-4 dark:border-[#30363d]/80 dark:bg-[#21262d]/40">
+      <div class="settings-subsection">
         <div class="grid gap-4 md:grid-cols-2">
           <div>
             <p class="settings-text">{t('settingsStorage.currentDir')}</p>
@@ -1011,7 +1201,7 @@
 
     {#if storageStats}
       <div class="settings-block">
-        <div class="rounded-2xl border border-slate-200/80 bg-slate-50/90 p-4 dark:border-[#30363d]/80 dark:bg-[#21262d]/40">
+        <div class="settings-subsection">
           <div class="mb-5">
             <div class="mb-2 flex items-end justify-between">
               <div>
@@ -1048,15 +1238,15 @@
           </div>
 
           <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
-            <div class="rounded-xl bg-white/70 p-3 text-center ring-1 ring-slate-200/70 dark:bg-[#161b22]/20 dark:ring-[#30363d]/70">
+                <div class="px-3 py-2 text-center">
               <p class="text-xl font-bold text-slate-900 dark:text-[#e6edf3]">{storageStats.total_files}</p>
               <p class="settings-muted mt-0.5">{t('settingsStorage.screenshotsCount')}</p>
             </div>
-            <div class="rounded-xl bg-white/70 p-3 text-center ring-1 ring-slate-200/70 dark:bg-[#161b22]/20 dark:ring-[#30363d]/70">
+                <div class="border-x border-slate-200/70 px-3 py-2 text-center dark:border-[#30363d]/70">
               <p class="text-xl font-bold text-slate-900 dark:text-[#e6edf3]">{storageStats.total_size_mb} MB</p>
               <p class="settings-muted mt-0.5">{t('settingsStorage.usedSpace')}</p>
             </div>
-            <div class="rounded-xl bg-white/70 p-3 text-center ring-1 ring-slate-200/70 dark:bg-[#161b22]/20 dark:ring-[#30363d]/70">
+                <div class="px-3 py-2 text-center">
               <p class="text-xl font-bold text-slate-900 dark:text-[#e6edf3]">{storageRetentionLabel}</p>
               <p class="settings-muted mt-0.5">{t('settingsStorage.retentionPeriod')}</p>
             </div>

@@ -1,10 +1,10 @@
 use crate::bot_common::{build_device_list, handle_cmd, status_payload, UNKNOWN_CMD_REPLY};
-use crate::config::AppConfig;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use reqwest::Client;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
+use work_review_core::config::AppConfig;
 
 /// 钉钉签名允许的时间窗口：±5 分钟（与企微一致；钉钉 timestamp 单位为毫秒）。
 /// 钉钉回调通常秒级到达，5 分钟窗口足够；收紧后避免 ±1 小时窗口内被截获请求重放。
@@ -159,9 +159,14 @@ pub async fn handle_dingtalk_callback(
         Err(e) => return DingtalkResponse::error(500, format!("HTTP client error: {e}")),
     };
 
-    let reply = handle_cmd(&client, &devices, &text)
-        .await
-        .unwrap_or_else(|| UNKNOWN_CMD_REPLY.to_string());
+    let reply = handle_cmd(
+        &client,
+        &devices,
+        &text,
+        crate::bot_common::report_generate_timeout(config),
+    )
+    .await
+    .unwrap_or_else(|| UNKNOWN_CMD_REPLY.to_string());
 
     // 通过 sessionWebhook 回复，但必须先校验目标域名属于钉钉，避免 SSRF。
     if session_webhook.is_empty() {

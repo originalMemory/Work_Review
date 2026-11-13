@@ -1,11 +1,13 @@
 //! Auto-extracted from the historical `commands.rs`. Behavior unchanged.
 
-use crate::config::{AppCategoryRule, AppConfig, CustomSemanticCategory, WebsiteSemanticRule};
-use crate::error::AppError;
 use crate::AppState;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, State};
+use work_review_core::config::{
+    AppCategoryRule, AppConfig, CustomSemanticCategory, WebsiteSemanticRule,
+};
+use work_review_core::error::AppError;
 
 use super::shared::persist_app_config;
 
@@ -30,7 +32,7 @@ pub(crate) fn get_app_category_overview_inner(
     Ok(overview
         .into_iter()
         .map(|item| {
-            let override_category = crate::monitor::find_category_override(
+            let override_category = work_review_core::categorize::find_collected_category_override(
                 &s.config.app_category_rules,
                 &item.app_name,
                 &s.config.custom_categories,
@@ -48,17 +50,19 @@ pub(crate) fn get_app_category_overview_inner(
 }
 
 pub(crate) fn upsert_app_category_rule(config: &mut AppConfig, app_name: &str, category: &str) {
-    let normalized_app_name = crate::monitor::normalize_display_app_name(app_name);
+    let normalized_app_name = work_review_core::categorize::normalize_display_app_name(app_name);
     let custom_keys: Vec<String> = config
         .custom_categories
         .iter()
         .map(|c| c.key.clone())
         .collect();
-    let normalized_category = crate::config::normalize_category_key_private(category, &custom_keys);
+    let normalized_category =
+        work_review_core::config::normalize_category_key_private(category, &custom_keys);
     let match_key = normalized_app_name.to_lowercase();
 
     if let Some(rule) = config.app_category_rules.iter_mut().find(|rule| {
-        crate::monitor::normalize_display_app_name(&rule.app_name).to_lowercase() == match_key
+        work_review_core::categorize::normalize_display_app_name(&rule.app_name).to_lowercase()
+            == match_key
     }) {
         rule.app_name = normalized_app_name;
         rule.category = normalized_category;
@@ -82,18 +86,20 @@ pub(crate) fn reclassify_app_history_in_state(
         .iter()
         .map(|c| c.key.clone())
         .collect();
-    let target_category = crate::config::normalize_category_key_private(category, &custom_keys);
+    let target_category =
+        work_review_core::config::normalize_category_key_private(category, &custom_keys);
     let activities = state
         .database
         .get_activities_by_normalized_app_name(app_name)?;
 
     for activity in &activities {
-        let classification = crate::activity_classifier::classify_activity_with_base_category(
-            &activity.app_name,
-            &activity.window_title,
-            activity.browser_url.as_deref(),
-            &target_category,
-        );
+        let classification =
+            work_review_core::activity_classifier::classify_activity_with_base_category(
+                &activity.app_name,
+                &activity.window_title,
+                activity.browser_url.as_deref(),
+                &target_category,
+            );
         state.database.update_activity_classification(
             activity.id.expect("活动记录应包含主键"),
             &classification.base_category,
@@ -106,13 +112,14 @@ pub(crate) fn reclassify_app_history_in_state(
 }
 
 fn upsert_domain_semantic_rule(config: &mut AppConfig, domain: &str, semantic_category: &str) {
-    let Some(normalized_domain) = crate::monitor::normalize_domain_rule(domain) else {
+    let Some(normalized_domain) = work_review_core::categorize::normalize_domain_rule(domain)
+    else {
         return;
     };
     let normalized_semantic_category = semantic_category.trim().to_string();
 
     if let Some(rule) = config.website_semantic_rules.iter_mut().find(|rule| {
-        crate::monitor::normalize_domain_rule(&rule.domain).as_deref()
+        work_review_core::categorize::normalize_domain_rule(&rule.domain).as_deref()
             == Some(normalized_domain.as_str())
     }) {
         rule.domain = normalized_domain;
@@ -135,7 +142,7 @@ fn reclassify_domain_history_in_state(
     let semantic_category = semantic_category.trim();
 
     for activity in &activities {
-        let next_base_category = crate::monitor::semantic_category_to_base_category(
+        let next_base_category = work_review_core::categorize::semantic_category_to_base_category(
             semantic_category,
             &activity.category,
         );
@@ -249,7 +256,7 @@ pub async fn save_custom_category(
         let state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
         let mut next_config = state.config.clone();
 
-        let custom = crate::config::CustomCategory {
+        let custom = work_review_core::config::CustomCategory {
             key: key.clone(),
             name: name.clone(),
             color: color.clone(),
@@ -306,7 +313,7 @@ pub async fn delete_custom_category(
         next_config.custom_categories.retain(|c| c.key != key);
 
         // 记录已删除的内置分类 key，防止 seed 复活
-        if crate::config::DEFAULT_CATEGORY_KEYS.contains(&key.as_str())
+        if work_review_core::config::DEFAULT_CATEGORY_KEYS.contains(&key.as_str())
             && !next_config.deleted_default_categories.contains(&key)
         {
             next_config.deleted_default_categories.push(key.clone());
@@ -453,7 +460,7 @@ pub async fn delete_custom_semantic_category(
             .retain(|c| c.key != key);
 
         // 记录已删除的内置语义分类 key，防止 seed 复活
-        if crate::config::DEFAULT_SEMANTIC_CATEGORY_KEYS.contains(&key.as_str())
+        if work_review_core::config::DEFAULT_SEMANTIC_CATEGORY_KEYS.contains(&key.as_str())
             && !next_config
                 .deleted_default_semantic_categories
                 .contains(&key)
@@ -485,7 +492,7 @@ pub async fn set_domain_semantic_rule(
     app: AppHandle,
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<usize, AppError> {
-    let normalized_domain = crate::monitor::normalize_domain_rule(&domain)
+    let normalized_domain = work_review_core::categorize::normalize_domain_rule(&domain)
         .ok_or_else(|| AppError::Unknown("域名不能为空".to_string()))?;
     let trimmed_semantic_category = semantic_category.trim();
     if trimmed_semantic_category.is_empty() {

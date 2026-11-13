@@ -1,18 +1,53 @@
 //! Auto-extracted from the historical `commands.rs`. Behavior unchanged.
 
-use crate::database::{
-    apply_flex_overtime_correction, local_hour_end_timestamp, AppUsage, BrowserUsage,
-    CategoryUsage, DailyStats, DomainUsage, HourlyActivityBucket, HourlyAppBucket, UrlDetail,
-    UrlUsage,
-};
-use crate::error::AppError;
-use crate::privacy::{apply_excluded_domains_to_stats, apply_ignored_apps_to_stats};
 use crate::AppState;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tauri::State;
+use work_review_core::config::WebsiteSemanticRule;
+use work_review_core::database::{
+    apply_flex_overtime_correction, local_hour_end_timestamp, AppUsage, BrowserUsage,
+    CategoryUsage, DailyStats, DomainUsage, HourlyActivityBucket, HourlyAppBucket, UrlDetail,
+    UrlUsage,
+};
+use work_review_core::error::AppError;
+use work_review_core::privacy::{apply_excluded_domains_to_stats, apply_ignored_apps_to_stats};
 
 use super::shared::collect_privacy_filters;
+
+/// 读取侧兜底：网站语义规则是用户的显式选择，展示时始终覆盖数据库内按时长投票的结果，
+/// 避免历史回填缺失（如规则先于历史数据从其他设备同步）时概览仍显示旧分类。
+fn apply_website_semantic_rules_to_stats(
+    mut stats: DailyStats,
+    rules: &[WebsiteSemanticRule],
+) -> DailyStats {
+    if rules.is_empty() {
+        return stats;
+    }
+    for domain in &mut stats.domain_usage {
+        if let Some(semantic_category) =
+            work_review_core::categorize::find_website_semantic_override(
+                rules,
+                Some(&domain.domain),
+            )
+        {
+            domain.semantic_category = Some(semantic_category);
+        }
+    }
+    for browser in &mut stats.browser_usage {
+        for domain in &mut browser.domains {
+            if let Some(semantic_category) =
+                work_review_core::categorize::find_website_semantic_override(
+                    rules,
+                    Some(&domain.domain),
+                )
+            {
+                domain.semantic_category = Some(semantic_category);
+            }
+        }
+    }
+    stats
+}
 
 pub(crate) fn load_daily_stats_for_overview(
     state: &AppState,
@@ -43,6 +78,7 @@ pub(crate) fn load_daily_stats_for_overview_device(
         state.config.work_time_enabled,
         state.config.standard_work_hours,
     );
+    let stats = apply_website_semantic_rules_to_stats(stats, &state.config.website_semantic_rules);
 
     Ok(stats)
 }
@@ -755,6 +791,7 @@ pub(crate) fn get_daily_stats_inner(
         s.config.work_time_enabled,
         s.config.standard_work_hours,
     );
+    let stats = apply_website_semantic_rules_to_stats(stats, &s.config.website_semantic_rules);
     Ok(stats)
 }
 
@@ -900,7 +937,7 @@ fn get_running_apps_impl() -> Result<Vec<String>, AppError> {
         let apps_str = String::from_utf8_lossy(&output.stdout);
         let mut apps: Vec<String> = apps_str
             .split(", ")
-            .map(crate::monitor::normalize_display_app_name)
+            .map(work_review_core::categorize::normalize_display_app_name)
             .filter(|s| !s.is_empty())
             .collect();
         apps.sort();
@@ -978,7 +1015,8 @@ fn get_running_apps_impl() -> Result<Vec<String>, AppError> {
 
                 if !excluded.contains(&name_lower.as_str()) {
                     // 移除 .exe 后缀
-                    let display_name = crate::monitor::normalize_display_app_name(&name);
+                    let display_name =
+                        work_review_core::categorize::normalize_display_app_name(&name);
                     apps.insert(display_name);
                 }
 
@@ -1155,7 +1193,149 @@ pub async fn get_hourly_summaries(
     get_hourly_summaries_filtered_inner(&date, device_id.as_deref(), state.inner())
 }
 
-/// 清理今天之前的所有活动记录
+#[derive(Debug, Default)]
+struct OldActivitiesCleanupResult {
+    deleted_activities: usize,
+    deleted_screenshots: usize,
+    failed_screenshot_paths: Vec<String>,
+}
+
+fn relative_screenshot_path(data_dir: &std::path::Path, path: &std::path::Path) -> String {
+    path.strip_prefix(data_dir)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn record_screenshot_cleanup_failure(
+    data_dir: &std::path::Path,
+    path: &std::path::Path,
+    error: &std::io::Error,
+    result: &mut OldActivitiesCleanupResult,
+) {
+    log::warn!("删除旧截图失败 {}: {error}", path.display());
+    result
+        .failed_screenshot_paths
+        .push(relative_screenshot_path(data_dir, path));
+}
+
+/// 递归删除截图目录，并只统计实际成功删除的文件。
+///
+/// 文件删除失败时继续处理其他条目，失败路径会返回给调用方用于提示和后续重试。
+fn remove_screenshot_directory(
+    data_dir: &std::path::Path,
+    directory: &std::path::Path,
+    result: &mut OldActivitiesCleanupResult,
+) {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            record_screenshot_cleanup_failure(data_dir, directory, &error, result);
+            return;
+        }
+    };
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                record_screenshot_cleanup_failure(data_dir, directory, &error, result);
+                continue;
+            }
+        };
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) => {
+                record_screenshot_cleanup_failure(data_dir, &path, &error, result);
+                continue;
+            }
+        };
+
+        if file_type.is_dir() {
+            remove_screenshot_directory(data_dir, &path, result);
+        } else {
+            match std::fs::remove_file(&path) {
+                Ok(()) => result.deleted_screenshots += 1,
+                Err(error) => record_screenshot_cleanup_failure(data_dir, &path, &error, result),
+            }
+        }
+    }
+
+    if let Err(error) = std::fs::remove_dir(directory) {
+        record_screenshot_cleanup_failure(data_dir, directory, &error, result);
+    }
+}
+
+/// 数据库事务必须先成功，之后才允许删除对应日期的截图目录。
+fn clear_old_activities_storage<F>(
+    data_dir: &std::path::Path,
+    delete_before: chrono::NaiveDate,
+    delete_activities: F,
+) -> Result<OldActivitiesCleanupResult, AppError>
+where
+    F: FnOnce() -> Result<usize, AppError>,
+{
+    let deleted_activities = delete_activities()?;
+    let mut result = OldActivitiesCleanupResult {
+        deleted_activities,
+        ..Default::default()
+    };
+    let screenshots_dir = data_dir.join("screenshots");
+    let mut directories = vec![screenshots_dir.clone()];
+    while let Some(directory) = directories.pop() {
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                record_screenshot_cleanup_failure(data_dir, &directory, &error, &mut result);
+                continue;
+            }
+        };
+
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    record_screenshot_cleanup_failure(data_dir, &directory, &error, &mut result);
+                    continue;
+                }
+            };
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(error) => {
+                    record_screenshot_cleanup_failure(data_dir, &path, &error, &mut result);
+                    continue;
+                }
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+
+            let directory_name = entry.file_name();
+            let Some(directory_name) = directory_name.to_str() else {
+                continue;
+            };
+            let Ok(directory_date) = chrono::NaiveDate::parse_from_str(directory_name, "%Y-%m-%d")
+            else {
+                if directory == screenshots_dir {
+                    directories.push(path);
+                }
+                continue;
+            };
+            if directory_date < delete_before {
+                remove_screenshot_directory(data_dir, &path, &mut result);
+            }
+        }
+    }
+
+    result.failed_screenshot_paths.sort();
+    result.failed_screenshot_paths.dedup();
+    Ok(result)
+}
+
+/// 清理昨天之前的所有活动记录
 #[tauri::command]
 pub async fn clear_old_activities(
     state: State<'_, Arc<Mutex<AppState>>>,
@@ -1166,68 +1346,33 @@ pub async fn clear_old_activities(
     };
 
     // 获取要保留的日期（今天和昨天）
-    let now = chrono::Local::now();
-    let today = now.format("%Y-%m-%d").to_string();
-    let yesterday = (now - chrono::Duration::days(1))
-        .format("%Y-%m-%d")
-        .to_string();
-
-    let mut deleted_screenshots = 0;
-
-    // 删除旧截图目录（保留今天和昨天）
-    let screenshots_dir = data_dir.join("screenshots");
-    if screenshots_dir.exists() {
-        if let Ok(entries) = std::fs::read_dir(&screenshots_dir) {
-            for entry in entries.flatten() {
-                if !entry.path().is_dir() {
-                    continue;
-                }
-                let direct_name = entry.file_name().to_string_lossy().to_string();
-                let date_dirs =
-                    if chrono::NaiveDate::parse_from_str(&direct_name, "%Y-%m-%d").is_ok() {
-                        vec![(direct_name, entry.path())]
-                    } else {
-                        std::fs::read_dir(entry.path())
-                            .into_iter()
-                            .flatten()
-                            .flatten()
-                            .filter(|child| child.path().is_dir())
-                            .map(|child| {
-                                (
-                                    child.file_name().to_string_lossy().to_string(),
-                                    child.path(),
-                                )
-                            })
-                            .collect()
-                    };
-                for (name, path) in date_dirs {
-                    if name != today
-                        && name != yesterday
-                        && chrono::NaiveDate::parse_from_str(&name, "%Y-%m-%d").is_ok()
-                    {
-                        if let Ok(files) = std::fs::read_dir(&path) {
-                            deleted_screenshots +=
-                                files.flatten().filter(|file| file.path().is_file()).count();
-                        }
-                        let _ = std::fs::remove_dir_all(path);
-                    }
-                }
-            }
-        }
-    }
-
-    // 同步清理数据库中对应的旧记录（保留今天和昨天，与截图保留策略一致）
-    {
+    let today_date = chrono::Local::now().date_naive();
+    let delete_before = today_date - chrono::Duration::days(1);
+    let today = today_date.format("%Y-%m-%d").to_string();
+    let yesterday = delete_before.format("%Y-%m-%d").to_string();
+    let cleanup = clear_old_activities_storage(&data_dir, delete_before, || {
         let state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
-        if let Err(e) = state.database.delete_activities_before_date(&yesterday) {
-            log::warn!("清理旧活动记录失败: {e}");
-        }
-    }
+        state.database.delete_activities_before_date(&yesterday)
+    })?;
+    let failed_count = cleanup.failed_screenshot_paths.len();
+    let message = if failed_count == 0 {
+        format!(
+            "已清理 {} 条旧活动记录和 {} 张旧截图，保留今天和昨天的数据",
+            cleanup.deleted_activities, cleanup.deleted_screenshots
+        )
+    } else {
+        format!(
+            "数据库已清理 {} 条旧活动记录；成功删除 {} 张旧截图，{} 个路径删除失败，可稍后重试",
+            cleanup.deleted_activities, cleanup.deleted_screenshots, failed_count
+        )
+    };
 
     Ok(serde_json::json!({
-        "deleted_screenshots": deleted_screenshots,
+        "deleted_activities": cleanup.deleted_activities,
+        "deleted_screenshots": cleanup.deleted_screenshots,
+        "failed_screenshot_paths": cleanup.failed_screenshot_paths,
         "kept_dates": [today, yesterday],
-        "message": format!("已清理 {} 张旧截图和对应活动记录，保留今天和昨天的数据", deleted_screenshots)
+        "message": message
     }))
 }
 
@@ -1323,8 +1468,218 @@ pub async fn delete_activities_by_app(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::HourlyActivityBucket;
     use chrono::NaiveDate;
+    use std::cell::Cell;
+    use work_review_core::database::HourlyActivityBucket;
+
+    fn clear_old_activities_test_dir(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "work-review-clear-old-activities-{label}-{}",
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    #[test]
+    fn 概览统计应读取侧应用网站语义规则覆盖历史投票() {
+        let rules = vec![WebsiteSemanticRule {
+            domain: "github.com".to_string(),
+            semantic_category: "休息娱乐".to_string(),
+        }];
+        let stats = DailyStats {
+            domain_usage: vec![
+                DomainUsage {
+                    domain: "github.com".to_string(),
+                    duration: 120,
+                    semantic_category: Some("工作开发".to_string()),
+                    urls: Vec::new(),
+                },
+                DomainUsage {
+                    domain: "docs.example.com".to_string(),
+                    duration: 60,
+                    semantic_category: Some("资料阅读".to_string()),
+                    urls: Vec::new(),
+                },
+                DomainUsage {
+                    domain: "unlabeled.example.com".to_string(),
+                    duration: 30,
+                    semantic_category: None,
+                    urls: Vec::new(),
+                },
+            ],
+            browser_usage: vec![BrowserUsage {
+                browser_name: "Chrome".to_string(),
+                duration: 120,
+                executable_path: None,
+                domains: vec![DomainUsage {
+                    domain: "github.com".to_string(),
+                    duration: 120,
+                    semantic_category: None,
+                    urls: Vec::new(),
+                }],
+            }],
+            ..DailyStats::default()
+        };
+
+        let applied = apply_website_semantic_rules_to_stats(stats, &rules);
+        let category_of = |domain: &str, list: &[DomainUsage]| {
+            list.iter()
+                .find(|item| item.domain == domain)
+                .expect("测试数据应包含目标域名")
+                .semantic_category
+                .clone()
+        };
+        assert_eq!(
+            category_of("github.com", &applied.domain_usage).as_deref(),
+            Some("休息娱乐")
+        );
+        assert_eq!(
+            category_of("docs.example.com", &applied.domain_usage).as_deref(),
+            Some("资料阅读"),
+            "未命中规则的域名不应被改动"
+        );
+        assert_eq!(
+            category_of("unlabeled.example.com", &applied.domain_usage),
+            None,
+            "无规则的域名不应被凭空赋予分类"
+        );
+        assert_eq!(
+            category_of("github.com", &applied.browser_usage[0].domains).as_deref(),
+            Some("休息娱乐"),
+            "浏览器分组内的域名也应应用规则"
+        );
+
+        let untouched = apply_website_semantic_rules_to_stats(applied, &[]);
+        assert_eq!(
+            category_of("github.com", &untouched.domain_usage).as_deref(),
+            Some("休息娱乐"),
+            "空规则列表应原样返回"
+        );
+    }
+
+    #[test]
+    fn 数据库清理失败时不应预先删除旧截图() {
+        let data_dir = clear_old_activities_test_dir("database-failure");
+        let old_dir = data_dir.join("screenshots/2026-08-01");
+        std::fs::create_dir_all(&old_dir).expect("创建旧截图目录失败");
+        let screenshot = old_dir.join("old.png");
+        std::fs::write(&screenshot, b"old screenshot").expect("写入旧截图失败");
+        let database_called = Cell::new(false);
+
+        let result = clear_old_activities_storage(
+            &data_dir,
+            NaiveDate::from_ymd_opt(2026, 8, 4).expect("有效截止日期"),
+            || {
+                database_called.set(true);
+                Err(AppError::Unknown("模拟数据库事务失败".to_string()))
+            },
+        );
+
+        assert!(result.is_err(), "数据库错误应向调用方返回");
+        assert!(database_called.get(), "应尝试执行数据库事务");
+        assert!(
+            screenshot.exists(),
+            "数据库事务失败时，旧截图必须保持原样以免记录引用断裂"
+        );
+        std::fs::remove_dir_all(&data_dir).expect("清理测试目录失败");
+    }
+
+    #[test]
+    fn 数据库成功后只删除截止日期之前的截图并返回实际计数() {
+        let data_dir = clear_old_activities_test_dir("success");
+        let screenshots_dir = data_dir.join("screenshots");
+        let old_dir = screenshots_dir.join("2026-08-01");
+        let device_old_dir = screenshots_dir.join("device-a/2026-08-01");
+        let device_recent_dir = screenshots_dir.join("device-a/2026-08-05");
+        std::fs::create_dir_all(&device_old_dir).unwrap();
+        std::fs::create_dir_all(&device_recent_dir).unwrap();
+        std::fs::write(device_old_dir.join("old.png"), b"old").unwrap();
+        std::fs::write(device_recent_dir.join("keep.png"), b"keep").unwrap();
+        let nested_dir = old_dir.join("nested");
+        let yesterday_dir = screenshots_dir.join("2026-08-04");
+        let today_dir = screenshots_dir.join("2026-08-05");
+        let future_dir = screenshots_dir.join("2026-08-06");
+        let unknown_dir = screenshots_dir.join("manual-backup");
+        for directory in [
+            &nested_dir,
+            &yesterday_dir,
+            &today_dir,
+            &future_dir,
+            &unknown_dir,
+        ] {
+            std::fs::create_dir_all(directory).expect("创建截图目录失败");
+        }
+        let old_screenshot = old_dir.join("one.png");
+        std::fs::write(&old_screenshot, b"one").expect("写入旧截图失败");
+        std::fs::write(nested_dir.join("two.png"), b"two").expect("写入嵌套旧截图失败");
+        std::fs::write(yesterday_dir.join("keep.png"), b"keep").expect("写入昨日截图失败");
+        std::fs::write(today_dir.join("keep.png"), b"keep").expect("写入今日截图失败");
+        std::fs::write(future_dir.join("keep.png"), b"keep").expect("写入未来截图失败");
+        std::fs::write(unknown_dir.join("keep.png"), b"keep").expect("写入未知目录截图失败");
+
+        let result = clear_old_activities_storage(
+            &data_dir,
+            NaiveDate::from_ymd_opt(2026, 8, 4).expect("有效截止日期"),
+            || {
+                assert!(
+                    old_screenshot.exists(),
+                    "执行数据库事务时，旧截图尚未被预先删除"
+                );
+                Ok(7)
+            },
+        )
+        .expect("清理旧活动应成功");
+
+        assert_eq!(result.deleted_activities, 7);
+        assert_eq!(result.deleted_screenshots, 3);
+        assert!(!device_old_dir.exists());
+        assert!(device_recent_dir.join("keep.png").exists());
+        assert!(result.failed_screenshot_paths.is_empty());
+        assert!(!old_dir.exists(), "旧截图目录应在数据库成功后删除");
+        assert!(yesterday_dir.exists(), "截止日期当天的截图应保留");
+        assert!(today_dir.exists(), "今天的截图应保留");
+        assert!(future_dir.exists(), "未来日期目录不属于数据库清理范围");
+        assert!(unknown_dir.exists(), "无法识别日期的目录不应被误删");
+        std::fs::remove_dir_all(&data_dir).expect("清理测试目录失败");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn 截图删除失败时不应虚增计数且应返回失败路径() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let data_dir = clear_old_activities_test_dir("filesystem-failure");
+        let old_dir = data_dir.join("screenshots/2026-08-01");
+        std::fs::create_dir_all(&old_dir).expect("创建旧截图目录失败");
+        let screenshot = old_dir.join("locked.png");
+        std::fs::write(&screenshot, b"locked").expect("写入旧截图失败");
+        std::fs::set_permissions(&old_dir, std::fs::Permissions::from_mode(0o500))
+            .expect("设置只读目录权限失败");
+
+        let result = clear_old_activities_storage(
+            &data_dir,
+            NaiveDate::from_ymd_opt(2026, 8, 4).expect("有效截止日期"),
+            || Ok(1),
+        )
+        .expect("数据库成功后，文件清理失败应通过结果显式报告");
+
+        assert_eq!(result.deleted_activities, 1);
+        assert_eq!(
+            result.deleted_screenshots, 0,
+            "删除失败的截图不应计入成功数量"
+        );
+        assert!(screenshot.exists(), "删除失败的截图应仍然存在");
+        assert!(
+            result
+                .failed_screenshot_paths
+                .iter()
+                .any(|path| path.ends_with("screenshots/2026-08-01/locked.png")),
+            "结果中应包含可重试的相对失败路径"
+        );
+
+        std::fs::set_permissions(&old_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("恢复测试目录权限失败");
+        std::fs::remove_dir_all(&data_dir).expect("清理测试目录失败");
+    }
 
     #[test]
     fn 概览本周范围应从周一开始到锚点日期结束() {

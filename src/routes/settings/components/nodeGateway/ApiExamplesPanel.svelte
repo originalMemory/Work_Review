@@ -1,21 +1,31 @@
-<script>
-  import { t } from '$lib/i18n/index.js';
+<script lang="ts">
+  import { t } from '$lib/i18n/index.ts';
   import { invoke } from '@tauri-apps/api/core';
   import { createEventDispatcher } from 'svelte';
 
-  export let localStatus = { enabled: false, baseUrl: '', tokenPreview: '' };
+  interface LocalApiStatus {
+    enabled: boolean;
+    baseUrl: string;
+  }
 
-  const dispatch = createEventDispatcher();
+  interface ToastDetail {
+    message: string;
+    type: 'success' | 'error';
+  }
+
+  export let localStatus: LocalApiStatus = { enabled: false, baseUrl: '' };
+
+  const AUTH_TOKEN_PLACEHOLDER = '<token>';
+  const dispatch = createEventDispatcher<{ toast: ToastDetail }>();
   let examplesExpanded = false;
   let activeApiCategory = 'all';
 
-  $: curlToken = localStatus.tokenPreview || '';
   $: curlBase = localStatus.baseUrl || 'http://127.0.0.1:47831';
 
-  function curlCommand(method, path, body) {
+  function curlCommand(method: string, path: string, body?: Record<string, unknown>): string {
     const headers = ['-H', '"Content-Type: application/json"'];
-    if (curlToken && curlToken !== '—') {
-      headers.push('-H', `"Authorization: Bearer ${curlToken}"`);
+    if (path !== '/health') {
+      headers.push('-H', `"Authorization: Bearer ${AUTH_TOKEN_PLACEHOLDER}"`);
     }
     const parts = ['curl', '-X', method, `"${curlBase}${path}"`, ...headers];
     if (body) {
@@ -24,7 +34,7 @@
     return parts.join(' \\\n  ');
   }
 
-  async function copyCurl(cmd) {
+  async function copyCurl(cmd: string): Promise<void> {
     try {
       await navigator.clipboard.writeText(cmd);
       dispatch('toast', { message: t('nodeGatewayPage.curlCopied'), type: 'success' });
@@ -37,6 +47,7 @@
     { cat: 'system', method: 'GET', path: '/health', desc: t('nodeGatewayPage.exampleHealthDesc'), cmd: curlCommand('GET', '/health') },
     { cat: 'system', method: 'GET', path: '/v1/device', desc: t('nodeGatewayPage.exampleDeviceDesc'), cmd: curlCommand('GET', '/v1/device') },
     { cat: 'system', method: 'GET', path: '/v1/storage/stats', desc: t('nodeGatewayPage.exampleStorageStatsDesc'), cmd: curlCommand('GET', '/v1/storage/stats') },
+    { cat: 'system', method: 'POST', path: '/v1/screenshots/capture', desc: t('nodeGatewayPage.exampleCaptureScreenshotDesc'), cmd: curlCommand('POST', '/v1/screenshots/capture') },
     { cat: 'report', method: 'GET', path: '/v1/reports', desc: t('nodeGatewayPage.exampleReportsDesc'), cmd: curlCommand('GET', '/v1/reports') },
     { cat: 'report', method: 'GET', path: '/v1/reports/:date', desc: t('nodeGatewayPage.exampleReportByDateDesc'), cmd: curlCommand('GET', '/v1/reports/2025-01-15') },
     { cat: 'report', method: 'GET', path: '/v1/reports/generate', desc: t('nodeGatewayPage.exampleGenerateDesc'), cmd: curlCommand('GET', '/v1/reports/generate?date=2025-01-15') },
@@ -67,7 +78,7 @@
         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4" />
       </svg>
       <span class="text-sm font-medium text-slate-700 dark:text-[#c9d1d9]">{t('nodeGatewayPage.apiExamples')}</span>
-      <span class="text-[10px] text-slate-400">19 endpoints</span>
+      <span class="text-[10px] text-slate-400">20 endpoints</span>
     </div>
     <svg class="w-4 h-4 text-slate-400 transition-transform {examplesExpanded ? 'rotate-180' : ''}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
       <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />

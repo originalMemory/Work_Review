@@ -6,21 +6,21 @@
 #[macro_use]
 extern crate objc;
 
-mod activity_classifier;
+mod activity_clock;
 mod agent;
-mod analysis;
 mod autostart;
 mod avatar_engine;
 mod avatar_followup;
 #[allow(dead_code)]
 mod avatar_input;
 mod avatar_proactive;
+#[cfg(target_os = "windows")]
+mod avatar_transparency;
 mod bot_common;
 mod commands;
-mod config;
-mod database;
+mod config_sync;
+mod data_dir;
 mod dingtalk_bot;
-mod error;
 mod feishu_bot;
 mod idle_detector;
 mod linux_session;
@@ -28,22 +28,19 @@ mod localhost_api;
 mod monitor;
 mod node_gateway;
 mod ocr;
-mod privacy;
 mod remote_upload;
 mod screen_lock;
 mod screenshot;
 mod storage;
 mod sync;
 mod telegram_bot;
+mod wecom_aibot;
 mod wecom_bot;
-mod work_intelligence;
 
-use config::{config_backup_path, AppConfig, AvatarFollowupItem, ConfigLoadStatus};
-use database::Database;
+pub(crate) use data_dir::{default_data_dir, save_data_dir_preference};
 use once_cell::sync::OnceCell;
-use privacy::PrivacyFilter;
-use screenshot::ScreenshotService;
-use serde::{Deserialize, Serialize};
+use screenshot::{ScreenshotResult, ScreenshotService};
+use serde::Serialize;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -52,8 +49,13 @@ use storage::StorageManager;
 use tauri::menu::{CheckMenuItem, CheckMenuItemBuilder, MenuBuilder, MenuItem, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, Position};
+use work_review_core::config::{
+    config_backup_path, AppConfig, AvatarFollowupItem, ConfigLoadStatus,
+};
+use work_review_core::database::Database;
+use work_review_core::privacy::PrivacyFilter;
 
-// 全局 AppHandle，用于在 macOS Dock 点击时恢复窗口
+// 全局 AppHandle，供原生系统回调恢复窗口。
 static APP_HANDLE: OnceCell<AppHandle> = OnceCell::new();
 const MAIN_WINDOW_LABEL: &str = "main";
 const AUTOSTART_LAUNCH_ARG: &str = "--autostart";
@@ -209,7 +211,9 @@ fn align_window_to_reference_monitor(
     )));
 }
 
-pub(crate) fn ensure_main_window(app: &AppHandle) -> Result<tauri::WebviewWindow, error::AppError> {
+pub(crate) fn ensure_main_window(
+    app: &AppHandle,
+) -> Result<tauri::WebviewWindow, work_review_core::error::AppError> {
     if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
         return Ok(window);
     }
@@ -221,12 +225,16 @@ pub(crate) fn ensure_main_window(app: &AppHandle) -> Result<tauri::WebviewWindow
         .iter()
         .find(|config| config.label == MAIN_WINDOW_LABEL)
         .or_else(|| app.config().app.windows.first())
-        .ok_or_else(|| error::AppError::Unknown("未找到主窗口配置".to_string()))?;
+        .ok_or_else(|| {
+            work_review_core::error::AppError::Unknown("未找到主窗口配置".to_string())
+        })?;
 
     let window = tauri::WebviewWindowBuilder::from_config(app, window_config)
-        .map_err(|e| error::AppError::Unknown(format!("创建主窗口构建器失败: {e}")))?
+        .map_err(|e| {
+            work_review_core::error::AppError::Unknown(format!("创建主窗口构建器失败: {e}"))
+        })?
         .build()
-        .map_err(|e| error::AppError::Unknown(format!("重建主窗口失败: {e}")))?;
+        .map_err(|e| work_review_core::error::AppError::Unknown(format!("重建主窗口失败: {e}")))?;
 
     configure_main_window(&window);
     Ok(window)
@@ -235,7 +243,7 @@ pub(crate) fn ensure_main_window(app: &AppHandle) -> Result<tauri::WebviewWindow
 pub(crate) fn reveal_main_window(
     app: &AppHandle,
     source_window_label: Option<&str>,
-) -> Result<(), error::AppError> {
+) -> Result<(), work_review_core::error::AppError> {
     let window = ensure_main_window(app)?;
     let reference_window = source_window_label.and_then(|label| app.get_webview_window(label));
     align_window_to_reference_monitor(&window, reference_window.as_ref());
@@ -344,7 +352,7 @@ async fn set_app_locale(
     locale: String,
     app: AppHandle,
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
-) -> Result<(), crate::error::AppError> {
+) -> Result<(), work_review_core::error::AppError> {
     let normalized = match locale.as_str() {
         v if v.starts_with("en") => "en",
         "zh-TW" | "zh-HK" => "zh-TW",
@@ -353,7 +361,7 @@ async fn set_app_locale(
     let config = {
         let mut s = state
             .lock()
-            .map_err(|e| crate::error::AppError::Unknown(e.to_string()))?;
+            .map_err(|e| work_review_core::error::AppError::Unknown(e.to_string()))?;
         s.config.locale = normalized.to_string();
         s.config.clone()
     };
@@ -432,6 +440,7 @@ pub struct AppState {
     pub generating_report: bool,
     pub localhost_api_runtime: localhost_api::LocalhostApiRuntime,
     pub telegram_bot_runtime: telegram_bot::TelegramBotRuntime,
+    pub wecom_bot_runtime: wecom_aibot::WecomBotRuntime,
     /// avatar 循环缓存的活动窗口（时间戳 + 窗口信息），供 screenshot 循环复用
     pub cached_active_window: Option<(std::time::Instant, monitor::ActiveWindow)>,
 }
@@ -440,11 +449,6 @@ pub struct AppState {
 pub(crate) struct AppLifecycleState {
     suppress_next_exit: bool,
     explicit_quit_requested: bool,
-}
-
-#[derive(Serialize, Deserialize)]
-struct DataDirPreference {
-    data_dir: String,
 }
 
 fn should_prevent_exit(suppress_next_exit: bool, explicit_quit_requested: bool) -> bool {
@@ -487,6 +491,7 @@ fn should_hide_main_window_on_setup(_config: &AppConfig, launch_args: &[String])
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn should_request_screen_capture_permission(
     has_screen_capture_permission: bool,
     already_prompted: bool,
@@ -494,6 +499,7 @@ fn should_request_screen_capture_permission(
     !has_screen_capture_permission && !already_prompted
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn should_initialize_startup_permissions(status: ConfigLoadStatus) -> bool {
     !status.requires_fail_safe()
 }
@@ -509,7 +515,7 @@ fn should_initialize_avatar_input(status: ConfigLoadStatus) -> bool {
 /// 清理历史遗留的钥匙串占位符。
 /// 早期未发布版本曾把敏感字段真实值迁入系统钥匙串,磁盘配置写成 "__keychain__" 占位符;
 /// 该机制已整体移除。这里把残留占位符清空,避免被当作真实密钥使用（需在设置中重新填写）。
-fn clear_legacy_keychain_placeholders(config: &mut crate::config::AppConfig) {
+fn clear_legacy_keychain_placeholders(config: &mut work_review_core::config::AppConfig) {
     const PLACEHOLDER: &str = "__keychain__";
     let mut cleared = 0u32;
     {
@@ -531,6 +537,7 @@ fn clear_legacy_keychain_placeholders(config: &mut crate::config::AppConfig) {
         clear_opt(&mut config.feishu_encrypt_key);
         clear_opt(&mut config.wecom_token);
         clear_opt(&mut config.wecom_encoding_aes_key);
+        clear_opt(&mut config.wecom_bot_secret);
         clear_opt(&mut config.dingtalk_app_secret);
         for profile in config.text_model_profiles.iter_mut() {
             clear_opt(&mut profile.model_config.api_key);
@@ -871,117 +878,6 @@ fn should_emit_avatar_backlog_nudge(
     Some(count)
 }
 
-pub(crate) fn default_data_dir() -> PathBuf {
-    dirs::data_dir()
-        .map(|d| d.join("work-review"))
-        .unwrap_or_else(|| PathBuf::from("./data"))
-}
-
-fn data_dir_preference_path() -> PathBuf {
-    dirs::config_dir()
-        .map(|d| d.join("work-review").join("data-location.json"))
-        .unwrap_or_else(|| PathBuf::from("./work-review-data-location.json"))
-}
-
-fn load_data_dir_preference() -> Option<PathBuf> {
-    let path = data_dir_preference_path();
-    let content = std::fs::read_to_string(path).ok()?;
-    let preference: DataDirPreference = serde_json::from_str(&content).ok()?;
-    let data_dir = preference.data_dir.trim();
-    if data_dir.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(data_dir))
-    }
-}
-
-pub(crate) fn save_data_dir_preference(data_dir: &Path) -> std::io::Result<()> {
-    let default_dir = default_data_dir();
-    let preference_path = data_dir_preference_path();
-
-    if data_dir == default_dir {
-        if preference_path.exists() {
-            std::fs::remove_file(preference_path)?;
-        }
-        return Ok(());
-    }
-
-    if let Some(parent) = preference_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let content = serde_json::to_string_pretty(&DataDirPreference {
-        data_dir: data_dir.to_string_lossy().to_string(),
-    })
-    .map_err(std::io::Error::other)?;
-
-    std::fs::write(preference_path, content)?;
-    Ok(())
-}
-
-fn ensure_data_dir(path: &Path) -> std::io::Result<PathBuf> {
-    std::fs::create_dir_all(path)?;
-    Ok(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
-}
-
-/// 获取数据目录
-fn resolve_data_dir() -> PathBuf {
-    let default_dir = default_data_dir();
-    let preferred_dir = load_data_dir_preference().unwrap_or_else(|| default_dir.clone());
-
-    match ensure_data_dir(&preferred_dir) {
-        Ok(dir) => {
-            migrate_legacy_data_dir(&dir);
-            dir
-        }
-        Err(error) => {
-            log::warn!("创建数据目录失败，回退默认目录: {error}");
-
-            if preferred_dir != default_dir {
-                if let Ok(dir) = ensure_data_dir(&default_dir) {
-                    migrate_legacy_data_dir(&dir);
-                    let _ = save_data_dir_preference(&dir);
-                    return dir;
-                }
-            }
-
-            let fallback_dir = PathBuf::from("./data");
-            if let Err(fallback_error) = std::fs::create_dir_all(&fallback_dir) {
-                log::warn!("创建兜底数据目录失败: {fallback_error}");
-            }
-            migrate_legacy_data_dir(&fallback_dir);
-            fallback_dir
-        }
-    }
-}
-
-fn migrate_legacy_data_dir(target_dir: &PathBuf) {
-    let legacy_dir = match std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(|parent| parent.join("data")))
-    {
-        Some(path) => path,
-        None => return,
-    };
-
-    if legacy_dir == *target_dir || !legacy_dir.exists() {
-        return;
-    }
-
-    let target_has_data = target_dir.join("config.json").exists()
-        || target_dir.join("workreview.db").exists()
-        || target_dir.join("screenshots").exists();
-    if target_has_data {
-        return;
-    }
-
-    if let Err(error) = copy_dir_contents(&legacy_dir, target_dir, false) {
-        log::warn!("迁移旧版数据目录失败: {error}");
-    } else {
-        log::info!("已将旧版数据目录迁移到稳定目录: {target_dir:?}");
-    }
-}
-
 pub(crate) fn copy_dir_contents(
     from: &Path,
     to: &Path,
@@ -1018,7 +914,7 @@ fn recover_recent_browser_url(
     now_ts: i64,
     max_age_secs: i64,
 ) -> Option<String> {
-    if !monitor::is_browser_app(app_name) || window_title.is_empty() {
+    if !work_review_core::categorize::is_browser_app(app_name) || window_title.is_empty() {
         return None;
     }
 
@@ -1041,8 +937,8 @@ pub(crate) fn resolve_activity_classification(
     app_name: &str,
     window_title: &str,
     browser_url: Option<&str>,
-) -> activity_classifier::ActivityClassification {
-    let mut base_category = monitor::categorize_app_with_rules(
+) -> work_review_core::activity_classifier::ActivityClassification {
+    let mut base_category = work_review_core::categorize::categorize_collected_app_with_rules(
         &config.app_category_rules,
         app_name,
         window_title,
@@ -1099,12 +995,13 @@ pub(crate) fn resolve_activity_classification(
         }
     }
 
-    let mut classification = activity_classifier::classify_activity_with_base_category(
-        app_name,
-        window_title,
-        browser_url,
-        &base_category,
-    );
+    let mut classification =
+        work_review_core::activity_classifier::classify_activity_with_base_category(
+            app_name,
+            window_title,
+            browser_url,
+            &base_category,
+        );
 
     // 语义分类被删除时回退到 "未知活动"
     if classification.semantic_category != "未知活动"
@@ -1132,13 +1029,21 @@ pub(crate) fn resolve_activity_classification(
         }
     }
 
-    if let Some(semantic_category) =
-        monitor::find_website_semantic_override(&config.website_semantic_rules, browser_url)
-    {
-        classification.base_category = monitor::semantic_category_to_base_category(
-            &semantic_category,
-            &classification.base_category,
-        );
+    // 与网站统计、历史回填共用域名来源；没有地址栏 URL 时仍可按标题匹配规则。
+    let browser_page_hint = if work_review_core::categorize::is_browser_app(app_name) {
+        work_review_core::categorize::resolve_browser_page_hint(browser_url, window_title, None)
+    } else {
+        None
+    };
+    if let Some(semantic_category) = work_review_core::categorize::find_website_semantic_override(
+        &config.website_semantic_rules,
+        browser_page_hint.as_deref(),
+    ) {
+        classification.base_category =
+            work_review_core::categorize::semantic_category_to_base_category(
+                &semantic_category,
+                &classification.base_category,
+            );
         classification.semantic_category = semantic_category.clone();
         classification.confidence = classification.confidence.max(100);
         classification
@@ -1209,6 +1114,17 @@ fn should_persist_merge_update(effective_duration: i64) -> bool {
     effective_duration > 0
 }
 
+fn should_merge_observed_tail(
+    latest_timestamp: i64,
+    observed_timestamp: i64,
+    duration: i64,
+) -> bool {
+    // 两次取整最多相差一秒；旧记录若在更早的空闲前结束，必须新建尾段而非移动旧区间。
+    duration > 0
+        && latest_timestamp <= observed_timestamp
+        && latest_timestamp.abs_diff(observed_timestamp.saturating_sub(duration)) <= 1
+}
+
 const ACTIVITY_MERGE_GAP_SECS: i64 = 600;
 
 fn should_merge_contiguous_activity(
@@ -1228,7 +1144,7 @@ fn resolve_previous_activity_to_backfill(
     previous_app_name: Option<&str>,
     previous_browser_url: Option<&str>,
     previous_window_title: Option<&str>,
-) -> Option<database::Activity> {
+) -> Option<work_review_core::database::Activity> {
     let previous_app_name = previous_app_name?;
 
     let state_guard = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1239,7 +1155,7 @@ fn resolve_previous_activity_to_backfill(
             .get_latest_activity_by_url(previous_url)
             .ok()
             .flatten()
-    } else if monitor::is_browser_app(previous_app_name) {
+    } else if work_review_core::categorize::is_browser_app(previous_app_name) {
         previous_window_title
             .filter(|title| !title.is_empty())
             .and_then(|title| {
@@ -1270,7 +1186,7 @@ fn persist_previous_activity_backfill(
     database: &Database,
     config: &AppConfig,
     privacy_filter: &PrivacyFilter,
-    previous_activity: Option<&database::Activity>,
+    previous_activity: Option<&work_review_core::database::Activity>,
     previous_app_name: Option<&str>,
     previous_window_title: Option<&str>,
     previous_browser_url: Option<&str>,
@@ -1285,21 +1201,28 @@ fn persist_previous_activity_backfill(
     if let Some(previous_activity) = previous_activity {
         let previous_id = previous_activity.id?;
 
-        let _ = database.merge_activity(
+        return match database.merge_activity(
             previous_id,
             duration_delta,
             None,
             &previous_activity.screenshot_path,
             current_timestamp,
             None,
-        );
-        log::debug!(
-            "⏱️ 时长回补: {} +{}s (切换到 {})",
-            previous_activity.app_name,
-            duration_delta,
-            current_app_name
-        );
-        return Some(previous_id);
+        ) {
+            Ok(()) => {
+                log::debug!(
+                    "⏱️ 时长回补: {} +{}s (切换到 {})",
+                    previous_activity.app_name,
+                    duration_delta,
+                    current_app_name
+                );
+                Some(previous_id)
+            }
+            Err(error) => {
+                log::error!("上一应用时长回补失败: {error}");
+                None
+            }
+        };
     }
 
     let previous_app_name = previous_app_name?.trim();
@@ -1314,7 +1237,7 @@ fn persist_previous_activity_backfill(
         previous_window_title,
         previous_browser_url,
     );
-    if privacy_action == privacy::PrivacyAction::Skip {
+    if privacy_action == work_review_core::privacy::PrivacyAction::Skip {
         log::debug!("上一应用回补跳过(隐私): {previous_app_name}");
         return None;
     }
@@ -1325,16 +1248,17 @@ fn persist_previous_activity_backfill(
         previous_window_title,
         previous_browser_url,
     );
-    let (window_title, browser_url) = if privacy_action == privacy::PrivacyAction::Anonymize {
-        ("[内容已脱敏]".to_string(), None)
-    } else {
-        (
-            previous_window_title.to_string(),
-            previous_browser_url.map(ToString::to_string),
-        )
-    };
+    let (window_title, browser_url) =
+        if privacy_action == work_review_core::privacy::PrivacyAction::Anonymize {
+            ("[内容已脱敏]".to_string(), None)
+        } else {
+            (
+                previous_window_title.to_string(),
+                previous_browser_url.map(ToString::to_string),
+            )
+        };
 
-    let activity = database::Activity {
+    let activity = work_review_core::database::Activity {
         id: None,
         timestamp: current_timestamp,
         app_name: previous_app_name.to_string(),
@@ -1367,16 +1291,20 @@ fn persist_previous_activity_backfill(
 #[allow(clippy::too_many_arguments)]
 fn backfill_previous_activity_if_needed(
     state: &Arc<Mutex<AppState>>,
-    previous_activity: Option<&database::Activity>,
+    previous_activity: Option<&work_review_core::database::Activity>,
     previous_app_name: Option<&str>,
     previous_window_title: Option<&str>,
     previous_browser_url: Option<&str>,
     duration_delta: i64,
     current_timestamp: i64,
     current_app_name: &str,
-) {
+) -> bool {
+    if duration_delta <= 0 {
+        return true;
+    }
+
     let state_guard = state.lock().unwrap_or_else(|e| e.into_inner());
-    let _ = persist_previous_activity_backfill(
+    persist_previous_activity_backfill(
         &state_guard.database,
         &state_guard.config,
         &state_guard.privacy_filter,
@@ -1387,7 +1315,8 @@ fn backfill_previous_activity_if_needed(
         duration_delta,
         current_timestamp,
         current_app_name,
-    );
+    )
+    .is_some()
 }
 
 fn recording_loop_decision(
@@ -1410,9 +1339,51 @@ fn recording_loop_decision(
     }
 }
 
+fn reset_recording_session(
+    last_app_name: &mut Option<String>,
+    last_window_title: &mut Option<String>,
+    last_browser_url: &mut Option<String>,
+    last_capture_time: &mut std::time::Instant,
+    overlay_sessions: &mut std::collections::HashMap<String, (i64, std::time::Instant)>,
+    now: std::time::Instant,
+) {
+    *last_app_name = None;
+    *last_window_title = None;
+    *last_browser_url = None;
+    *last_capture_time = now;
+    overlay_sessions.clear();
+}
+
+fn should_run_ocr(elapsed_since_ocr: Option<Duration>, screenshot_interval: u64) -> bool {
+    match elapsed_since_ocr {
+        None => true,
+        Some(elapsed) => elapsed >= Duration::from_secs(screenshot_interval),
+    }
+}
+
+/// 浮窗只合并连续观察到的同一条记录，并保留不足一秒的余量。
+fn overlay_session_increment(
+    previous: Option<(i64, std::time::Instant)>,
+    latest: &work_review_core::database::Activity,
+    now: std::time::Instant,
+    timestamp: i64,
+) -> Option<(i64, std::time::Instant)> {
+    let (activity_id, accounted_at) = previous?;
+    if latest.id != Some(activity_id)
+        || latest.app_name == "Unknown"
+        || !(0..=600).contains(&timestamp.saturating_sub(latest.timestamp))
+    {
+        return None;
+    }
+    let seconds = now.checked_duration_since(accounted_at)?.as_secs();
+    Some((seconds as i64, accounted_at + Duration::from_secs(seconds)))
+}
+
 fn monitoring_poll_interval_ms_for_platform(is_macos: bool) -> u64 {
     if is_macos {
         1500
+    } else if cfg!(target_os = "linux") {
+        1000
     } else {
         500
     }
@@ -1447,7 +1418,7 @@ fn should_probe_browser_url_before_change_detection(
     last_window_title: Option<&str>,
     current_browser_url: Option<&str>,
 ) -> bool {
-    if !monitor::is_browser_app(app_name) || window_title.is_empty() {
+    if !work_review_core::categorize::is_browser_app(app_name) || window_title.is_empty() {
         return false;
     }
     // 首次遇到浏览器窗口时（last 为 None），也需要探测 URL
@@ -1458,12 +1429,40 @@ fn should_probe_browser_url_before_change_detection(
     last_app_name == Some(app_name) && last_window_title == Some(window_title)
 }
 
+fn claim_browser_url_probe(browser_url_probe_attempted: &mut bool, eligible: bool) -> bool {
+    if *browser_url_probe_attempted || !eligible {
+        return false;
+    }
+
+    // 查询开始即消耗本轮预算。即使 URL 获取失败，也不能立即重复扫描 UIA。
+    *browser_url_probe_attempted = true;
+    true
+}
+
+fn resolve_browser_url_once<F>(
+    browser_url_probe_attempted: &mut bool,
+    eligible: bool,
+    resolve: F,
+) -> Option<String>
+where
+    F: FnOnce() -> Option<String>,
+{
+    claim_browser_url_probe(browser_url_probe_attempted, eligible).then(resolve)?
+}
+
+fn browser_url_probe_attempted_after_full_lookup(
+    used_full_window_lookup: bool,
+    is_browser: bool,
+) -> bool {
+    used_full_window_lookup && is_browser
+}
+
 fn browser_change_capture_min_interval_ms(
     app_name: &str,
     title_changed: bool,
     url_changed: bool,
 ) -> u128 {
-    if monitor::is_browser_app(app_name) && (title_changed || url_changed) {
+    if work_review_core::categorize::is_browser_app(app_name) && (title_changed || url_changed) {
         MIN_BROWSER_CHANGE_CAPTURE_INTERVAL_MS
     } else {
         MIN_CAPTURE_INTERVAL_MS
@@ -1471,7 +1470,7 @@ fn browser_change_capture_min_interval_ms(
 }
 
 fn should_refresh_browser_url_before_record(app_name: &str, window_title: &str) -> bool {
-    monitor::is_browser_app(app_name) && !window_title.is_empty()
+    work_review_core::categorize::is_browser_app(app_name) && !window_title.is_empty()
 }
 
 fn avatar_monitor_poll_interval_ms_for_platform(is_macos: bool, active: bool) -> u64 {
@@ -1482,7 +1481,11 @@ fn avatar_monitor_poll_interval_ms_for_platform(is_macos: bool, active: bool) ->
             2000
         }
     } else if active {
-        180
+        if cfg!(target_os = "linux") {
+            1000
+        } else {
+            180
+        }
     } else {
         750
     }
@@ -1494,7 +1497,8 @@ fn avatar_monitor_poll_interval_ms() -> u64 {
 }
 
 fn screen_lock_check_interval_ms_for_platform(is_macos: bool) -> u64 {
-    if is_macos {
+    if cfg!(target_os = "linux") || is_macos {
+        // Linux 命令检测有超时，macOS 为 FFI；两者都不需要秒级轮询。
         5000
     } else {
         1000
@@ -1641,7 +1645,7 @@ fn should_skip_transient_window(active_window: &monitor::ActiveWindow) -> bool {
 }
 
 fn should_skip_system_window(active_window: &monitor::ActiveWindow) -> bool {
-    let is_sys = monitor::is_system_process(&active_window.app_name);
+    let is_sys = work_review_core::categorize::is_system_process(&active_window.app_name);
     let is_minimized_window = active_window.is_minimized;
     let is_explorer_shell = {
         let name_lower = active_window.app_name.to_lowercase();
@@ -2107,6 +2111,43 @@ async fn background_avatar_task(state: Arc<Mutex<AppState>>, app: AppHandle) {
 
 // 系统托盘在 setup 钩子中使用 TrayIconBuilder 创建 (Tauri v2)
 
+async fn capture_screenshot_for_window(
+    state: &Arc<Mutex<AppState>>,
+    active_window: &monitor::ActiveWindow,
+    sample: activity_clock::Sample,
+) -> work_review_core::error::Result<ScreenshotResult> {
+    let screenshot_service = {
+        let state_guard = state.lock().unwrap_or_else(|e| e.into_inner());
+        state_guard.screenshot_service.clone()
+    };
+    let active_window = active_window.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        screenshot_service
+            .capture_for_window(Some(&active_window))
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| {
+        work_review_core::error::AppError::Unknown(format!("截图任务异常: {error}"))
+    })?;
+
+    let result = result.map_err(work_review_core::error::AppError::Screenshot)?;
+    if !activity_clock::Sample::now().follows(sample) {
+        if let Some(path) = result
+            .ocr_source_path
+            .as_ref()
+            .filter(|path| *path != &result.path)
+        {
+            let _ = std::fs::remove_file(path);
+        }
+        let _ = std::fs::remove_file(&result.path);
+        return Err(work_review_core::error::AppError::Screenshot(
+            "截图跨越待机或采样中断，已丢弃本次结果".to_string(),
+        ));
+    }
+    Ok(result)
+}
+
 /// 后台截屏任务
 /// 使用 Arc<Mutex<AppState>> 而非 tauri::State，因为 State 无法在 async move 块中手动构造
 async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle) {
@@ -2115,7 +2156,10 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
     let mut last_app_window_title: Option<String> = None;
     let mut last_browser_url: Option<String> = None;
 
+    let _power_monitor = activity_clock::PowerMonitor::new();
+    let mut activity_clock = activity_clock::ActivityClock::new();
     let mut last_capture_time = std::time::Instant::now();
+    let mut overlay_sessions = std::collections::HashMap::new();
 
     // ===== 空闲检测器 =====
     // 先以输入空闲进入”疑似空闲”，再结合前台变化做短时保留。
@@ -2135,6 +2179,7 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
 
     // 合并路径的截图哈希去重：用 Arc 共享给异步任务，避免 static 跨活动污染
     let merge_screenshot_hash = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut last_ocr_time: Option<std::time::Instant> = None;
 
     // 锁屏检测器（无内部状态，复用同一实例避免重复分配）
     let screen_lock_monitor = screen_lock::ScreenLockMonitor::new();
@@ -2155,7 +2200,14 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
         };
 
         if decision.reset_capture_clock {
-            last_capture_time = std::time::Instant::now();
+            reset_recording_session(
+                &mut last_app_name,
+                &mut last_app_window_title,
+                &mut last_browser_url,
+                &mut last_capture_time,
+                &mut overlay_sessions,
+                std::time::Instant::now(),
+            );
         }
 
         if !decision.should_continue {
@@ -2173,8 +2225,14 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
         // 检测屏幕锁定状态，锁屏时不统计时长
         if cached_screen_locked {
             log::info!("🔒 屏幕已锁定，暂停活动统计");
-            last_app_name = None; // 重置应用状态，解锁后视为新开始
-            last_capture_time = std::time::Instant::now(); // 重置截图计时，避免解锁后累加锁屏时长
+            reset_recording_session(
+                &mut last_app_name,
+                &mut last_app_window_title,
+                &mut last_browser_url,
+                &mut last_capture_time,
+                &mut overlay_sessions,
+                std::time::Instant::now(),
+            );
             tokio::time::sleep(Duration::from_secs(5)).await;
             continue;
         }
@@ -2183,6 +2241,70 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
 
         // 轮询检测活动窗口（1秒间隔），让桌宠状态切换更及时
         tokio::time::sleep(Duration::from_millis(poll_interval_ms)).await;
+
+        let last_observed = activity_clock.previous_sample();
+        let Some(poll_sample) = activity_clock.sample() else {
+            // 仅结算最后一次连续采样前已观察到的尾段，绝不结算随后未知的空档。
+            let tail_duration = last_observed
+                .instant
+                .saturating_duration_since(last_capture_time)
+                .as_secs() as i64;
+            let can_persist_tail = tail_duration > 0 && !is_currently_idle && {
+                let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+                last_app_name.as_deref().is_some_and(|name| {
+                    guard.privacy_filter.check_privacy_full(
+                        name,
+                        last_app_window_title.as_deref().unwrap_or(""),
+                        last_browser_url.as_deref(),
+                    ) != work_review_core::privacy::PrivacyAction::Skip
+                })
+            };
+            if can_persist_tail {
+                let previous = resolve_previous_activity_to_backfill(
+                    &state,
+                    last_app_name.as_deref(),
+                    last_browser_url.as_deref(),
+                    last_app_window_title.as_deref(),
+                )
+                .filter(|activity| {
+                    should_merge_observed_tail(
+                        activity.timestamp,
+                        last_observed.timestamp(),
+                        tail_duration,
+                    )
+                });
+                backfill_previous_activity_if_needed(
+                    &state,
+                    previous.as_ref(),
+                    last_app_name.as_deref(),
+                    last_app_window_title.as_deref(),
+                    last_browser_url.as_deref(),
+                    tail_duration,
+                    last_observed.timestamp(),
+                    "采样中断",
+                );
+            }
+            reset_recording_session(
+                &mut last_app_name,
+                &mut last_app_window_title,
+                &mut last_browser_url,
+                &mut last_capture_time,
+                &mut overlay_sessions,
+                std::time::Instant::now(),
+            );
+            idle_detector.reset();
+            is_currently_idle = false;
+            cached_screen_locked = false;
+            last_screen_lock_check = std::time::Instant::now()
+                .checked_sub(Duration::from_millis(screen_lock_check_interval_ms()))
+                .unwrap_or_else(std::time::Instant::now);
+            state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .cached_active_window = None;
+            log::debug!("电源状态变化或采样不连续，已切断活动会话");
+            continue;
+        };
 
         // 获取当前活动窗口
         // 失败原因：Windows 睡眠/待机/UAC 时无前台窗口、macOS 权限不足等
@@ -2195,25 +2317,42 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                 active_window_now,
             )
         };
-        let mut active_window = if let Some(window) = cached_active_window {
-            // 头像循环缓存不含浏览器 URL，如果是浏览器窗口则跳过缓存重新获取
-            if monitor::is_browser_app(&window.app_name) && window.browser_url.is_none() {
-                match monitor::get_active_window() {
-                    Ok(w) => w,
-                    Err(_) => window,
+        let (mut active_window, used_full_window_lookup) =
+            if let Some(window) = cached_active_window {
+                // 头像循环缓存不含浏览器 URL；浏览器窗口需要走完整采集路径。
+                if work_review_core::categorize::is_browser_app(&window.app_name)
+                    && window.browser_url.is_none()
+                {
+                    match monitor::get_active_window() {
+                        Ok(window) => (window, true),
+                        Err(_) => (window, false),
+                    }
+                } else {
+                    (window, false)
                 }
             } else {
-                window
-            }
-        } else {
-            match monitor::get_active_window() {
-                Ok(w) => w,
-                Err(_) => {
-                    last_capture_time = std::time::Instant::now();
-                    continue;
-                }
-            }
-        };
+                (
+                    match monitor::get_active_window() {
+                        Ok(w) => w,
+                        Err(_) => {
+                            reset_recording_session(
+                                &mut last_app_name,
+                                &mut last_app_window_title,
+                                &mut last_browser_url,
+                                &mut last_capture_time,
+                                &mut overlay_sessions,
+                                std::time::Instant::now(),
+                            );
+                            continue;
+                        }
+                    },
+                    true,
+                )
+            };
+        let mut browser_url_probe_attempted = browser_url_probe_attempted_after_full_lookup(
+            used_full_window_lookup,
+            work_review_core::categorize::is_browser_app(&active_window.app_name),
+        );
 
         // 再次检查状态
         let should_capture = {
@@ -2222,6 +2361,7 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
         };
 
         if !should_capture {
+            overlay_sessions.clear();
             continue;
         }
 
@@ -2235,6 +2375,7 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                 last_app_window_title = None;
                 last_browser_url = None;
                 last_capture_time = std::time::Instant::now();
+                overlay_sessions.clear();
                 continue;
             }
         }
@@ -2253,6 +2394,7 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                 last_app_window_title = None;
                 last_browser_url = None;
                 last_capture_time = std::time::Instant::now();
+                overlay_sessions.clear();
                 continue;
             }
         }
@@ -2264,27 +2406,31 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
             last_app_window_title.as_deref(),
             active_window.browser_url.as_deref(),
         );
-        if should_probe_browser_url {
-            if let Some(resolved_url) = monitor::resolve_browser_url_for_window(
-                &active_window.app_name,
-                &active_window.window_title,
-            ) {
-                if last_browser_url.as_deref() != Some(resolved_url.as_str()) {
-                    log::debug!(
-                        "浏览器 URL 预探测命中: {} | {} -> {}",
-                        active_window.app_name,
-                        active_window.window_title,
-                        resolved_url
-                    );
-                }
-                active_window.browser_url = Some(resolved_url);
+        if let Some(resolved_url) = resolve_browser_url_once(
+            &mut browser_url_probe_attempted,
+            should_probe_browser_url,
+            || {
+                monitor::resolve_browser_url_for_window(
+                    &active_window.app_name,
+                    &active_window.window_title,
+                )
+            },
+        ) {
+            if last_browser_url.as_deref() != Some(resolved_url.as_str()) {
+                log::debug!(
+                    "浏览器 URL 预探测命中: {} | {} -> {}",
+                    active_window.app_name,
+                    active_window.window_title,
+                    resolved_url
+                );
             }
+            active_window.browser_url = Some(resolved_url);
         }
 
         // 浏览器 URL 存在瞬时采集失败时，尽量复用同窗口最近一次成功值，减少统计断裂。
         const BROWSER_URL_STICKY_GAP_SECS: i64 = 120;
         if active_window.browser_url.is_none()
-            && monitor::is_browser_app(&active_window.app_name)
+            && work_review_core::categorize::is_browser_app(&active_window.app_name)
             && !active_window.window_title.is_empty()
         {
             let now_ts = chrono::Local::now().timestamp();
@@ -2341,8 +2487,14 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
             url_changed,
         );
 
-        // 计算距离上次截图的时间
-        let elapsed_since_capture = last_capture_time.elapsed();
+        // 窗口/URL 查询也可能跨越待机；使用同一采样时刻计算时长与落库终点。
+        let accounting_sample = activity_clock::Sample::now();
+        if !accounting_sample.follows(poll_sample) {
+            continue;
+        }
+        let elapsed_since_capture = accounting_sample
+            .instant
+            .saturating_duration_since(last_capture_time);
         let elapsed_secs = elapsed_since_capture.as_secs();
 
         // ===== 应用切换日志 =====
@@ -2411,24 +2563,29 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
             continue;
         }
 
-        if should_refresh_browser_url_before_record(
+        let should_refresh_browser_url = should_refresh_browser_url_before_record(
             &active_window.app_name,
             &active_window.window_title,
+        );
+        if let Some(resolved_url) = resolve_browser_url_once(
+            &mut browser_url_probe_attempted,
+            should_refresh_browser_url,
+            || {
+                monitor::resolve_browser_url_for_window(
+                    &active_window.app_name,
+                    &active_window.window_title,
+                )
+            },
         ) {
-            if let Some(resolved_url) = monitor::resolve_browser_url_for_window(
-                &active_window.app_name,
-                &active_window.window_title,
-            ) {
-                if active_window.browser_url.as_deref() != Some(resolved_url.as_str()) {
-                    log::debug!(
-                        "浏览器 URL 落库前刷新: {} | {} -> {}",
-                        active_window.app_name,
-                        active_window.window_title,
-                        resolved_url
-                    );
-                }
-                active_window.browser_url = Some(resolved_url);
+            if active_window.browser_url.as_deref() != Some(resolved_url.as_str()) {
+                log::debug!(
+                    "浏览器 URL 落库前刷新: {} | {} -> {}",
+                    active_window.app_name,
+                    active_window.window_title,
+                    resolved_url
+                );
             }
+            active_window.browser_url = Some(resolved_url);
             url_changed = match (&last_browser_url, &active_window.browser_url) {
                 (Some(l), Some(r)) => l != r,
                 (None, None) => false,
@@ -2453,7 +2610,7 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
         last_browser_url = active_window.browser_url.clone();
 
         // 更新截图时间
-        last_capture_time = std::time::Instant::now();
+        last_capture_time = accounting_sample.instant;
 
         // 使用距离上次截图的实际经过时间作为本次记录的时长
         // 而非固定的轮询间隔，避免截图间隔大于轮询间隔时丢失时长
@@ -2476,7 +2633,7 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
         };
         // 锁已释放
 
-        let current_timestamp = chrono::Local::now().timestamp();
+        let current_timestamp = accounting_sample.timestamp();
         let previous_activity_to_backfill = if app_changed {
             resolve_previous_activity_to_backfill(
                 &state,
@@ -2503,8 +2660,8 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
             (current, previous)
         };
 
-        use privacy::PrivacyAction;
-        let result: Option<database::Activity> = match privacy_action {
+        use work_review_core::privacy::PrivacyAction;
+        let result: Option<work_review_core::database::Activity> = match privacy_action {
             PrivacyAction::Skip => {
                 log::debug!(
                     "完全跳过: {} - {}",
@@ -2558,7 +2715,7 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                     anonymized_is_confirmed_idle,
                     previous_app_idle_exempt,
                 );
-                backfill_previous_activity_if_needed(
+                let previous_backfill_succeeded = backfill_previous_activity_if_needed(
                     &state,
                     previous_activity_to_backfill.as_ref(),
                     previous_app_name.as_deref(),
@@ -2574,6 +2731,15 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                 ) {
                     log::debug!("空闲确认: 脱敏活动跳过时长记录");
                     0
+                } else if app_changed
+                    && previous_effective_duration > 0
+                    && !previous_backfill_succeeded
+                {
+                    log::warn!(
+                        "上一应用回补失败，改为把切换间隔记入脱敏活动 {}",
+                        active_window.app_name
+                    );
+                    duration_to_record
                 } else {
                     adjusted_duration
                 };
@@ -2581,7 +2747,7 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                 if effective_duration <= 0 && !app_changed {
                     None
                 } else {
-                    let activity = database::Activity {
+                    let activity = work_review_core::database::Activity {
                         id: None,
                         timestamp: current_timestamp,
                         app_name: active_window.app_name,
@@ -2636,7 +2802,7 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                             .get_latest_activity_by_url(url)
                             .ok()
                             .flatten()
-                    } else if monitor::is_browser_app(&active_window.app_name)
+                    } else if work_review_core::categorize::is_browser_app(&active_window.app_name)
                         && !active_window.window_title.is_empty()
                     {
                         state_guard
@@ -2670,7 +2836,7 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                     // 我们必须更严格地判断合并条件，否则不同标签页的切换会被错误合并。
                     if merge
                         && active_window.browser_url.is_none()
-                        && monitor::is_browser_app(&active_window.app_name)
+                        && work_review_core::categorize::is_browser_app(&active_window.app_name)
                         && (latest.window_title != active_window.window_title
                             || latest.browser_url.is_some())
                     {
@@ -2681,6 +2847,14 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                 } else {
                     false
                 };
+
+                // 新建与合并共用 OCR 冷却，窗口切换仍保留截图。
+                // ponytail: 冷却期内的短活动可能没有 OCR；需要逐条索引时再加有界后台队列。
+                let should_run_ocr = screenshots_enabled
+                    && should_run_ocr(
+                        last_ocr_time.map(|last| last.elapsed()),
+                        screenshot_interval,
+                    );
 
                 if is_merge {
                     // === 合并路径：不保存截图，只做 OCR ===
@@ -2696,10 +2870,8 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
 
                     // 截屏到内存，保存为临时文件供 OCR 使用
                     let screenshot_result = if screenshots_enabled {
-                        let state_guard = state.lock().unwrap_or_else(|e| e.into_inner());
-                        state_guard
-                            .screenshot_service
-                            .capture_for_window(Some(&active_window))
+                        capture_screenshot_for_window(&state, &active_window, accounting_sample)
+                            .await
                             .ok()
                     } else {
                         None
@@ -2812,6 +2984,9 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
 
                     // 对截图执行 OCR；若已成功合并，则保留最新截图并清理旧截图
                     if let Some(screenshot) = screenshot_result {
+                        if should_run_ocr {
+                            last_ocr_time = Some(std::time::Instant::now());
+                        }
                         let latest_capture_path =
                             latest_archive_path.unwrap_or_else(|| screenshot.path.clone());
                         let state_clone = state.clone();
@@ -2825,6 +3000,14 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
 
                         tokio::spawn(async move {
                             use std::sync::atomic::Ordering;
+
+                            if !should_run_ocr {
+                                if let Some(temp_path) = temporary_ocr_source_path {
+                                    let _ = std::fs::remove_file(temp_path);
+                                }
+                                let _ = std::fs::remove_file(latest_capture_path);
+                                return;
+                            }
 
                             // 非阻塞获取 permit，满载时跳过 OCR 避免任务堆积
                             let _permit = match ocr_sem.try_acquire_owned() {
@@ -2879,10 +3062,17 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                                             let filtered_text =
                                                 ocr::filter_sensitive_text(&ocr_result.text);
                                             if let Ok(state_guard) = state_clone.lock() {
-                                                let _ = state_guard.database.update_activity_ocr(
-                                                    latest_id,
-                                                    Some(filtered_text),
-                                                );
+                                                if let Err(error) =
+                                                    state_guard.database.update_activity_ocr(
+                                                        latest_id,
+                                                        Some(filtered_text),
+                                                        &state_guard.config.website_semantic_rules,
+                                                    )
+                                                {
+                                                    log::warn!(
+                                                        "保存 OCR 与网站分类失败(合并): {error}"
+                                                    );
+                                                }
                                                 log::info!(
                                                     "OCR 完成(合并): 活动 {} 识别到 {} 个字符",
                                                     latest_id,
@@ -2907,7 +3097,7 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                         });
                     }
 
-                    Some(database::Activity {
+                    Some(work_review_core::database::Activity {
                         id: Some(latest_id),
                         timestamp: current_timestamp,
                         app_name: active_window.app_name.clone(),
@@ -2925,12 +3115,12 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                 } else {
                     // === 新建路径：正常截屏并保存 ===
                     if screenshots_enabled {
-                        let screenshot_result = {
-                            let state_guard = state.lock().unwrap_or_else(|e| e.into_inner());
-                            state_guard
-                                .screenshot_service
-                                .capture_for_window(Some(&active_window))
-                        };
+                        let screenshot_result = capture_screenshot_for_window(
+                            &state,
+                            &active_window,
+                            accounting_sample,
+                        )
+                        .await;
 
                         match screenshot_result {
                             Ok(screenshot_result) => {
@@ -2958,16 +3148,17 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                                     is_confirmed_idle,
                                     previous_app_idle_exempt,
                                 );
-                                backfill_previous_activity_if_needed(
-                                    &state,
-                                    previous_activity_to_backfill.as_ref(),
-                                    previous_app_name.as_deref(),
-                                    previous_window_title.as_deref(),
-                                    previous_browser_url.as_deref(),
-                                    previous_effective_duration,
-                                    current_timestamp,
-                                    &active_window.app_name,
-                                );
+                                let previous_backfill_succeeded =
+                                    backfill_previous_activity_if_needed(
+                                        &state,
+                                        previous_activity_to_backfill.as_ref(),
+                                        previous_app_name.as_deref(),
+                                        previous_window_title.as_deref(),
+                                        previous_browser_url.as_deref(),
+                                        previous_effective_duration,
+                                        current_timestamp,
+                                        &active_window.app_name,
+                                    );
 
                                 // 如果确认空闲，跳过时长记录（但仍创建活动记录以保持截图）
                                 let effective_duration = if should_zero_duration_for_idle(
@@ -2976,6 +3167,15 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                                 ) {
                                     log::debug!("空闲确认: 新活动时长设为 0");
                                     0
+                                } else if app_changed
+                                    && previous_effective_duration > 0
+                                    && !previous_backfill_succeeded
+                                {
+                                    log::warn!(
+                                        "上一应用回补失败，改为把切换间隔记入当前活动 {}",
+                                        active_window.app_name
+                                    );
+                                    duration_to_record
                                 } else {
                                     adjusted_duration
                                 };
@@ -3006,9 +3206,9 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                                     )
                                 };
 
-                                let activity = database::Activity {
+                                let activity = work_review_core::database::Activity {
                                     id: None,
-                                    timestamp: screenshot_result.timestamp,
+                                    timestamp: current_timestamp,
                                     app_name: active_window.app_name.clone(),
                                     window_title: active_window.window_title,
                                     screenshot_path: relative_path.clone(),
@@ -3039,9 +3239,19 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                                         );
 
                                         // 异步 OCR（新建活动的截图已保存，不删除）
+                                        if should_run_ocr {
+                                            last_ocr_time = Some(std::time::Instant::now());
+                                        }
                                         let state_clone = state.clone();
                                         let ocr_sem = ocr_semaphore.clone();
                                         tokio::spawn(async move {
+                                            if !should_run_ocr {
+                                                if let Some(temp_path) = temporary_ocr_source_path {
+                                                    let _ = std::fs::remove_file(temp_path);
+                                                }
+                                                return;
+                                            }
+
                                             // 非阻塞获取 permit，满载时跳过 OCR
                                             let _permit = match ocr_sem.try_acquire_owned() {
                                                 Ok(p) => p,
@@ -3079,12 +3289,18 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                                                             );
                                                         if let Ok(state_guard) = state_clone.lock()
                                                         {
-                                                            let _ = state_guard
+                                                            if let Err(error) = state_guard
                                                                 .database
                                                                 .update_activity_ocr(
                                                                     activity_id,
                                                                     Some(filtered_text),
-                                                                );
+                                                                    &state_guard
+                                                                        .config
+                                                                        .website_semantic_rules,
+                                                                )
+                                                            {
+                                                                log::warn!("保存 OCR 与网站分类失败(新建): {error}");
+                                                            }
                                                             log::info!(
                                                         "OCR 完成(新建): 活动 {} 识别到 {} 个字符",
                                                         activity_id,
@@ -3129,7 +3345,7 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                                             }
                                         }
 
-                                        Some(database::Activity {
+                                        Some(work_review_core::database::Activity {
                                             id: Some(activity_id),
                                             ..activity
                                         })
@@ -3163,7 +3379,7 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                             is_confirmed_idle,
                             previous_app_idle_exempt,
                         );
-                        backfill_previous_activity_if_needed(
+                        let previous_backfill_succeeded = backfill_previous_activity_if_needed(
                             &state,
                             previous_activity_to_backfill.as_ref(),
                             previous_app_name.as_deref(),
@@ -3179,11 +3395,20 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                         ) {
                             log::debug!("关闭截图后按输入空闲判定，新活动时长设为 0");
                             0
+                        } else if app_changed
+                            && previous_effective_duration > 0
+                            && !previous_backfill_succeeded
+                        {
+                            log::warn!(
+                                "上一应用回补失败，改为把切换间隔记入当前活动 {}",
+                                active_window.app_name
+                            );
+                            duration_to_record
                         } else {
                             adjusted_duration
                         };
 
-                        let activity = database::Activity {
+                        let activity = work_review_core::database::Activity {
                             id: None,
                             timestamp: current_timestamp,
                             app_name: active_window.app_name.clone(),
@@ -3211,7 +3436,7 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                                     active_window.app_name,
                                     activity_id
                                 );
-                                Some(database::Activity {
+                                Some(work_review_core::database::Activity {
                                     id: Some(activity_id),
                                     ..activity
                                 })
@@ -3233,11 +3458,23 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
             }
         }
 
+        if !activity_clock::Sample::now().follows(accounting_sample) {
+            overlay_sessions.clear();
+            continue;
+        }
+
         // ===== 浮动窗口（PiP 画中画）检测 =====
         // 检测 layer > 0 的浮动窗口（如视频小窗），为它们记录使用时长
         // 浮动窗口不截图（截图已由主活动管理），仅记录时长
+        // ponytail: 按截图周期采样，短于一个周期的浮窗不估算时长；需要精确计时再独立高频采样。
         let overlay_windows = monitor::get_overlay_windows(&frontmost_app_name);
+        let observed_at = std::time::Instant::now();
+        let mut next_overlay_sessions = std::collections::HashMap::new();
         for ow in &overlay_windows {
+            // 同一应用可能有多个不相邻的浮窗，每轮只能计时一次。
+            if next_overlay_sessions.contains_key(&ow.app_name) {
+                continue;
+            }
             // 隐私检查
             let ow_privacy = {
                 let state_guard = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -3246,7 +3483,7 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                     .check_privacy(&ow.app_name, &ow.window_title)
             };
 
-            if ow_privacy == privacy::PrivacyAction::Skip {
+            if ow_privacy == work_review_core::privacy::PrivacyAction::Skip {
                 log::debug!("浮动窗口跳过(隐私): {}", ow.app_name);
                 continue;
             }
@@ -3269,7 +3506,6 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
             };
             let ow_category = classification.base_category.clone();
             let current_ts = chrono::Local::now().timestamp();
-            let ow_duration = poll_interval_ms.div_ceil(1000) as i64;
 
             // 查找该应用的最近活动记录，尝试合并
             let latest = {
@@ -3281,16 +3517,22 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                     .flatten()
             };
 
-            const OW_MERGE_GAP_SECS: i64 = 600;
-            let can_merge = if let Some(ref act) = latest {
-                ow.app_name != "Unknown" && (current_ts - act.timestamp) <= OW_MERGE_GAP_SECS
-            } else {
-                false
-            };
+            let increment = latest.as_ref().and_then(|activity| {
+                overlay_session_increment(
+                    overlay_sessions.get(&ow.app_name).copied(),
+                    activity,
+                    observed_at,
+                    current_ts,
+                )
+            });
 
-            if can_merge {
+            if let Some((ow_duration, accounted_at)) = increment {
                 let act = latest.unwrap();
                 if let Some(act_id) = act.id {
+                    if ow_duration == 0 {
+                        next_overlay_sessions.insert(ow.app_name.clone(), (act_id, accounted_at));
+                        continue;
+                    }
                     let state_guard = state.lock().unwrap_or_else(|e| e.into_inner());
                     match state_guard.database.merge_activity(
                         act_id,
@@ -3301,6 +3543,8 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                         None,
                     ) {
                         Ok(_) => {
+                            next_overlay_sessions
+                                .insert(ow.app_name.clone(), (act_id, accounted_at));
                             log::info!(
                                 "🪟 浮动窗口合并: {} (id={}, +{}s, 总{}s)",
                                 ow.app_name,
@@ -3313,14 +3557,17 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                     }
                 }
             } else {
-                // 新建活动记录（无截图）
-                let ow_title = if ow_privacy == privacy::PrivacyAction::Anonymize {
+                // 首次观察不能反推浮窗何时出现，先以 0 秒创建连续会话。
+                let ow_duration = 0;
+                let ow_title = if ow_privacy == work_review_core::privacy::PrivacyAction::Anonymize
+                {
                     "[内容已脱敏]".to_string()
                 } else {
-                    ow.window_title.clone()
+                    let state_guard = state.lock().unwrap_or_else(|e| e.into_inner());
+                    state_guard.privacy_filter.filter_text(&ow.window_title)
                 };
 
-                let activity = database::Activity {
+                let activity = work_review_core::database::Activity {
                     id: None,
                     timestamp: current_ts,
                     app_name: ow.app_name.clone(),
@@ -3339,6 +3586,7 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                 let state_guard = state.lock().unwrap_or_else(|e| e.into_inner());
                 match state_guard.database.insert_activity(&activity) {
                     Ok(id) => {
+                        next_overlay_sessions.insert(ow.app_name.clone(), (id, observed_at));
                         log::info!(
                             "🪟 浮动窗口新建: {} (id={}, {}s)",
                             ow.app_name,
@@ -3350,6 +3598,7 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                 }
             }
         }
+        overlay_sessions = next_overlay_sessions;
     }
 }
 
@@ -3361,8 +3610,8 @@ pub(crate) fn build_hourly_summary(
     state: &Arc<Mutex<AppState>>,
     date: &str,
     hour: i32,
-) -> Option<database::HourlySummary> {
-    use analysis::hourly::{generate_fallback_summary, HourlyStats};
+) -> Option<work_review_core::database::HourlySummary> {
+    use work_review_core::analysis::hourly::{generate_fallback_summary, HourlyStats};
 
     let activities = {
         let state_guard = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -3371,10 +3620,10 @@ pub(crate) fn build_hourly_summary(
 
     match activities {
         Ok(acts) if !acts.is_empty() => {
-            let stats = HourlyStats::from_activities(date, hour, acts);
+            let stats = HourlyStats::from_activities(acts);
             let summary = generate_fallback_summary(&stats);
 
-            Some(database::HourlySummary {
+            Some(work_review_core::database::HourlySummary {
                 id: None,
                 date: date.to_string(),
                 hour,
@@ -3846,6 +4095,19 @@ async fn entity_classify_task(state: Arc<Mutex<AppState>>) {
             continue;
         };
 
+        // 一轮模型结果只读取一次近 14 天浏览器 URL，避免每个域名重复扫描同一批历史。
+        let retro_domain_rows = if results.iter().any(|(key, _, _)| key.starts_with("domain:")) {
+            let database = {
+                let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+                guard.database.clone()
+            };
+            database
+                .get_browser_activity_urls(now - RETRO_SECS)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
         let mut learned = 0usize;
         for (key, base, semantic) in results {
             // 模型对没把握的实体返回 "skip":不学习、不缓存,留待将来有更多上下文再判
@@ -3861,12 +4123,11 @@ async fn entity_classify_task(state: Arc<Mutex<AppState>>) {
                 continue;
             }
 
-            let persisted = {
+            let database = {
                 let guard = state.lock().unwrap_or_else(|e| e.into_inner());
-                guard
-                    .database
-                    .upsert_entity_category(&key, &base, &semantic)
+                guard.database.clone()
             };
+            let persisted = database.upsert_entity_category(&key, &base, &semantic);
             if let Err(e) = persisted {
                 log::warn!("写入实体分类缓存失败({key}): {e}");
                 continue;
@@ -3876,32 +4137,25 @@ async fn entity_classify_task(state: Arc<Mutex<AppState>>) {
             }
 
             // 回溯修正近 14 天历史记录,让统计"自己变准"
-            let updated = if let Some(app) = key.strip_prefix("app:") {
+            let database = {
                 let guard = state.lock().unwrap_or_else(|e| e.into_inner());
-                guard
-                    .database
+                guard.database.clone()
+            };
+            let updated = if let Some(app) = key.strip_prefix("app:") {
+                database
                     .reclassify_app_activities(app, &base, &semantic, now - RETRO_SECS)
                     .unwrap_or(0)
             } else if let Some(domain) = key.strip_prefix("domain:") {
-                let rows = {
-                    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
-                    guard
-                        .database
-                        .get_browser_activity_urls(now - RETRO_SECS)
-                        .unwrap_or_default()
-                };
-                let ids: Vec<i64> = rows
-                    .into_iter()
+                let ids: Vec<i64> = retro_domain_rows
+                    .iter()
                     .filter(|(_, url)| {
                         let row_domain =
                             work_review_core::config::PrivacyConfig::extract_domain(url);
                         row_domain.split(':').next().unwrap_or("") == domain
                     })
-                    .map(|(id, _)| id)
+                    .map(|(id, _)| *id)
                     .collect();
-                let guard = state.lock().unwrap_or_else(|e| e.into_inner());
-                guard
-                    .database
+                database
                     .reclassify_activities_by_ids(&ids, &base, &semantic)
                     .unwrap_or(0)
             } else {
@@ -3929,10 +4183,11 @@ async fn storage_cleanup_task(state: Arc<Mutex<AppState>>) {
         // 启动清理已在 main 里执行过,首轮直接等一个周期
         tokio::time::sleep(tokio::time::Duration::from_secs(SWEEP_INTERVAL_SECS)).await;
 
-        let (data_dir, storage_config, allowed) = {
+        let (data_dir, database, storage_config, allowed) = {
             let guard = state.lock().unwrap_or_else(|e| e.into_inner());
             (
                 guard.data_dir.clone(),
+                guard.database.clone(),
                 guard.config.storage.clone(),
                 should_run_startup_cleanup(guard.config_load_status),
             )
@@ -3943,7 +4198,7 @@ async fn storage_cleanup_task(state: Arc<Mutex<AppState>>) {
 
         // 用独立实例在阻塞线程执行,避免清理期间占用 AppState 锁阻塞采集循环
         let manager = StorageManager::new(&data_dir, storage_config);
-        match tokio::task::spawn_blocking(move || manager.cleanup()).await {
+        match tokio::task::spawn_blocking(move || manager.cleanup(&database)).await {
             Ok(Ok(_)) => log::debug!("周期存储清理完成"),
             Ok(Err(e)) => log::warn!("周期存储清理失败: {e}"),
             Err(e) => log::warn!("周期存储清理任务异常: {e}"),
@@ -3985,7 +4240,13 @@ async fn main() {
     log::info!("work回顾助手启动中...");
 
     // 获取数据目录
-    let data_dir = resolve_data_dir();
+    let data_dir = match data_dir::resolve_data_dir() {
+        Ok(directory) => directory,
+        Err(error) => {
+            data_dir::report_startup_error(&error);
+            std::process::exit(1);
+        }
+    };
     log::info!("数据目录: {data_dir:?}");
 
     // 加载配置
@@ -4164,7 +4425,7 @@ async fn main() {
 
     // 配置损坏时使用默认存储策略会误删历史数据，因此故障安全启动必须跳过清理。
     if should_run_startup_cleanup(config_load_status) {
-        if let Err(e) = storage_manager.cleanup() {
+        if let Err(e) = storage_manager.cleanup(&database) {
             log::warn!("启动时清理存储失败: {e}");
         }
     } else {
@@ -4196,6 +4457,7 @@ async fn main() {
         generating_report: false,
         localhost_api_runtime: localhost_api::LocalhostApiRuntime::default(),
         telegram_bot_runtime: telegram_bot::TelegramBotRuntime::default(),
+        wecom_bot_runtime: wecom_aibot::WecomBotRuntime::default(),
         cached_active_window: None,
     }));
     let app_lifecycle_state = Arc::new(Mutex::new(AppLifecycleState::default()));
@@ -4343,12 +4605,18 @@ async fn main() {
             // 初始化智能穿透运行时 flag（从启动 config，供 input bridge 轮询无锁读）。
             // 配置损坏时不得注册全局键鼠监听，以免故障安全启动仍采集输入事件。
             if should_initialize_avatar_input(config_load_status) {
-                if let Ok(s) = state.inner().lock() {
+                let avatar_enabled = if let Ok(s) = state.inner().lock() {
                     avatar_input::set_avatar_enabled_flag(s.config.avatar_enabled);
                     avatar_input::set_avatar_click_through_flag(s.config.avatar_click_through);
+                    s.config.avatar_enabled
+                } else {
+                    false
+                };
+                if avatar_enabled {
+                    avatar_input::start_avatar_input_monitor(app.handle());
+                    avatar_input::spawn_avatar_input_monitor_retry(app.handle().clone());
+                    avatar_input::spawn_avatar_input_bridge(app.handle().clone());
                 }
-                avatar_input::start_avatar_input_monitor(app.handle());
-                avatar_input::spawn_avatar_input_bridge(app.handle().clone());
             } else {
                 avatar_input::set_avatar_enabled_flag(false);
                 avatar_input::set_avatar_click_through_flag(false);
@@ -4361,6 +4629,10 @@ async fn main() {
             if let Err(e) = telegram_bot::sync_telegram_bot_runtime(state.inner()) {
                 log::warn!("初始化 Telegram Bot 失败: {e}");
             }
+            if let Err(e) = wecom_aibot::sync_wecom_bot_runtime(state.inner()) {
+                log::warn!("初始化企业微信 Bot 失败: {e}");
+            }
+            config_sync::spawn_pull_on_startup(app.handle().clone(), state.inner().clone());
 
             // 创建 Tauri v2 系统托盘
             let tray_locale = state
@@ -4508,6 +4780,9 @@ async fn main() {
                 })
                 .build(app)?;
 
+            // 先发布句柄，再注册后台电源通知，避免恢复事件找不到应用。
+            let _ = APP_HANDLE.set(app.handle().clone());
+
             // 启动后台截屏任务
             tauri::async_runtime::spawn(async move {
                 background_screenshot_task(state_clone, screenshot_app_handle).await;
@@ -4543,9 +4818,6 @@ async fn main() {
 
             sync_effective_dock_visibility(app.handle());
 
-            // 保存 AppHandle 到全局变量，用于从 macOS Dock 点击恢复窗口
-            let _ = APP_HANDLE.set(app.handle().clone());
-
             // 注: macOS Dock 点击恢复窗口通过系统托盘 LeftClick 事件处理
             // 用户需要点击状态栏的系统托盘图标来恢复窗口
 
@@ -4574,6 +4846,7 @@ async fn main() {
             commands::get_localhost_api_status,
             commands::get_node_gateway_status,
             commands::get_telegram_bot_status,
+            commands::get_wecom_bot_status,
             commands::generate_telegram_bot_bind_code,
             commands::generate_text_with_model,
             commands::reveal_localhost_api_token,
@@ -4591,6 +4864,7 @@ async fn main() {
             commands::save_avatar_position,
             commands::persist_avatar_position,
             commands::set_avatar_window_expanded,
+            commands::set_avatar_interactive_regions,
             commands::get_data_dir,
             commands::get_default_data_dir,
             commands::get_runtime_platform,
@@ -4635,6 +4909,11 @@ async fn main() {
             commands::get_assistant_messages,
             commands::append_assistant_message,
             commands::delete_assistant_conversation,
+            commands::list_user_memories,
+            commands::create_user_memory,
+            commands::update_user_memory,
+            commands::delete_user_memory,
+            commands::clear_user_memories,
             commands::index_semantic_memory,
             commands::semantic_memory_status,
             commands::test_embedding_model,
@@ -4700,33 +4979,35 @@ mod tests {
         advance_break_reminder, avatar_activity_decision, avatar_monitor_poll_interval_ms,
         avatar_monitor_poll_interval_ms_for_platform, avatar_proactive_ai_should_run,
         avatar_transition_decision, browser_change_capture_min_interval_ms,
-        describe_config_file_issue, duplicate_instance_should_stay_silent,
-        effective_dock_visibility, initial_recording_state, launch_args_contain_autostart,
-        main_window_close_behavior, monitoring_poll_interval_ms,
-        monitoring_poll_interval_ms_for_platform, persist_previous_activity_backfill,
-        previous_app_backfill_duration, record_avatar_window_switch, recording_loop_decision,
-        resolve_activity_classification, reusable_cached_active_window,
+        browser_url_probe_attempted_after_full_lookup, describe_config_file_issue,
+        duplicate_instance_should_stay_silent, effective_dock_visibility, initial_recording_state,
+        launch_args_contain_autostart, main_window_close_behavior, monitoring_poll_interval_ms,
+        monitoring_poll_interval_ms_for_platform, overlay_session_increment,
+        persist_previous_activity_backfill, previous_app_backfill_duration,
+        record_avatar_window_switch, recording_loop_decision, resolve_activity_classification,
+        resolve_browser_url_once, reusable_cached_active_window,
         screen_lock_check_interval_ms_for_platform, should_confirm_idle,
         should_emit_avatar_backlog_nudge, should_hide_main_window_on_setup,
         should_initialize_avatar_input, should_initialize_startup_permissions,
         should_merge_contiguous_activity, should_persist_merge_update, should_prevent_exit,
         should_probe_browser_url_before_change_detection, should_request_screen_capture_permission,
-        should_run_startup_cleanup, should_skip_system_window, should_zero_duration_for_idle,
-        tray_recording_toggle_action, tray_recording_toggle_label, AvatarNudgeRuntime,
-        BreakReminderRuntime, BreakReminderSignal, MainWindowCloseBehavior, RecordingToggleAction,
+        should_run_ocr, should_run_startup_cleanup, should_skip_system_window,
+        should_zero_duration_for_idle, tray_recording_toggle_action, tray_recording_toggle_label,
+        AvatarNudgeRuntime, BreakReminderRuntime, BreakReminderSignal, MainWindowCloseBehavior,
+        RecordingToggleAction,
     };
     use crate::avatar_engine::{
         apply_avatar_visual_settings, default_avatar_state, derive_avatar_state,
     };
-    use crate::config::{
+    use crate::monitor::ActiveWindow;
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use work_review_core::config::{
         AiProvider, AppConfig, AvatarFollowupItem, ConfigLoadStatus, ModelConfig,
         WebsiteSemanticRule,
     };
-    use crate::database::Database;
-    use crate::monitor::ActiveWindow;
-    use crate::privacy::PrivacyFilter;
-    use std::path::PathBuf;
-    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use work_review_core::database::Database;
+    use work_review_core::privacy::PrivacyFilter;
 
     fn temp_db_path(name: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -4784,6 +5065,88 @@ mod tests {
         assert!(decision.should_continue);
         assert!(!decision.reset_capture_clock);
         assert_eq!(decision.screenshot_interval, 30);
+    }
+
+    #[test]
+    fn 浮窗应按实际连续观察间隔计时且不得跨会话合并() {
+        let start = Instant::now();
+        let mut activity = work_review_core::database::Activity {
+            id: Some(7),
+            timestamp: 1000,
+            app_name: "Player".into(),
+            window_title: "PiP".into(),
+            screenshot_path: String::new(),
+            ocr_text: None,
+            category: "entertainment".into(),
+            duration: 0,
+            browser_url: None,
+            executable_path: None,
+            semantic_category: None,
+            semantic_confidence: None,
+            screenshot_url: None,
+        };
+        let sample = start + Duration::from_millis(30_500);
+        assert_eq!(
+            overlay_session_increment(None, &activity, sample, 1030),
+            None
+        );
+        assert_eq!(
+            overlay_session_increment(Some((7, start)), &activity, sample, 1030),
+            Some((30, start + Duration::from_secs(30)))
+        );
+        // 30.5 秒后的半秒余量不得被每轮舍弃：再过 1.5 秒应追加 2 秒。
+        activity.timestamp = 1030;
+        assert_eq!(
+            overlay_session_increment(
+                Some((7, start + Duration::from_secs(30))),
+                &activity,
+                start + Duration::from_secs(32),
+                1032
+            ),
+            Some((2, start + Duration::from_secs(32)))
+        );
+        // 前台记录取代了上一次浮窗记录、长时间断开、系统时钟倒退都须新建会话。
+        activity.id = Some(8);
+        assert_eq!(
+            overlay_session_increment(Some((7, start)), &activity, sample, 1030),
+            None
+        );
+        activity.id = Some(7);
+        assert_eq!(
+            overlay_session_increment(Some((7, start)), &activity, sample, 1631),
+            None
+        );
+        assert_eq!(
+            overlay_session_increment(Some((7, start)), &activity, sample, 1029),
+            None
+        );
+        activity.app_name = "Unknown".into();
+        assert_eq!(
+            overlay_session_increment(Some((7, start)), &activity, sample, 1030),
+            None
+        );
+    }
+
+    #[test]
+    fn ocr应遵循全局间隔且首次立即执行() {
+        assert!(should_run_ocr(None, 30));
+        assert!(!should_run_ocr(Some(Duration::from_secs(29)), 30));
+        assert!(should_run_ocr(Some(Duration::from_secs(30)), 30));
+        assert!(!should_run_ocr(Some(Duration::from_secs(5)), 30));
+        assert!(!should_run_ocr(Some(Duration::ZERO), 30));
+
+        // 连续 80 分钟每秒切换窗口，30 秒间隔最多启动 160 次 OCR。
+        let mut last_ocr_at = None;
+        let mut ocr_count = 0;
+        for second in 0..80 * 60 {
+            let now = Duration::from_secs(second);
+            let elapsed = last_ocr_at.map(|last| now - last);
+            if should_run_ocr(elapsed, 30) {
+                last_ocr_at = Some(now);
+                ocr_count += 1;
+            }
+        }
+        assert_eq!(ocr_count, 160);
     }
 
     #[test]
@@ -4941,15 +5304,66 @@ mod tests {
     }
 
     #[test]
-    fn 非mac主监控轮询间隔应保持半秒() {
-        assert_eq!(monitoring_poll_interval_ms_for_platform(false), 500);
+    fn 网站规则应在浏览器网址缺失或不可用时匹配标题() {
+        let mut config = AppConfig::default();
+        config.website_semantic_rules = vec![WebsiteSemanticRule {
+            domain: "github.com".to_string(),
+            semantic_category: "休息娱乐".to_string(),
+        }];
+        config.normalize();
+
+        for browser_url in [None, Some("  "), Some("https://linux.dolatest")] {
+            let classification = resolve_activity_classification(
+                &config,
+                "Google Chrome",
+                "github.com - Google Chrome",
+                browser_url,
+            );
+            assert_eq!(classification.base_category, "entertainment");
+            assert_eq!(classification.semantic_category, "休息娱乐");
+            assert_eq!(classification.confidence, 100);
+        }
     }
 
     #[test]
-    fn 非mac桌宠活跃轮询间隔应压到一百八十毫秒() {
+    fn 网站规则不应因标题提到域名而覆盖其它网站或普通应用() {
+        let mut config = AppConfig::default();
+        config.website_semantic_rules = vec![WebsiteSemanticRule {
+            domain: "github.com".to_string(),
+            semantic_category: "休息娱乐".to_string(),
+        }];
+        config.normalize();
+
+        for (app_name, browser_url) in [
+            ("Google Chrome", Some("https://docs.github.com/guide")),
+            ("Visual Studio Code", None),
+        ] {
+            let classification = resolve_activity_classification(
+                &config,
+                app_name,
+                "github.com - 项目文档",
+                browser_url,
+            );
+            assert!(!classification
+                .evidence
+                .iter()
+                .any(|evidence| evidence.starts_with("命中网站语义规则:")));
+        }
+    }
+
+    #[test]
+    fn 非mac主监控轮询间隔应按平台避免高频窗口查询() {
+        assert_eq!(
+            monitoring_poll_interval_ms_for_platform(false),
+            if cfg!(target_os = "linux") { 1000 } else { 500 }
+        );
+    }
+
+    #[test]
+    fn 非mac桌宠活跃轮询间隔应按平台避免高频窗口查询() {
         assert_eq!(
             avatar_monitor_poll_interval_ms_for_platform(false, true),
-            180
+            if cfg!(target_os = "linux") { 1000 } else { 180 }
         );
     }
 
@@ -4999,6 +5413,89 @@ mod tests {
             None,
             Some("https://example.com"),
         ));
+    }
+
+    #[test]
+    fn 完整窗口查询后本轮后续阶段都不应再次查询url() {
+        let mut calls = 1;
+        let mut attempted = browser_url_probe_attempted_after_full_lookup(true, true);
+
+        let first = resolve_browser_url_once(&mut attempted, true, || {
+            calls += 1;
+            None
+        });
+        let second = resolve_browser_url_once(&mut attempted, true, || {
+            calls += 1;
+            None
+        });
+
+        assert_eq!(calls, 1);
+        assert!(first.is_none());
+        assert!(second.is_none());
+    }
+
+    #[test]
+    fn 变化检测领取查询后落库刷新不能再次领取() {
+        let mut attempted = false;
+
+        let mut calls = 0;
+        resolve_browser_url_once(&mut attempted, true, || {
+            calls += 1;
+            None
+        });
+        resolve_browser_url_once(&mut attempted, true, || {
+            calls += 1;
+            None
+        });
+
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn 浏览器url查询失败也应消耗本轮预算() {
+        let mut attempted = false;
+        let mut calls = 0;
+
+        let resolved_url = resolve_browser_url_once(&mut attempted, true, || {
+            calls += 1;
+            None
+        });
+        let retried_url = resolve_browser_url_once(&mut attempted, true, || {
+            calls += 1;
+            Some("https://example.com".to_string())
+        });
+
+        assert_eq!(calls, 1);
+        assert!(resolved_url.is_none());
+        assert!(retried_url.is_none());
+    }
+
+    #[test]
+    fn 变化检测无需查询时落库前仍可使用唯一预算() {
+        let mut attempted = false;
+
+        let mut calls = 0;
+        resolve_browser_url_once(&mut attempted, false, || {
+            calls += 1;
+            None
+        });
+        resolve_browser_url_once(&mut attempted, true, || {
+            calls += 1;
+            None
+        });
+        resolve_browser_url_once(&mut attempted, true, || {
+            calls += 1;
+            None
+        });
+
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn 完整窗口查询是否探测url不应依赖查询结果() {
+        assert!(browser_url_probe_attempted_after_full_lookup(true, true));
+        assert!(!browser_url_probe_attempted_after_full_lookup(false, true));
+        assert!(!browser_url_probe_attempted_after_full_lookup(true, false));
     }
 
     #[test]
@@ -5132,6 +5629,7 @@ mod tests {
             endpoint: "http://localhost:11434".to_string(),
             api_key: None,
             model: "qwen3".to_string(),
+            ..ModelConfig::default_text()
         };
 
         assert!(avatar_proactive_ai_should_run(

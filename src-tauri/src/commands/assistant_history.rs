@@ -4,11 +4,11 @@
 //! 替代此前 localStorage 40 条上限的易失存储。前端在每轮问答完成后调用
 //! `append_assistant_message` 存档，打开助手页时按会话加载。
 
-use crate::database::{AssistantConversation, AssistantStoredMessage};
-use crate::error::AppError;
 use crate::AppState;
 use std::sync::{Arc, Mutex};
 use tauri::State;
+use work_review_core::database::{AssistantConversation, AssistantStoredMessage};
+use work_review_core::error::AppError;
 
 /// 会话列表（按最近更新排序）。
 #[tauri::command]

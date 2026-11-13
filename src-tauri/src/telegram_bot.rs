@@ -2,14 +2,14 @@ use crate::bot_common::{
     build_device_list, handle_cmd, normalize_command, progress_text_for_command, DeviceEndpoint,
     NON_TEXT_REPLY, OUTPUT_DIVIDER,
 };
-use crate::config::AppConfig;
-use crate::error::AppError;
 use crate::AppState;
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use std::sync::{Arc, Mutex};
 use subtle::ConstantTimeEq;
 use tokio::task::JoinHandle;
+use work_review_core::config::AppConfig;
+use work_review_core::error::AppError;
 
 #[derive(Deserialize)]
 struct TgResp<T> {
@@ -338,7 +338,16 @@ async fn run(
                                             send_text(&client, bot_token, msg.chat.id, progress)
                                                 .await;
                                         }
-                                        handle_cmd(&client, &devices, text).await
+                                        let generate_timeout = state
+                                            .lock()
+                                            .ok()
+                                            .map(|s| {
+                                                crate::bot_common::report_generate_timeout(
+                                                    &s.config,
+                                                )
+                                            })
+                                            .unwrap_or_else(|| std::time::Duration::from_secs(120));
+                                        handle_cmd(&client, &devices, text, generate_timeout).await
                                     } else {
                                         Some(NON_TEXT_REPLY.to_string())
                                     };
@@ -729,7 +738,7 @@ fn set_running(shared: &Arc<std::sync::Mutex<SharedBotStatus>>, running: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::AppConfig;
+    use work_review_core::config::AppConfig;
 
     #[test]
     fn 命令应支持带机器人用户名后缀() {

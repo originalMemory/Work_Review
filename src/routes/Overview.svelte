@@ -1,18 +1,20 @@
-<script>
+<script lang="ts">
   import { onMount, onDestroy, tick } from 'svelte';
+  import { get } from 'svelte/store';
   import { invoke } from '@tauri-apps/api/core';
-  import { listen } from '@tauri-apps/api/event';
+  import { listen, type Event as TauriEvent } from '@tauri-apps/api/event';
   import StatsCard from '../lib/components/StatsCard.svelte';
   import AppUsageChart from '../lib/components/AppUsageChart.svelte';
   import ActivityHourlyChart from '../lib/components/ActivityHourlyChart.svelte';
   import LocalizedDatePicker from '../lib/components/LocalizedDatePicker.svelte';
+  import { cache } from '../lib/stores/cache.ts';
+  import { portalToBody } from '$lib/actions/portal.ts';
+  import { recordingStore, isActiveRecording } from '../lib/stores/recording.ts';
+  import { confirm } from '../lib/stores/confirm.ts';
+  import { showToast } from '../lib/stores/toast.ts';
+  import { preloadAppIcons, type AppIconInvoke } from '../lib/stores/iconCache.ts';
   import DeviceFilter from '../lib/components/DeviceFilter.svelte';
-  import { selectedDeviceId } from '../lib/stores/deviceFilter.js';
-  import { cache } from '../lib/stores/cache.js';
-  import { recordingStore, isActiveRecording } from '../lib/stores/recording.js';
-  import { confirm } from '../lib/stores/confirm.js';
-  import { showToast } from '../lib/stores/toast.js';
-  import { preloadAppIcons } from '../lib/stores/iconCache.js';
+  import { selectedDeviceId } from '../lib/stores/deviceFilter.ts';
   import {
     formatDurationLocalized,
     formatLocalizedDate,
@@ -21,19 +23,146 @@
     t,
     translateCategoryLabel,
     translateSemanticCategoryLabel,
-  } from '$lib/i18n/index.js';
-  import { formatUserError } from '$lib/utils/errorDisplay.js';
-  import { trapFocus } from '$lib/utils/focusTrap.js';
-  import { formatBrowserUrlForDisplay } from '../lib/utils/browserUrl.js';
-  import { getViewportPopoverPlacement } from '../lib/utils/popoverPosition.js';
-  import { semanticCategoryStore } from '../lib/stores/categories.js';
+  } from '$lib/i18n/index.ts';
+  import { formatUserError } from '$lib/utils/errorDisplay.ts';
+  import { trapFocus } from '$lib/utils/focusTrap.ts';
+  import { formatBrowserUrlForDisplay } from '../lib/utils/browserUrl.ts';
+  import { getViewportPopoverPlacement } from '../lib/utils/popoverPosition.ts';
+  import {
+    semanticCategoryStore,
+    type CategoryInfo,
+    type SemanticCategoryInfo,
+  } from '../lib/stores/categories.ts';
   import {
     buildDomainPresentation,
     getSemanticCategoryColor,
-  } from './overviewDomainPresentation.js';
-  import { buildCategoryCompositionSummary } from './overviewCategoryPresentation.js';
+  } from './overviewDomainPresentation.ts';
+  import { buildCategoryCompositionSummary } from './overviewCategoryPresentation.ts';
 
-  async function safeListen(eventName, handler) {
+  interface AppUsage {
+    app_name: string;
+    duration: number;
+    count: number;
+    executable_path: string | null;
+    screenshot_url?: string | null;
+  }
+
+  interface CategoryUsage {
+    category: string;
+    duration: number;
+  }
+
+  interface HourlyActivityBucket {
+    hour: number;
+    duration: number;
+  }
+
+  interface HourlyAppDuration {
+    app_name: string;
+    duration: number;
+    category: string;
+    screenshot_url?: string | null;
+  }
+
+  interface HourlyAppBucket {
+    hour: number;
+    total_duration: number;
+    apps: HourlyAppDuration[];
+  }
+
+  interface UrlDetail {
+    url: string;
+    duration: number;
+  }
+
+  interface DomainBrowserSource {
+    browser_name: string;
+    duration: number;
+    percentage: number;
+    urls?: UrlDetail[];
+  }
+
+  interface DomainItem {
+    domain: string;
+    duration: number;
+    semantic_category: string | null;
+    urls?: UrlDetail[];
+    page_count?: number;
+    browser_sources?: DomainBrowserSource[];
+  }
+
+  interface BrowserUsage {
+    browser_name: string;
+    duration: number;
+    executable_path: string | null;
+    domains: DomainItem[];
+  }
+
+  interface DailyStats {
+    total_duration: number;
+    screenshot_count: number;
+    app_usage: AppUsage[];
+    category_usage: CategoryUsage[];
+    browser_duration: number;
+    domain_usage: DomainItem[];
+    domain_total_count: number;
+    browser_usage: BrowserUsage[];
+    work_time_duration: number;
+    overtime_duration: number;
+    hourly_activity_distribution: HourlyActivityBucket[];
+  }
+
+  interface RangeDailyTotal {
+    date: string;
+    total_duration: number;
+  }
+
+  interface OverviewDomainCollection {
+    total_count: number;
+    domains: DomainItem[];
+  }
+
+  interface OverviewDomainDetail extends DomainItem {
+    page_count: number;
+    urls: UrlDetail[];
+    browser_sources: DomainBrowserSource[];
+  }
+
+  interface DeleteSemanticCategoryTarget {
+    key: string;
+    name: string;
+  }
+
+  interface WorkGoalConfig {
+    daily_work_goal_minutes?: number | null;
+  }
+
+  interface CategoryActiveRange {
+    startHour: number;
+    endHour: number;
+  }
+
+  interface OverviewRefreshOptions {
+    silent?: boolean;
+  }
+
+  type OverviewMode = 'today' | 'week' | 'date';
+  type AppUsageViewMode = 'row' | 'column';
+  type DomainOverlayView = 'detail' | 'all';
+
+  function isDailyStats(value: unknown): value is DailyStats {
+    return typeof value === 'object'
+      && value !== null
+      && 'app_usage' in value
+      && Array.isArray(Reflect.get(value, 'app_usage'))
+      && 'category_usage' in value
+      && Array.isArray(Reflect.get(value, 'category_usage'));
+  }
+
+  async function safeListen<T>(
+    eventName: string,
+    handler: (event: TauriEvent<T>) => void,
+  ): Promise<() => void> {
     try {
       return await listen(eventName, handler);
     } catch (e) {
@@ -50,11 +179,11 @@
     return `${year}-${month}-${day}`;
   }
 
-  function parseDateString(dateValue) {
+  function parseDateString(dateValue: string): Date {
     return new Date(`${dateValue}T12:00:00`);
   }
 
-  function getDateRangeLabel(dateFrom, dateTo) {
+  function getDateRangeLabel(dateFrom: string, dateTo: string): string {
     if (!dateFrom && !dateTo) {
       return '';
     }
@@ -85,14 +214,14 @@
     return `${formatLocalizedDate(parseDateString(dateFrom), { year: 'numeric', month: 'short', day: 'numeric' })} - ${formatLocalizedDate(parseDateString(dateTo), { year: 'numeric', month: 'short', day: 'numeric' })}`;
   }
 
-  function getWeekRangeLabel(dateValue) {
+  function getWeekRangeLabel(dateValue: string): string {
     const anchor = parseDateString(dateValue);
     const monday = new Date(anchor);
     monday.setDate(anchor.getDate() - ((anchor.getDay() + 6) % 7));
     return `${formatLocalizedDate(monday, { year: 'numeric', month: 'short', day: 'numeric' })} - ${formatLocalizedDate(anchor, { year: 'numeric', month: 'short', day: 'numeric' })}`;
   }
 
-  function getWeekDateRange(dateValue) {
+  function getWeekDateRange(dateValue: string) {
     const anchor = parseDateString(dateValue);
     const monday = new Date(anchor);
     monday.setDate(anchor.getDate() - ((anchor.getDay() + 6) % 7));
@@ -102,58 +231,63 @@
     };
   }
 
-  function formatIsoDate(date) {
+  function formatIsoDate(date: Date): string {
     return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
   }
 
-  function shiftIsoDate(dateValue, offsetDays) {
+  function shiftIsoDate(dateValue: string, offsetDays: number): string {
     const next = parseDateString(dateValue);
     next.setDate(next.getDate() + offsetDays);
     return formatIsoDate(next);
   }
 
-  function diffIsoDateDays(leftDateValue, rightDateValue) {
+  function diffIsoDateDays(leftDateValue: string, rightDateValue: string): number {
     const dayInMs = 24 * 60 * 60 * 1000;
-    return Math.round((parseDateString(leftDateValue) - parseDateString(rightDateValue)) / dayInMs);
+    return Math.round((parseDateString(leftDateValue).getTime() - parseDateString(rightDateValue).getTime()) / dayInMs);
   }
 
   // 应用投入保留用户偏好的展示方式；今日节奏固定使用竖向小时图。
   const APP_USAGE_VIEW_MODE_KEY = 'overview.appUsage.viewMode';
+  const invokeAppIcon: AppIconInvoke = (command, args) => invoke<string>(command, {
+    appName: args.appName,
+    executablePath: args.executablePath,
+  });
 
-  let stats = null;
+  let stats: DailyStats | null = null;
   let loading = true;
-  let error = null;
-  let unlisten = null;
+  let error: string | null = null;
+  let unlisten: (() => void) | null = null;
   let componentDestroyed = false;
   let currentTime = new Date();
-  let overviewMode = 'today';
-  let selectedCompositionCategory = null;
+  let overviewMode: OverviewMode = 'today';
+  let selectedCompositionCategory: string | null = null;
   let selectedDateFrom = getLocalDateString();
   let selectedDateTo = getLocalDateString();
-  let clockInterval;
-  let refreshInterval;
-  let handleActivityAdded;
-  let handleVisibilityChange;
-  let overviewRefreshPromise = null;
+  let clockInterval: ReturnType<typeof setInterval> | null = null;
+  let refreshInterval: ReturnType<typeof setInterval> | null = null;
+  let handleActivityAdded: EventListener | null = null;
+  let handleVisibilityChange: EventListener | null = null;
+  let overviewRefreshPromise: Promise<void> | null = null;
   let overviewRefreshKey = '';
   let overviewRequestId = 0;
   let lastCheckDate = currentTime.getDate();
-  let appUsageViewMode = 'row';
+  let appUsageViewMode: AppUsageViewMode = 'row';
   let domainUsageExpanded = false;
-  let expandedDomainUsageItems = [];
+  let expandedDomainUsageItems: DomainItem[] = [];
   let domainUsageLoading = false;
   let domainUsageRequestId = 0;
   // #104: 按分类着色的柱状图（堆叠）
-  let hourlyAppBreakdown = [];
-  let categoryList = [];
-  let workGoalMinutes = null;
+  let hourlyAppBreakdown: HourlyAppBucket[] = [];
+  let hourlyBreakdownError: string | null = null;
+  let categoryList: CategoryInfo[] = [];
+  let workGoalMinutes: number | null = null;
   // ── 2026-07 概览改版 ──
   // 上周同日基线（today 模式的 KPI 差值与洞察条；加载失败时保持 null，不显示 delta）
-  let lastWeekStats = null;
-  let lastWeekStatsDate = null;
-  let lastWeekStatsPromise = null;
+  let lastWeekStats: DailyStats | null = null;
+  let lastWeekStatsDate: string | null = null;
+  let lastWeekStatsPromise: Promise<void> | null = null;
   // week/date 模式「按天投入」：来自新命令 get_range_daily_totals
-  let rangeDailyTotals = [];
+  let rangeDailyTotals: RangeDailyTotal[] = [];
   let rangeDailyLoading = false;
   let rangeDailyRequestId = 0;
   let hourlyBreakdownRequestId = 0;
@@ -177,8 +311,9 @@
   async function loadHourlyBreakdown() {
     const range = getHourlyBreakdownRange();
     const requestId = ++hourlyBreakdownRequestId;
+    hourlyBreakdownError = null;
     try {
-      const breakdown = await invoke('get_hourly_app_breakdown', {
+      const breakdown = await invoke<HourlyAppBucket[]>('get_hourly_app_breakdown', {
         mode: overviewMode,
         date: range.dateTo,
         dateFrom: range.dateFrom,
@@ -188,9 +323,12 @@
       if (requestId === hourlyBreakdownRequestId) {
         hourlyAppBreakdown = breakdown;
       }
+      if (requestId === hourlyBreakdownRequestId) {
+        hourlyBreakdownError = null;
+      }
     } catch (e) {
       if (requestId === hourlyBreakdownRequestId) {
-        hourlyAppBreakdown = [];
+        hourlyBreakdownError = formatUserError(e, t('common.loadFailedRetry'));
       }
     }
   }
@@ -207,7 +345,7 @@
     const requestId = ++rangeDailyRequestId;
     rangeDailyLoading = true;
     try {
-      const totals = await invoke('get_range_daily_totals', {
+      const totals = await invoke<RangeDailyTotal[]>('get_range_daily_totals', {
         dateFrom: range.dateFrom,
         dateTo: range.dateTo,
         deviceId: $selectedDeviceId,
@@ -240,7 +378,7 @@
       return;
     }
     lastWeekStatsDate = baselineDate;
-    lastWeekStatsPromise = invoke('get_overview_stats', {
+    lastWeekStatsPromise = invoke<DailyStats>('get_overview_stats', {
       mode: 'date',
       dateFrom: baselineDate,
       dateTo: baselineDate,
@@ -257,19 +395,19 @@
         lastWeekStatsPromise = null;
       });
   }
-  $: hourlyCategoryColors = categoryList.reduce((acc, c) => {
+  $: hourlyCategoryColors = categoryList.reduce<Record<string, string>>((acc, c) => {
     acc[c.key] = c.color;
     return acc;
   }, {});
-  $: hourlyCategoryNames = categoryList.reduce((acc, c) => {
+  $: hourlyCategoryNames = categoryList.reduce<Record<string, string>>((acc, c) => {
     currentLocale;
     const translatedCategoryName = translateCategoryLabel(c.key);
     const isKnownSystemCategory = c.is_system || translatedCategoryName !== c.key;
     acc[c.key] = isKnownSystemCategory ? translatedCategoryName : (c.name || translatedCategoryName);
     return acc;
   }, {});
-  $: hourlyCategoryBreakdown = hourlyAppBreakdown.reduce((acc, bucket) => {
-    const cats = {};
+  $: hourlyCategoryBreakdown = hourlyAppBreakdown.reduce<Record<string, CategoryUsage[]>>((acc, bucket) => {
+    const cats: Record<string, number> = {};
     for (const app of bucket.apps || []) {
       const k = app.category || 'other';
       cats[k] = (cats[k] || 0) + app.duration;
@@ -282,14 +420,14 @@
   //    与 KPI 总投入/应用列表同源，优先 stats.category_usage（逐条裁剪口径）；
   //    缺失或为空时回退到 hourlyCategoryBreakdown 跨小时求和。
   //    小时图本身不动（小时口径，与日合计允许既知偏差）。
-  $: hourlyCompositionTotals = Object.values(hourlyCategoryBreakdown).reduce((acc, segments) => {
+  $: hourlyCompositionTotals = Object.values(hourlyCategoryBreakdown).reduce<Record<string, number>>((acc, segments) => {
     for (const segment of segments || []) {
       acc[segment.category] = (acc[segment.category] || 0) + segment.duration;
     }
     return acc;
   }, {});
   $: compositionTotals = stats?.category_usage?.length
-    ? stats.category_usage.reduce((acc, item) => {
+    ? stats.category_usage.reduce<Record<string, number>>((acc, item) => {
         acc[item.category] = (acc[item.category] || 0) + item.duration;
         return acc;
       }, {})
@@ -317,7 +455,7 @@
       })
     : null;
 
-  function toggleCompositionCategory(category) {
+  function toggleCompositionCategory(category: string) {
     selectedCompositionCategory = selectedCompositionCategory === category ? null : category;
   }
 
@@ -325,13 +463,13 @@
     selectedCompositionCategory = null;
   }
 
-  function formatCompositionActiveRange(activeRange) {
+  function formatCompositionActiveRange(activeRange: CategoryActiveRange | null): string {
     if (!activeRange) return t('overview.compositionNoActiveRange');
     return `${String(activeRange.startHour).padStart(2, '0')}:00–${String(activeRange.endHour + 1).padStart(2, '0')}:00`;
   }
 
   // ── 专注峰值：hourly 分布最大桶向相邻延伸（相邻桶 ≥ 最大值 60% 时并入窗口） ──
-  function computePeakWindow(distribution) {
+  function computePeakWindow(distribution: readonly HourlyActivityBucket[]) {
     const buckets = Array.from({ length: 24 }, (_, hour) => {
       const found = (distribution || []).find((bucket) => bucket.hour === hour);
       return found?.duration || 0;
@@ -356,12 +494,12 @@
     return { startHour, endHour, totalDuration };
   }
 
-  function formatSignedCompactDuration(diffSeconds) {
+  function formatSignedCompactDuration(diffSeconds: number): string {
     const sign = diffSeconds >= 0 ? '+' : '−';
     return `${sign}${formatDurationLocalized(Math.abs(diffSeconds), { compact: true })}`;
   }
 
-  function entertainmentSharePctOf(source) {
+  function entertainmentSharePctOf(source: DailyStats | null): number | null {
     if (!source || !(source.total_duration > 0)) {
       return null;
     }
@@ -438,7 +576,7 @@
       : t('overview.todayRhythm');
 
   // ── 按天投入（week/date 模式） ──
-  function formatDailyBarDayLabel(dateValue, totalDays) {
+  function formatDailyBarDayLabel(dateValue: string, totalDays: number): string {
     const parsed = parseDateString(dateValue);
     return totalDays <= 7
       ? formatLocalizedDate(parsed, { weekday: 'short' })
@@ -474,28 +612,28 @@
     .join(', ');
   let overviewViewModeReady = false;
   
-  let expandedDomains = new Set();
-  let editingDomainKey = null;
+  let expandedDomains = new Set<string>();
+  let editingDomainKey: string | null = null;
   let editingSemanticCategory = '';
-  let pendingDomainSemanticRequests = new Map();
+  let pendingDomainSemanticRequests = new Map<string, number>();
   let nextDomainSemanticRequestId = 0;
   let domainSemanticEditSessionId = 0;
-  let semanticCategoryPopover;
+  let semanticCategoryPopover: HTMLDivElement | null = null;
   let semanticPopoverStyle = '';
-  const domainSemanticTriggers = new Map();
+  const domainSemanticTriggers = new Map<string, HTMLElement>();
 
   // 语义分类（新建 + 删除 + 重命名）
   let showCreateSemanticCategory = false;
   let newSemanticCategoryName = '';
   let semanticCategorySaving = false;
-  let pendingDeleteSemanticCategory = null; // { key, name }
+  let pendingDeleteSemanticCategory: DeleteSemanticCategoryTarget | null = null;
 
   // 重命名语义分类
   let showRenameSemanticCategory = false;
   let renameSemanticKey = '';
   let renameSemanticName = '';
 
-  function startRenameSemanticCategory(cat) {
+  function startRenameSemanticCategory(cat: SemanticCategoryInfo) {
     renameSemanticKey = cat.key;
     renameSemanticName = cat.name;
     showCreateSemanticCategory = false;
@@ -515,7 +653,7 @@
       showRenameSemanticCategory = false;
       showToast(t('overview.semanticCategoryRenamed'), 'success');
     } catch (e) {
-      showToast(e.toString(), 'error');
+      showToast(String(e), 'error');
     } finally {
       semanticCategorySaving = false;
     }
@@ -528,14 +666,14 @@
     pendingDeleteSemanticCategory = null;
     semanticCategorySaving = true;
     try {
-      const affected = await invoke('delete_custom_semantic_category', { key });
+      const affected = await invoke<number>('delete_custom_semantic_category', { key });
       await semanticCategoryStore.refresh();
       showToast(
         t('overview.semanticCategoryDeleted', { category: name, count: affected }),
         'success'
       );
     } catch (e) {
-      showToast(e.toString(), 'error');
+      showToast(String(e), 'error');
     } finally {
       semanticCategorySaving = false;
     }
@@ -562,11 +700,11 @@
       newSemanticCategoryName = '';
       showToast(t('overview.semanticCategoryCreated'), 'success');
     } catch (e) {
-      showToast(e.toString(), 'error');
+      showToast(String(e), 'error');
     }
   }
 
-  function getSemanticCategoryDisplayName(cat) {
+  function getSemanticCategoryDisplayName(cat: SemanticCategoryInfo): string {
     const translatedSemanticCategoryName = translateSemanticCategoryLabel(cat.key);
     const isKnownSemanticCategory = cat.is_system || translatedSemanticCategoryName !== cat.key;
     return isKnownSemanticCategory ? translatedSemanticCategoryName : (cat.name || translatedSemanticCategoryName);
@@ -574,15 +712,15 @@
   
   // 域名摘要 / 单域名详情浮层
   let domainOverlayOpen = false;
-  let domainOverlayView = 'detail';
-  let domainCollection = [];
+  let domainOverlayView: DomainOverlayView = 'detail';
+  let domainCollection: DomainItem[] = [];
   let domainCollectionTotalCount = 0;
-  let selectedDomainDetail = null;
+  let selectedDomainDetail: OverviewDomainDetail | null = null;
   let domainOverlayLoading = false;
-  let domainOverlayError = null;
+  let domainOverlayError: string | null = null;
   let domainOverlayRequestId = 0;
-  let domainOverlayDialog;
-  let domainOverlayBackButton;
+  let domainOverlayDialog: HTMLDivElement | null = null;
+  let domainOverlayBackButton: HTMLButtonElement | null = null;
   $: currentLocale = $locale;
   $: isSingleSelectedDate = selectedDateFrom === selectedDateTo;
   $: canStepOverviewDateForward = selectedDateTo < getLocalDateString();
@@ -638,16 +776,16 @@
       ? t(isSingleSelectedDate ? 'overview.noAppStatsDate' : 'overview.noAppStatsRange')
       : t('overview.noAppStatsToday');
 
-  function readStoredOverviewViewMode(key, fallback) {
+  function readStoredOverviewViewMode(key: string, fallback: AppUsageViewMode): AppUsageViewMode {
     try {
       const value = window.localStorage.getItem(key);
-      return value || fallback;
+      return value === 'column' || value === 'row' ? value : fallback;
     } catch {
       return fallback;
     }
   }
 
-  function persistOverviewViewMode(key, value) {
+  function persistOverviewViewMode(key: string, value: AppUsageViewMode) {
     try {
       window.localStorage.setItem(key, value);
     } catch {
@@ -661,35 +799,35 @@
       preloadAppIcons(stats.app_usage.slice(0, 10).map(a => ({
         appName: a.app_name,
         executablePath: a.executable_path,
-      })), invoke);
+      })), invokeAppIcon);
     }
   }
 
-  function formatDuration(seconds) {
+  function formatDuration(seconds: number): string {
     return formatDurationLocalized(seconds);
   }
 
   const UNRESOLVED_BROWSER_DOMAIN_LABEL = '未识别页面';
 
-  function isUnresolvedBrowserDomain(domain) {
+  function isUnresolvedBrowserDomain(domain: DomainItem): boolean {
     return domain?.domain === UNRESOLVED_BROWSER_DOMAIN_LABEL;
   }
 
-  function getBrowserDomainDisplayLabel(domain) {
+  function getBrowserDomainDisplayLabel(domain: DomainItem): string {
     return isUnresolvedBrowserDomain(domain) ? t('overview.unresolvedPage') : domain.domain;
   }
 
-  function getDomainSemanticLabel(domain) {
+  function getDomainSemanticLabel(domain: DomainItem): string {
     if (!domain?.semantic_category?.trim()) return t('overview.autoDetected');
     return semanticCategoryStore.getSemanticCategoryDisplayName(domain.semantic_category.trim());
   }
 
-  function registerDomainSemanticTrigger(node, domainKey) {
+  function registerDomainSemanticTrigger(node: HTMLElement, domainKey: string) {
     let currentDomainKey = domainKey;
     if (currentDomainKey) domainSemanticTriggers.set(currentDomainKey, node);
 
     return {
-      update(nextDomainKey) {
+      update(nextDomainKey: string) {
         if (currentDomainKey && domainSemanticTriggers.get(currentDomainKey) === node) {
           domainSemanticTriggers.delete(currentDomainKey);
         }
@@ -705,8 +843,12 @@
   }
 
   function updateSemanticPopoverPosition() {
+    if (!editingDomainKey || typeof window === 'undefined') {
+      semanticPopoverStyle = '';
+      return;
+    }
     const trigger = domainSemanticTriggers.get(editingDomainKey);
-    if (!editingDomainKey || !trigger || typeof window === 'undefined') {
+    if (!trigger) {
       semanticPopoverStyle = '';
       return;
     }
@@ -726,7 +868,7 @@
     if (editingDomainKey) updateSemanticPopoverPosition();
   }
 
-  async function startDomainSemanticEdit(domain) {
+  async function startDomainSemanticEdit(domain: DomainItem) {
     domainSemanticEditSessionId += 1;
     editingDomainKey = domain.domain;
     editingSemanticCategory = domain.semantic_category?.trim() || '';
@@ -756,34 +898,34 @@
     return options;
   }
 
-  function isDomainSemanticSavePending(domainKey) {
+  function isDomainSemanticSavePending(domainKey: string): boolean {
     return pendingDomainSemanticRequests.has(domainKey);
   }
 
-  function setDomainSemanticSavePending(domainKey, requestId) {
+  function setDomainSemanticSavePending(domainKey: string, requestId: number) {
     pendingDomainSemanticRequests = new Map(pendingDomainSemanticRequests);
     pendingDomainSemanticRequests.set(domainKey, requestId);
   }
 
-  function clearDomainSemanticSavePending(domainKey, requestId) {
+  function clearDomainSemanticSavePending(domainKey: string, requestId: number) {
     if (pendingDomainSemanticRequests.get(domainKey) !== requestId) return;
     pendingDomainSemanticRequests = new Map(pendingDomainSemanticRequests);
     pendingDomainSemanticRequests.delete(domainKey);
   }
 
-  function isCurrentDomainSemanticEdit(domainKey, editSessionId) {
+  function isCurrentDomainSemanticEdit(domainKey: string, editSessionId: number): boolean {
     return domainSemanticEditSessionId === editSessionId
       && editingDomainKey === domainKey
       && domainOverlayOpen
       && selectedDomainDetail?.domain === domainKey;
   }
 
-  function isCurrentDomainSemanticSave(domainKey, requestId, editSessionId) {
+  function isCurrentDomainSemanticSave(domainKey: string, requestId: number, editSessionId: number): boolean {
     return pendingDomainSemanticRequests.get(domainKey) === requestId
       && isCurrentDomainSemanticEdit(domainKey, editSessionId);
   }
 
-  function cancelDomainSemanticEdit({ restoreFocus = true } = {}) {
+  function cancelDomainSemanticEdit({ restoreFocus = true }: { restoreFocus?: boolean } = {}) {
     const domainKey = editingDomainKey;
     domainSemanticEditSessionId += 1;
     editingDomainKey = null;
@@ -794,7 +936,7 @@
     showRenameSemanticCategory = false;
     renameSemanticKey = '';
     renameSemanticName = '';
-    if (!restoreFocus) return;
+    if (!restoreFocus || !domainKey) return;
     tick().then(() => domainSemanticTriggers.get(domainKey)?.focus());
   }
 
@@ -813,7 +955,7 @@
   function focusDomainOverlayView() {
     tick().then(() => {
       if (!domainOverlayOpen) return;
-      const summaryButton = domainOverlayDialog?.querySelector('[data-domain-summary]');
+      const summaryButton = domainOverlayDialog?.querySelector<HTMLElement>('[data-domain-summary]');
       const target = domainOverlayView === 'all'
         ? (summaryButton || domainOverlayDialog)
         : (domainOverlayBackButton || domainOverlayDialog);
@@ -821,7 +963,7 @@
     });
   }
 
-  function getOverviewDomainParams(domain = undefined) {
+  function getOverviewDomainParams(domain?: string) {
     const range = getHourlyBreakdownRange();
     return {
       ...(domain ? { domain } : {}),
@@ -833,7 +975,7 @@
     };
   }
 
-  async function loadDomainDetail(domainKey) {
+  async function loadDomainDetail(domainKey: string): Promise<boolean> {
     const requestId = ++domainOverlayRequestId;
     domainOverlayOpen = true;
     domainOverlayView = 'detail';
@@ -842,20 +984,20 @@
     domainOverlayError = null;
     focusDomainOverlayView();
     try {
-      const detail = await invoke('get_overview_domain_detail', getOverviewDomainParams(domainKey));
+      const detail = await invoke<OverviewDomainDetail>('get_overview_domain_detail', getOverviewDomainParams(domainKey));
       if (requestId !== domainOverlayRequestId || !domainOverlayOpen) return false;
       selectedDomainDetail = detail;
       return true;
     } catch (e) {
       if (requestId !== domainOverlayRequestId || !domainOverlayOpen) return false;
-      domainOverlayError = formatUserError(e);
+      domainOverlayError = formatUserError(e, t('common.loadFailedRetry'));
       return false;
     } finally {
       if (requestId === domainOverlayRequestId) domainOverlayLoading = false;
     }
   }
 
-  async function openDomainDetail(domain) {
+  async function openDomainDetail(domain: DomainItem) {
     if (!domain?.domain) return;
     cancelDomainSemanticEdit({ restoreFocus: false });
     const availableDomains = expandedDomainUsageItems.length > 0
@@ -888,7 +1030,7 @@
     const requestId = ++domainUsageRequestId;
     domainUsageLoading = true;
     try {
-      const collection = await invoke('get_overview_domains', getOverviewDomainParams());
+      const collection = await invoke<OverviewDomainCollection>('get_overview_domains', getOverviewDomainParams());
       if (requestId !== domainUsageRequestId) return;
       expandedDomainUsageItems = collection?.domains || [];
       domainUsageExpanded = true;
@@ -909,7 +1051,7 @@
     domainUsageLoading = false;
   }
 
-  async function selectDomainFromCollection(domain) {
+  async function selectDomainFromCollection(domain: DomainItem) {
     if (!domain?.domain) return;
     cancelDomainSemanticEdit({ restoreFocus: false });
     await loadDomainDetail(domain.domain);
@@ -923,11 +1065,14 @@
     focusDomainOverlayView();
   }
 
-  async function refreshCurrentDomainDetail(domainKey, isCurrent = () => true) {
+  async function refreshCurrentDomainDetail(
+    domainKey: string,
+    isCurrent: () => boolean = () => true,
+  ): Promise<boolean> {
     if (!isCurrent()) return false;
     await loadStats(true);
     if (!isCurrent()) return false;
-    const detail = await invoke('get_overview_domain_detail', getOverviewDomainParams(domainKey));
+    const detail = await invoke<OverviewDomainDetail>('get_overview_domain_detail', getOverviewDomainParams(domainKey));
     if (!isCurrent()) return false;
     selectedDomainDetail = detail;
     domainCollection = domainCollection.map((domain) =>
@@ -951,7 +1096,7 @@
     return overviewMode !== 'date';
   }
 
-  function setOverviewMode(mode) {
+  function setOverviewMode(mode: OverviewMode) {
     if (overviewMode === mode) {
       return;
     }
@@ -980,7 +1125,7 @@
     loadStats(true);
   }
 
-  function stepOverviewDateRange(offsetDays) {
+  function stepOverviewDateRange(offsetDays: number) {
     clearSelectedCompositionCategory();
     const today = getLocalDateString();
     if (offsetDays > 0 && !canStepOverviewDateForward) {
@@ -1002,7 +1147,7 @@
     handleOverviewDateChange();
   }
 
-  async function saveDomainSemanticRule(domain) {
+  async function saveDomainSemanticRule(domain: DomainItem) {
     const nextCategory = editingSemanticCategory.trim();
     if (!domain) return;
     const domainKey = domain.domain;
@@ -1035,7 +1180,7 @@
     const isCurrent = () => isCurrentDomainSemanticSave(domainKey, requestId, editSessionId);
 
     try {
-      const updatedCount = await invoke('set_domain_semantic_rule', {
+      const updatedCount = await invoke<number>('set_domain_semantic_rule', {
         domain: domainKey,
         semanticCategory: nextCategory,
         syncHistory: true,
@@ -1045,12 +1190,12 @@
       if (!refreshed) return;
       cancelDomainSemanticEdit();
       showToast(
-        t('overview.domainSemanticUpdated', {
+        t(updatedCount > 0 ? 'overview.domainSemanticUpdated' : 'overview.domainSemanticSavedWithoutHistory', {
           domain: domainKey,
           category: semanticCategoryStore.getSemanticCategoryDisplayName(nextCategory),
           count: updatedCount,
         }),
-        'success'
+        updatedCount > 0 ? 'success' : 'info'
       );
     } catch (e) {
       if (!isCurrent()) return;
@@ -1067,7 +1212,9 @@
     }
   }
 
-  async function refreshOverviewStats({ silent = false } = {}) {
+  async function refreshOverviewStats(
+    { silent = false }: OverviewRefreshOptions = {},
+  ): Promise<void> {
     const params = {
       mode: overviewMode,
       dateFrom: overviewMode === 'date' ? selectedDateFrom : undefined,
@@ -1082,7 +1229,7 @@
 
     const requestId = ++overviewRequestId;
     overviewRefreshKey = paramsKey;
-    overviewRefreshPromise = invoke('get_overview_stats', params)
+    overviewRefreshPromise = invoke<DailyStats>('get_overview_stats', params)
       .then((newStats) => {
         if (requestId !== overviewRequestId) {
           return;
@@ -1113,7 +1260,7 @@
     return overviewRefreshPromise;
   }
 
-  async function loadStats(forceRefresh = false) {
+  async function loadStats(forceRefresh = false): Promise<void> {
     // today 模式并行补齐「上周同日」基线（有同日期基线时为空操作）
     ensureLastWeekBaseline();
     if (!shouldUseOverviewCache()) {
@@ -1125,12 +1272,10 @@
     }
 
     // 乐观更新策略：先显示缓存数据，后台刷新后再更新
-    let cacheData;
-    const unsubscribe = cache.subscribe(c => { cacheData = c; });
-    unsubscribe();
+    const cacheData = get(cache);
     
     // 如果有缓存数据，立即显示（不显示 loading）
-    if (cacheData.overview.data) {
+    if (isDailyStats(cacheData.overview.data)) {
       stats = cacheData.overview.data;
       loading = false;
       
@@ -1152,8 +1297,13 @@
     semanticCategoryStore.refresh();
     appUsageViewMode = readStoredOverviewViewMode(APP_USAGE_VIEW_MODE_KEY, 'row');
     overviewViewModeReady = true;
-    try { categoryList = await invoke('get_categories'); } catch (e) { categoryList = []; }
-    try { const cfg = await invoke('get_config'); workGoalMinutes = cfg.daily_work_goal_minutes ?? null; } catch (e) {}
+    try { categoryList = await invoke<CategoryInfo[]>('get_categories'); } catch (e) { categoryList = []; }
+    try {
+      const cfg = await invoke<WorkGoalConfig>('get_config');
+      workGoalMinutes = cfg.daily_work_goal_minutes ?? null;
+    } catch (e) {
+      workGoalMinutes = null;
+    }
     loadHourlyBreakdown();
     loadStats();
     if (!document.hidden) {
@@ -1182,8 +1332,8 @@
 
     handleVisibilityChange = () => {
       if (document.hidden) {
-        clearInterval(clockInterval);
-        clearInterval(refreshInterval);
+        if (clockInterval) clearInterval(clockInterval);
+        if (refreshInterval) clearInterval(refreshInterval);
         clockInterval = null;
         refreshInterval = null;
       } else {
@@ -1369,7 +1519,7 @@
   <!-- 洞察条：仅 today 模式、数据非空且上周同日基线可用时组句显示 -->
   {#if overviewMode === 'today' && insightSentence}
     <!-- 窄屏精修：flex-wrap 允许洞察句换行,链接自动下移到第二行,避免最小窗口横向溢出 -->
-    <div class="mb-4 flex flex-wrap items-center gap-3.5 rounded-[22px] border border-blue-100 bg-gradient-to-r from-blue-50 via-white to-white px-5 py-3.5 dark:border-blue-900/40 dark:from-blue-950/35 dark:via-[#161b22] dark:to-[#161b22]">
+    <div class="mb-4 flex flex-wrap items-center gap-3.5 rounded-lg border border-blue-100 bg-gradient-to-r from-blue-50 via-white to-white px-5 py-3.5 dark:border-blue-900/40 dark:from-blue-950/35 dark:via-[#161b22] dark:to-[#161b22]">
       <span class="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-blue-100 text-blue-500 dark:bg-blue-900/40 dark:text-blue-300">
         <svg class="h-[17px] w-[17px]" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
           <path d="M12 2.5l2 6.4 6.5 2.1-6.5 2.1-2 6.4-2-6.4L3.5 11l6.5-2.1zM19 15.5l.9 2.6 2.6.9-2.6.9-.9 2.6-.9-2.6-2.6-.9 2.6-.9z" />
@@ -1388,24 +1538,26 @@
   <div class="overview-summary-grid grid grid-cols-2 lg:grid-cols-4 gap-3 mb-4">
     {#if loading || !stats}
       {#each [1,2,3,4] as _}
-        <div class="min-h-[116px] rounded-2xl border border-slate-100 bg-white p-5 animate-pulse dark:border-[#30363d]/60 dark:bg-[#21262d]/80">
+        <div class="min-h-[116px] rounded-lg border border-slate-100 bg-white p-5 animate-pulse dark:border-[#30363d]/60 dark:bg-[#21262d]/80">
           <div class="flex h-full items-center justify-between gap-4">
             <div class="flex-1">
               <div class="h-3 rounded bg-slate-200 dark:bg-[#30363d] w-20"></div>
               <div class="mt-6 h-8 w-1/2 rounded bg-slate-200 dark:bg-[#30363d]"></div>
             </div>
-            <div class="h-11 w-11 rounded-2xl bg-slate-100 dark:bg-[#30363d] shrink-0"></div>
+            <div class="h-11 w-11 rounded-lg bg-slate-100 dark:bg-[#30363d] shrink-0"></div>
           </div>
         </div>
       {/each}
     {:else}
       <!-- 改版 KPI：总投入 / 工作时长 / 专注峰值 / 娱乐占比（原浏览器时长、应用数两卡移除） -->
+      <!-- data-kpi-card：供 ui-style-c 紧凑样式精准命中数值/标签，不误伤 subtitle -->
       <StatsCard
         title={overviewTotalActivityTitle}
         value={formatDurationLocalized(stats.total_duration, { compact: true })}
         icon="duration"
         color="indigo"
         subtitle={totalDeltaSubtitle}
+        dataKpiCard
       />
       <StatsCard
         title={overviewWorkDurationTitle}
@@ -1413,6 +1565,7 @@
         icon="focus"
         color="emerald"
         subtitle={workShareSubtitle}
+        dataKpiCard
       />
       <StatsCard
         title={t('overview.peakFocus')}
@@ -1420,6 +1573,7 @@
         icon="duration"
         color="blue"
         subtitle={peakWindowSubtitle}
+        dataKpiCard
       />
       <StatsCard
         title={t('overview.entertainmentShare')}
@@ -1427,6 +1581,7 @@
         icon="apps"
         color="rose"
         subtitle={entertainmentDeltaSubtitle}
+        dataKpiCard
       />
     {/if}
   </div>
@@ -1437,7 +1592,7 @@
         <p class="font-semibold">{t('overview.loadError')}</p>
         <p class="text-sm mt-1">{error}</p>
       </div>
-      <button class="page-action-brand" on:click={loadStats}>{t('overview.retry')}</button>
+      <button class="page-action-brand" on:click={() => loadStats()}>{t('overview.retry')}</button>
     </div>
   {/if}
 
@@ -1500,13 +1655,13 @@
         <div class="mb-5 h-3.5 rounded-full bg-slate-200 dark:bg-[#30363d]"></div>
         <div class="mb-4 grid grid-cols-2 gap-3 lg:grid-cols-4">
           {#each [1,2,3,4] as _}
-            <div class="min-h-[88px] rounded-[22px] bg-slate-50/88 p-4 dark:bg-[#161b22]/30">
+            <div class="min-h-[88px] rounded-lg bg-slate-50/88 p-4 dark:bg-[#161b22]/30">
               <div class="h-3 w-16 rounded bg-slate-200 dark:bg-[#30363d]"></div>
               <div class="mt-4 h-7 w-20 rounded bg-slate-200 dark:bg-[#30363d]"></div>
             </div>
           {/each}
         </div>
-        <div class="rounded-[22px] bg-slate-50/90 p-4 dark:bg-[#161b22]/40">
+        <div class="rounded-lg bg-slate-50/90 p-4 dark:bg-[#161b22]/40">
           <div class="flex h-40 items-end gap-1.5">
             {#each Array(24) as _, hour}
               <div class="flex h-full flex-1 flex-col items-center justify-end">
@@ -1539,11 +1694,11 @@
             {#each compositionSegments as segment (segment.category)}
               <button
                 type="button"
-                class={`inline-flex items-center gap-1.5 rounded-full px-2 py-1 text-xs transition-colors ${selectedCompositionCategory === segment.category ? 'bg-slate-100 text-slate-800 dark:bg-[#30363d] dark:text-[#e6edf3]' : 'text-slate-500 hover:bg-slate-50 dark:text-[#7d8590] dark:hover:bg-[#21262d]'}`}
+                class={`inline-flex items-center gap-1.5 rounded-lg px-2 py-1 text-xs transition-colors ${selectedCompositionCategory === segment.category ? 'bg-slate-100 text-slate-800 dark:bg-[#30363d] dark:text-[#e6edf3]' : 'text-slate-500 hover:bg-slate-50 dark:text-[#7d8590] dark:hover:bg-[#21262d]'}`}
                 aria-pressed={selectedCompositionCategory === segment.category}
                 on:click={() => toggleCompositionCategory(segment.category)}
               >
-                <span class="inline-block h-2 w-2 rounded-[3px]" style={`background: ${segment.color};`}></span>
+                <span class="inline-block h-2 w-2 rounded-[var(--radius-xs)]" style={`background: ${segment.color};`}></span>
                 <span class="font-medium">{segment.name}</span>
                 {formatDurationLocalized(segment.duration, { compact: true })}
                 <span class="text-slate-400 dark:text-[#636c76]">{segment.percent}%</span>
@@ -1552,7 +1707,7 @@
           </div>
 
           {#if selectedCompositionSummary}
-            <div class="overview-composition-summary mx-auto mt-4 max-w-3xl rounded-2xl bg-slate-50/90 px-4 py-3 text-center dark:bg-[#161b22]/35">
+            <div class="overview-composition-summary mx-auto mt-4 max-w-3xl rounded-lg bg-slate-50/90 px-4 py-3 text-center dark:bg-[#161b22]/35">
               <div class="grid gap-2 sm:grid-cols-3">
                 <div class="overview-composition-kpi rounded-xl px-3 py-2 text-center">
                   <p class="text-[11px] text-slate-400 dark:text-[#636c76]">{t('overview.compositionDuration')}</p>
@@ -1579,6 +1734,14 @@
               {/if}
             </div>
           {/if}
+        </div>
+      {/if}
+      {#if hourlyBreakdownError}
+        <div class="mb-3 flex items-center justify-between gap-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700 dark:border-red-500/30 dark:bg-red-950/20 dark:text-red-300" role="alert">
+          <span>{hourlyBreakdownError}</span>
+          <button type="button" class="shrink-0 underline underline-offset-2" on:click={loadHourlyBreakdown}>
+            {t('common.retry')}
+          </button>
         </div>
       {/if}
       <ActivityHourlyChart
@@ -1631,7 +1794,7 @@
               on:click={() => openDomainDetail(domain)}
             >
               <span class="overview-domain-heading min-w-0">
-                <span class="block truncate text-[13px] font-semibold text-slate-700 dark:text-[#c9d1d9]">
+                <span class="overview-domain-name block truncate">
                   {getBrowserDomainDisplayLabel(domain)}
                 </span>
                 <span class="overview-domain-meta overview-domain-category-meta mt-0.5 flex items-center gap-1.5 truncate text-[11px] text-slate-500 dark:text-[#7d8590]">
@@ -1807,7 +1970,7 @@
       {#if domainOverlayLoading}
         <div class="py-10 text-center text-sm text-slate-400 dark:text-[#636c76]">{t('common.loading')}</div>
       {:else if domainOverlayError}
-        <div class="mx-auto max-w-md rounded-2xl bg-red-50 px-4 py-5 text-center text-sm text-red-600 dark:bg-red-950/20 dark:text-red-300">
+        <div class="mx-auto max-w-md rounded-lg bg-red-50 px-4 py-5 text-center text-sm text-red-600 dark:bg-red-950/20 dark:text-red-300">
           <p>{t('overview.domainLoadFailed')}</p>
           <p class="mt-1 break-words text-xs opacity-80">{domainOverlayError}</p>
         </div>
@@ -1818,7 +1981,7 @@
             <button
               type="button"
               data-domain-summary
-              class="overview-domain-summary-row grid w-full grid-cols-[minmax(0,1fr)_auto] gap-3 rounded-2xl border border-slate-200/80 px-4 py-3 text-start transition-colors hover:border-sky-200 hover:bg-sky-50/45 focus:outline-none focus:ring-2 focus:ring-sky-300 dark:border-[#30363d] dark:hover:border-sky-800/70 dark:hover:bg-sky-950/10"
+              class="overview-domain-summary-row grid w-full grid-cols-[minmax(0,1fr)_auto] gap-3 rounded-lg border border-slate-200/80 px-4 py-3 text-start transition-colors hover:border-sky-200 hover:bg-sky-50/45 focus:outline-none focus:ring-2 focus:ring-sky-300 dark:border-[#30363d] dark:hover:border-sky-800/70 dark:hover:bg-sky-950/10"
               on:click={() => selectDomainFromCollection(domain)}
             >
               <span class="min-w-0">
@@ -1851,7 +2014,7 @@
       {:else if domainOverlayView === 'detail'}
       {#each (selectedDomainDetail ? [selectedDomainDetail] : []) as domain}
         {@const domainPresentation = buildDomainPresentation(domain)}
-        <div class="overview-domain-detail-source rounded-2xl bg-slate-50/80 p-3 dark:bg-[#21262d]/45">
+        <div class="overview-domain-detail-source rounded-lg bg-slate-50/80 p-3 dark:bg-[#21262d]/45">
           <div class="overview-domain-source-list flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500 dark:text-[#7d8590]">
             <span>{domainPresentation.sourceLabel || t('overview.domainSourcesUnknown')}</span>
             <span>{formatDurationLocalized(domain.duration, { compact: true })}</span>
@@ -1890,7 +2053,7 @@
                   {t('overview.currentCategory', { label: getDomainSemanticLabel(domain) })}
                 </span>
                 <button
-                  class="text-xs px-2 py-1 rounded-full border border-slate-200 dark:border-[#484f58] text-slate-700 dark:text-[#adbac7] hover:border-primary-300 hover:text-primary-600 transition-colors"
+                  class="text-xs px-2 py-1 rounded-lg border border-slate-200 dark:border-[#484f58] text-slate-700 dark:text-[#adbac7] hover:border-primary-300 hover:text-primary-600 transition-colors"
                   aria-haspopup="dialog"
                   aria-expanded={editingDomainKey === domain.domain}
                   aria-controls={`semantic-category-popover-${domain.domain}`}
@@ -1914,7 +2077,8 @@
             <div
               bind:this={semanticCategoryPopover}
               id={`semantic-category-popover-${domain.domain}`}
-              class="overview-semantic-popover fixed z-[160] overflow-y-auto rounded-2xl border border-slate-200 bg-white p-3 shadow-xl dark:border-[#30363d] dark:bg-[#161b22] dark:shadow-black/30"
+                  class="overview-semantic-popover fixed z-[160] overflow-y-auto rounded-lg border border-slate-200 bg-white p-3 shadow-xl dark:border-[#30363d] dark:bg-[#161b22] dark:shadow-black/30"
+              use:portalToBody
               role="dialog"
               tabindex="-1"
               aria-label={t('overview.changeCategory')}
@@ -1928,7 +2092,7 @@
                 <button
                   type="button"
                   class="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-700 dark:hover:bg-[#21262d] dark:hover:text-[#adbac7]"
-                  on:click={cancelDomainSemanticEdit}
+                  on:click={() => cancelDomainSemanticEdit()}
                   aria-label={t('overview.cancel')}
                 >
                   ×
@@ -2054,7 +2218,7 @@
                     type="button"
                     class="rounded-lg px-2.5 py-1.5 text-xs text-slate-500 transition-colors hover:bg-slate-100 dark:text-[#7d8590] dark:hover:bg-[#21262d]"
                     disabled={isDomainSemanticSavePending(domain.domain)}
-                    on:click={cancelDomainSemanticEdit}
+                    on:click={() => cancelDomainSemanticEdit()}
                   >{t('overview.cancel')}</button>
                   <button
                     type="button"
@@ -2125,7 +2289,7 @@
     role="presentation"
     on:click|self={cancelDeleteSemanticCategory}
   >
-    <div use:trapFocus role="dialog" aria-modal="true" class="w-full max-w-sm rounded-2xl border border-slate-200 dark:border-[#30363d] bg-white dark:bg-[#161b22] shadow-2xl p-6 mx-4">
+        <div use:trapFocus role="dialog" aria-modal="true" class="w-full max-w-sm rounded-xl border border-slate-200 dark:border-[#30363d] bg-white dark:bg-[#161b22] shadow-2xl p-6 mx-4">
       <h3 class="text-base font-semibold text-slate-900 dark:text-[#e6edf3]">{t('overview.deleteSemanticCategoryTitle')}</h3>
       <p class="mt-2 text-sm text-slate-700 dark:text-[#7d8590] leading-relaxed">
         {t('overview.deleteSemanticCategoryMessage', { category: pendingDeleteSemanticCategory.name })}

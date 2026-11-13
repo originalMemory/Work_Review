@@ -1,6 +1,28 @@
-<script>
-  export let followup = null;
-  export let copy = null;
+<script lang="ts">
+  interface AvatarFollowup {
+    projectKey?: string;
+  }
+
+  interface AvatarFollowupCopy {
+    surfaceClass: string;
+    dismissLabel: string;
+    badgeClass: string;
+    personaLabel: string;
+    title: string;
+    summary: string;
+    meta: string;
+    primaryClass: string;
+    openTimeline: string;
+    focus: string;
+    focusFull: string;
+    remember: string;
+    rememberFull: string;
+    snooze: string;
+    snoozeFull: string;
+  }
+
+  export let followup: AvatarFollowup | null = null;
+  export let copy: AvatarFollowupCopy | null = null;
   export let flipLeft = false;
   export let onTimeline = () => {};
   export let onFocus = () => {};
@@ -17,10 +39,11 @@
 {#if followup && copy}
   <div class="absolute inset-0 z-30 overflow-visible pointer-events-none">
     <section
-      class={`pointer-events-auto absolute ${flipLeft ? 'left-[4%]' : 'right-[4%]'} top-[8px] flex w-[min(92vw,348px)] max-w-[348px] flex-col overflow-hidden rounded-[16px] border border-slate-200/95 bg-[rgba(255,255,255,0.96)] p-[14px] text-slate-900 shadow-[0_14px_28px_rgba(15,23,42,0.14),0_4px_12px_rgba(15,23,42,0.07)] backdrop-blur-[14px] ${copy.surfaceClass || ''}`}
+      class={`pointer-events-auto absolute ${flipLeft ? 'left-[4%]' : 'right-[4%]'} top-[8px] flex w-[min(92vw,348px)] max-w-[348px] flex-col overflow-hidden rounded-lg border border-slate-200/95 bg-[rgba(255,255,255,0.96)] p-[14px] text-slate-900 shadow-[0_14px_28px_rgba(15,23,42,0.14),0_4px_12px_rgba(15,23,42,0.07)] backdrop-blur-[14px] ${copy.surfaceClass || ''}`}
+      data-avatar-hit-region="followup"
       style="max-height: calc(100vh - 16px);"
     >
-      <div class="pointer-events-none absolute inset-[1px] rounded-[15px] border border-white/70"></div>
+      <div class="pointer-events-none absolute inset-[1px] rounded-lg border border-white/70"></div>
 
       <button
         type="button"
@@ -95,7 +118,7 @@
         </div>
       </div>
 
-      <div class="followup-tail absolute left-5 top-[calc(100%-6px)] h-3 w-3 rotate-45 rounded-[3px] border border-slate-200/95 bg-[rgba(255,255,255,0.96)] shadow-[0_6px_16px_rgba(15,23,42,0.06)]"></div>
+      <div class="followup-tail absolute left-5 top-[calc(100%-6px)] h-3 w-3 rotate-45 rounded-[var(--radius-xs)] border border-slate-200/95 bg-[rgba(255,255,255,0.96)] shadow-[0_6px_16px_rgba(15,23,42,0.06)]"></div>
     </section>
   </div>
 {/if}

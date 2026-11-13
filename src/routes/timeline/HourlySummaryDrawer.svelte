@@ -1,7 +1,8 @@
-<script>
+<script lang="ts">
   import { createEventDispatcher, tick } from 'svelte';
-  import { formatDurationLocalized, t } from '$lib/i18n/index.js';
-  import { trapFocus } from '$lib/utils/focusTrap.js';
+  import { formatDurationLocalized, t } from '$lib/i18n/index.ts';
+  import { trapFocus } from '$lib/utils/focusTrap.ts';
+  import { portalToBody } from '$lib/actions/portal.ts';
   import {
     formatHourRange,
     getFullSummary,
@@ -11,18 +12,19 @@
     getSummaryDisplayParts,
     getSummaryRhythmTone,
     orderHourlySummariesForDisplay,
-  } from './summaryPresentation.js';
+    type HourlySummaryRecord,
+  } from './summaryPresentation.ts';
 
   export let open = false;
   export let date = '';
-  export let summaries = [];
+  export let summaries: HourlySummaryRecord[] = [];
   export let loading = false;
   export let refreshing = false;
-  export let error = null;
+  export let error = null as string | null;
 
-  const dispatch = createEventDispatcher();
-  let closeButton;
-  let expandedHours = new Set();
+  const dispatch = createEventDispatcher<{ close: void }>();
+  let closeButton: HTMLButtonElement | null = null;
+  let expandedHours = new Set<number>();
   let previousOpen = false;
   let previousDate = date;
   let previousSummarySignature = '';
@@ -70,14 +72,14 @@
     dispatch('close');
   }
 
-  function handleOverlayKeydown(event) {
+  function handleOverlayKeydown(event: KeyboardEvent) {
     if (event.key === 'Escape') {
       event.preventDefault();
       requestClose();
     }
   }
 
-  function toggleExpand(hour) {
+  function toggleExpand(hour: number) {
     const next = new Set(expandedHours);
     if (next.has(hour)) {
       next.delete(hour);
@@ -87,7 +89,7 @@
     expandedHours = next;
   }
 
-  function needsExpand(summary) {
+  function needsExpand(summary: HourlySummaryRecord) {
     const full = getFullSummary(summary.summary);
     const primary = getPrimarySummary(summary.summary);
     const secondary = getSecondarySummary(summary.summary);
@@ -95,7 +97,7 @@
     return full.length > displayed.length + 2;
   }
 
-  function isPeakSummary(summary) {
+  function isPeakSummary(summary: HourlySummaryRecord) {
     return summaries.length > 1
       && peakDuration > 0
       && summary.total_duration === peakDuration;
@@ -107,6 +109,7 @@
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <div
     class="hourly-summary-overlay"
+    use:portalToBody
     role="presentation"
     on:click|self={requestClose}
     on:keydown={handleOverlayKeydown}
@@ -238,7 +241,6 @@
     justify-content: flex-end;
     padding: 1rem;
     background: rgba(15, 23, 42, 0.48);
-    backdrop-filter: blur(7px);
   }
 
   .hourly-summary-drawer {
@@ -248,7 +250,7 @@
     flex-direction: column;
     overflow: hidden;
     border: 1px solid rgba(148, 163, 184, 0.24);
-    border-radius: 1.25rem;
+    border-radius: var(--radius-lg);
     background: #fff;
     box-shadow: -18px 0 48px rgba(15, 23, 42, 0.18);
   }
@@ -272,7 +274,7 @@
   .hourly-summary-kicker {
     display: block;
     margin-bottom: 0.28rem;
-    color: #a16207;
+    color: #78716c;
     font-size: 0.75rem;
     font-weight: 700;
     letter-spacing: 0.08em;
@@ -298,7 +300,7 @@
     align-items: center;
     justify-content: center;
     border: 1px solid rgba(120, 113, 108, 0.16);
-    border-radius: 0.8rem;
+    border-radius: var(--radius-lg);
     color: #57534e;
     background: rgba(250, 250, 249, 0.92);
     cursor: pointer;
@@ -311,7 +313,7 @@
 
   .hourly-summary-close:focus-visible,
   .hourly-summary-expand:focus-visible {
-    outline: 2px solid rgba(217, 119, 6, 0.62);
+    outline: 2px solid rgba(87, 83, 78, 0.4);
     outline-offset: 2px;
   }
 
@@ -342,7 +344,7 @@
   .hourly-summary-refresh-error {
     padding: 0.6rem 0.75rem;
     border: 1px solid rgba(248, 113, 113, 0.2);
-    border-radius: 0.75rem;
+    border-radius: var(--radius-lg);
     color: #b91c1c;
     background: rgba(254, 242, 242, 0.78);
   }
@@ -351,8 +353,8 @@
     width: 0.9rem;
     height: 0.9rem;
     border: 2px solid rgba(120, 113, 108, 0.24);
-    border-top-color: #d97706;
-    border-radius: 999px;
+    border-top-color: #57534e;
+    border-radius: var(--radius-full);
     animation: hourly-summary-spin 700ms linear infinite;
   }
 
@@ -380,13 +382,9 @@
   .hourly-summary-item {
     padding: 1rem 1.05rem;
     border: 1px solid rgba(120, 113, 108, 0.14);
-    border-radius: 1rem;
+    border-radius: var(--radius-md);
     background: rgba(255, 255, 255, 0.92);
     box-shadow: 0 10px 24px rgba(15, 23, 42, 0.04);
-  }
-
-  .hourly-summary-item-peak {
-    border-color: rgba(217, 119, 6, 0.2);
   }
 
   .hourly-summary-item-header {
@@ -421,30 +419,22 @@
     align-items: center;
     min-height: 1.55rem;
     padding: 0.18rem 0.56rem;
-    border-radius: 999px;
+    border-radius: var(--radius-full);
     font-size: 0.68rem;
     font-weight: 700;
     white-space: nowrap;
   }
 
+  /* 徽章走中性体系：高峰用深实底突出，节奏档位统一灰胶囊（靠文字区分） */
   .hourly-summary-peak {
-    color: #b45309;
-    background: rgba(254, 243, 199, 0.88);
+    color: #fafaf9;
+    background: #292524;
   }
 
-  .hourly-summary-rhythm-deep {
-    color: #f8fafc;
-    background: #334155;
-  }
-
-  .hourly-summary-rhythm-steady {
-    color: #4338ca;
-    background: #eef2ff;
-  }
-
-  .hourly-summary-rhythm-light {
-    color: #c2410c;
-    background: #fff7ed;
+  .hourly-summary-rhythm {
+    border: 1px solid rgba(148, 163, 184, 0.32);
+    color: #57534e;
+    background: #fff;
   }
 
   .hourly-summary-primary {
@@ -495,7 +485,7 @@
   .hourly-summary-apps span {
     padding: 0.27rem 0.58rem;
     border: 1px solid rgba(120, 113, 108, 0.12);
-    border-radius: 999px;
+    border-radius: var(--radius-full);
     color: #57534e;
     background: #fafaf9;
     font-size: 0.72rem;
@@ -528,7 +518,7 @@
   }
 
   :global(.dark) .hourly-summary-kicker {
-    color: #d29922;
+    color: #8b949e;
   }
 
   :global(.dark) .hourly-summary-close {
@@ -558,28 +548,15 @@
     box-shadow: none;
   }
 
-  :global(.dark) .hourly-summary-item-peak {
-    border-color: rgba(210, 153, 34, 0.24);
-  }
-
   :global(.dark) .hourly-summary-peak {
-    color: #e3b341;
-    background: rgba(187, 128, 9, 0.16);
+    color: #161b22;
+    background: #8b949e;
   }
 
-  :global(.dark) .hourly-summary-rhythm-deep {
-    color: #e6edf3;
-    background: #30363d;
-  }
-
-  :global(.dark) .hourly-summary-rhythm-steady {
-    color: #a5b4fc;
-    background: rgba(79, 70, 229, 0.2);
-  }
-
-  :global(.dark) .hourly-summary-rhythm-light {
-    color: #ffa657;
-    background: rgba(158, 69, 0, 0.2);
+  :global(.dark) .hourly-summary-rhythm {
+    border-color: rgba(48, 54, 61, 0.9);
+    color: #adbac7;
+    background: #21262d;
   }
 
   :global(.dark) .hourly-summary-apps span {

@@ -1,9 +1,9 @@
 //! Auto-extracted from the historical `commands.rs`. Behavior unchanged.
 
-use crate::error::AppError;
 use crate::AppState;
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, State};
+use work_review_core::error::AppError;
 
 use super::shared::persist_app_config;
 
@@ -35,6 +35,20 @@ pub async fn get_telegram_bot_status(
         "bindCode": s.config.telegram_bot_bind_code.clone(),
         "bindCodeExpiresAt": s.config.telegram_bot_bind_code_expires_at,
         "bindCodeExpired": s.config.telegram_bot_bind_code_expires_at.map(|expires_at| expires_at < now_ts).unwrap_or(false),
+    }))
+}
+
+#[tauri::command]
+pub async fn get_wecom_bot_status(
+    state: State<'_, Arc<Mutex<AppState>>>,
+) -> Result<serde_json::Value, AppError> {
+    let s = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
+    Ok(serde_json::json!({
+        "running": s.wecom_bot_runtime.is_running(),
+        "starting": s.wecom_bot_runtime.is_starting(),
+        "lastError": s.wecom_bot_runtime.last_error(),
+        "longConnectionConfigured": crate::wecom_aibot::long_connection_configured(&s.config),
+        "callbackConfigured": crate::wecom_aibot::callback_configured(&s.config),
     }))
 }
 

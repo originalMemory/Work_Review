@@ -22,6 +22,7 @@ mod sync;
 mod system;
 mod timeline;
 mod updater;
+mod user_memory;
 
 // 所有 pub command + DTO（main.rs generate_handler 的 commands::xxx 不变）
 pub use ai::*;
@@ -40,6 +41,7 @@ pub use sync::*;
 pub use system::*;
 pub use timeline::*;
 pub use updater::*;
+pub use user_memory::*;
 
 // 被 main.rs / localhost_api / agent / bot 直接调用的 pub(crate) helper
 // 通过子模块再次 re-export，保持 `commands::xxx_inner` / `commands::xxx` 路径不断。

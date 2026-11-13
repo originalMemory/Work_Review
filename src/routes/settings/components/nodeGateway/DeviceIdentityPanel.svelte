@@ -1,10 +1,24 @@
-<script>
-  import { t } from '$lib/i18n/index.js';
-  export let config;
-  export let nodeStatus = { deviceId: '', protocolVersion: '', deviceName: '' };
+<script lang="ts">
+  import { t } from '$lib/i18n/index.ts';
+
+  interface DeviceIdentityConfig {
+    node_gateway: {
+      device_name: string | null;
+      endpoint: string | null;
+    };
+  }
+
+  interface NodeGatewayStatus {
+    deviceId: string;
+    protocolVersion: string;
+    deviceName: string;
+  }
+
+  export let config: DeviceIdentityConfig;
+  export let nodeStatus: NodeGatewayStatus = { deviceId: '', protocolVersion: '', deviceName: '' };
 </script>
 
-<div class="rounded-2xl border border-slate-200/80 bg-slate-50/90 p-4 dark:border-[#30363d]/80 dark:bg-[#21262d]/40">
+<div class="settings-subsection">
   <div class="flex items-center gap-2 mb-3">
     <div class="flex h-6 w-6 items-center justify-center rounded-md bg-primary-100 dark:bg-primary-900/30">
       <svg class="w-3.5 h-3.5 text-primary-600 dark:text-primary-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">

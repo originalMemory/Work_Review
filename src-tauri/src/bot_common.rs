@@ -1,9 +1,9 @@
-use crate::config::{AppConfig, DEFAULT_LOCALHOST_API_PORT};
 use crate::localhost_api::LOCALHOST_API_HOST;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::Duration;
+use work_review_core::config::{AppConfig, DEFAULT_LOCALHOST_API_PORT};
 
 pub const HELP: &str = "\
 📊 Work Review Bot（多设备）
@@ -117,13 +117,17 @@ pub fn connection_failed_reply(device_name: &str) -> String {
     format!("❌ 连接失败\n设备：{device_name}\n请检查地址、Token 与网络连通性。")
 }
 
+pub fn report_generate_timeout(config: &AppConfig) -> Duration {
+    Duration::from_secs(config.report_generation_timeout_secs.max(60))
+}
+
 pub fn progress_text_for_command(cmd: &str) -> Option<&'static str> {
     match cmd {
         "devices" | "设备列表" => Some("⏳ 正在获取设备列表，请稍候..."),
         "device" | "设备" => Some("⏳ 正在获取设备状态，请稍候..."),
         "reports" | "日报列表" => Some("⏳ 正在获取日报列表，请稍候..."),
         "report" | "日报" => Some("⏳ 正在获取日报详情，请稍候..."),
-        "generate" | "生成日报" => Some("⏳ 正在生成日报，预计需要 30-120 秒..."),
+        "generate" | "生成日报" => Some("⏳ 正在生成日报，请稍候..."),
         _ => None,
     }
 }
@@ -269,16 +273,22 @@ fn build_generate_report_request(
     client: &Client,
     device: &DeviceEndpoint,
     date: &str,
+    generate_timeout: Duration,
 ) -> reqwest::RequestBuilder {
     let url = format!("{}/v1/reports/generate", device.url.trim_end_matches('/'));
     client
         .post(url)
         .bearer_auth(&device.token)
         .json(&serde_json::json!({ "date": date }))
-        .timeout(Duration::from_secs(120))
+        .timeout(generate_timeout)
 }
 
-pub async fn handle_cmd(client: &Client, devices: &[DeviceEndpoint], text: &str) -> Option<String> {
+pub async fn handle_cmd(
+    client: &Client,
+    devices: &[DeviceEndpoint],
+    text: &str,
+    generate_timeout: Duration,
+) -> Option<String> {
     let parts: Vec<&str> = text.split_whitespace().collect();
     let cmd = normalize_command(parts.first().copied().unwrap_or(""));
     if cmd.is_empty() {
@@ -406,9 +416,9 @@ pub async fn handle_cmd(client: &Client, devices: &[DeviceEndpoint], text: &str)
                 Ok(d) => d,
                 Err(reply) => return Some(reply),
             };
-            // 日报生成可长达 120 秒，而企微等被动回复通道 5 秒即超时；
+            // 日报生成可长达数分钟，而企微 HTTP 回调 5 秒即超时；
             // 因此改为后台任务生成 + 立即回执，结果通过 /report 查询。
-            let request = build_generate_report_request(client, device, &date);
+            let request = build_generate_report_request(client, device, &date, generate_timeout);
             let device_name = device.name.clone();
             let task_date = date.clone();
             tokio::spawn(async move {
@@ -458,9 +468,10 @@ mod tests {
             is_local: true,
         };
 
-        let request = build_generate_report_request(&client, &device, "2026-07-21")
-            .build()
-            .expect("请求应可构造");
+        let request =
+            build_generate_report_request(&client, &device, "2026-07-21", Duration::from_secs(300))
+                .build()
+                .expect("请求应可构造");
 
         assert_eq!(request.method(), reqwest::Method::POST);
         assert_eq!(
@@ -481,7 +492,7 @@ mod tests {
             .expect("JSON Body 应存在");
         let payload: serde_json::Value = serde_json::from_slice(body).expect("JSON Body 应合法");
         assert_eq!(payload, serde_json::json!({ "date": "2026-07-21" }));
-        assert_eq!(request.timeout(), Some(&Duration::from_secs(120)));
+        assert_eq!(request.timeout(), Some(&Duration::from_secs(300)));
     }
 
     #[test]
@@ -525,11 +536,19 @@ mod tests {
             .expect("build client")
     }
 
+    fn run_cmd<'a>(
+        client: &'a Client,
+        devices: &'a [DeviceEndpoint],
+        text: &'a str,
+    ) -> impl std::future::Future<Output = Option<String>> + 'a {
+        handle_cmd(client, devices, text, Duration::from_secs(120))
+    }
+
     #[tokio::test]
     async fn handle_cmd_help命令应返回帮助文本() {
         let client = dummy_client();
         let devices: Vec<DeviceEndpoint> = Vec::new();
-        let reply = handle_cmd(&client, &devices, "/help").await.unwrap();
+        let reply = run_cmd(&client, &devices, "/help").await.unwrap();
         assert!(reply.contains("Work Review Bot"));
         assert!(reply.contains("/devices"));
     }
@@ -538,7 +557,7 @@ mod tests {
     async fn handle_cmd_中文帮助别名应等价() {
         let client = dummy_client();
         let devices: Vec<DeviceEndpoint> = Vec::new();
-        let reply = handle_cmd(&client, &devices, "帮助").await.unwrap();
+        let reply = run_cmd(&client, &devices, "帮助").await.unwrap();
         assert!(reply.contains("Work Review Bot"));
     }
 
@@ -546,9 +565,7 @@ mod tests {
     async fn handle_cmd_未知命令应返回未知提示() {
         let client = dummy_client();
         let devices: Vec<DeviceEndpoint> = Vec::new();
-        let reply = handle_cmd(&client, &devices, "/random_garbage")
-            .await
-            .unwrap();
+        let reply = run_cmd(&client, &devices, "/random_garbage").await.unwrap();
         assert_eq!(reply, UNKNOWN_CMD_REPLY);
     }
 
@@ -556,7 +573,7 @@ mod tests {
     async fn handle_cmd_空文本应返回未知提示() {
         let client = dummy_client();
         let devices: Vec<DeviceEndpoint> = Vec::new();
-        let reply = handle_cmd(&client, &devices, "").await.unwrap();
+        let reply = run_cmd(&client, &devices, "").await.unwrap();
         assert_eq!(reply, UNKNOWN_CMD_REPLY);
     }
 
@@ -565,23 +582,19 @@ mod tests {
         let client = dummy_client();
         let devices: Vec<DeviceEndpoint> = Vec::new();
         // /devices 命中 devices.is_empty() 分支
-        let reply = handle_cmd(&client, &devices, "/devices").await.unwrap();
+        let reply = run_cmd(&client, &devices, "/devices").await.unwrap();
         assert!(reply.contains("无可用设备"));
         // /device 应通过 find_device 找不到设备时回落到无可用设备提示
-        let reply = handle_cmd(&client, &devices, "/device").await.unwrap();
+        let reply = run_cmd(&client, &devices, "/device").await.unwrap();
         assert!(reply.contains("无可用设备"));
         // /reports
-        let reply = handle_cmd(&client, &devices, "/reports").await.unwrap();
+        let reply = run_cmd(&client, &devices, "/reports").await.unwrap();
         assert!(reply.contains("无可用设备"));
         // /report
-        let reply = handle_cmd(&client, &devices, "/report today")
-            .await
-            .unwrap();
+        let reply = run_cmd(&client, &devices, "/report today").await.unwrap();
         assert!(reply.contains("无可用设备"));
         // /generate
-        let reply = handle_cmd(&client, &devices, "/generate today")
-            .await
-            .unwrap();
+        let reply = run_cmd(&client, &devices, "/generate today").await.unwrap();
         assert!(reply.contains("无可用设备"));
     }
 
@@ -591,7 +604,7 @@ mod tests {
         let devices: Vec<DeviceEndpoint> = Vec::new();
         // 这些命令都没有设备，全部应返回"无可用设备"，证明中英文别名都正确分发了。
         for cmd in ["设备列表", "设备", "日报列表", "日报", "生成日报"] {
-            let reply = handle_cmd(&client, &devices, cmd).await.unwrap();
+            let reply = run_cmd(&client, &devices, cmd).await.unwrap();
             assert!(
                 reply.contains("无可用设备"),
                 "命令 {cmd} 应该分发到无设备分支，实际：{reply}"
@@ -604,7 +617,7 @@ mod tests {
         let client = dummy_client();
         let devices: Vec<DeviceEndpoint> = Vec::new();
         // 大写 + 多空白 + @机器人后缀都应被 normalize_command 处理
-        let reply = handle_cmd(&client, &devices, "  /HELP@work_review_bot  ")
+        let reply = run_cmd(&client, &devices, "  /HELP@work_review_bot  ")
             .await
             .unwrap();
         assert!(reply.contains("Work Review Bot"));

@@ -216,11 +216,19 @@ Supported providers: Ollama (local) / LM Studio (local) / OpenAI compatible / De
 | macOS (Apple Silicon / Intel) | `.dmg` |
 | Windows | `.exe` / portable `.zip` |
 | Linux x86_64 (X11 / Wayland) | `.deb` / `.rpm` / `.AppImage` |
-| Linux ARM64 (aarch64) | `.deb` |
+| Linux ARM64 (aarch64) | `.deb` / `.rpm` / `.AppImage` |
 
 **macOS:** Screenshots require the "Screen Recording" permission, and avatar linkage requires "Accessibility + Input Monitoring". If you see a "damaged" warning on first launch: `sudo xattr -rd com.apple.quarantine "/Applications/Work Review.app"`
 
 **Windows:** Depends on Microsoft Edge WebView2 Runtime.
+
+**Windows portable mode (available in `v1.1.4-rc.2`, #182):**
+- The portable ZIP includes an empty `Data` folder. When it exists beside the EXE, the database, configuration, screenshots and update settings stay there, taking priority over this PC's saved location without adding a settings toggle. Without it, existing storage behavior is unchanged.
+- No data is imported automatically. Back up and exit completely before copying your full data directory into `Data`; move the EXE and `Data` together. An unreadable or unwritable folder stops startup with an error instead of silently falling back.
+- To update, download the portable ZIP, exit, replace the EXE and preserve `Data`; do not run the installer. External data locations cannot be selected in portable mode. After exiting and backing up, moving `Data` away restores this PC's normal data location.
+- WebView2 cache, autostart registration and user-selected external export paths remain system-managed. `Data` may contain API keys: never share it publicly.
+
+**Available for testing in [v1.1.4-rc.2](https://github.com/wm94i/Work-Review/releases/tag/v1.1.4-rc.2); `v1.1.4-rc.1` and earlier releases do not include this support.**
 
 > **Windows 11 Smart App Control**: If Windows shows "Smart App Control blocked this app from running", it's because Work Review is signed with a self-signed certificate (not a commercial EV certificate). You can turn off Smart App Control in "Windows Security → App & browser control → Smart App Control". See [#139](https://github.com/wm94i/Work-Review/issues/139).
 
@@ -240,6 +248,8 @@ sudo zypper install xprintidle tesseract-ocr xdotool xorg-x11-tools gnome-screen
 ```
 
 </details>
+
+AppImage is not a universal package for every Linux distribution. The GLIBC compatibility gate checks only the main program ELF inside each Linux release package; it does not scan every bundled library or plugin. The current maximum allowed GLIBC version is 2.35. The actual requirement of each build is shown in the release workflow's GLIBC check output.
 
 Ubuntu 24.04 / 24.10 Wayland (GNOME 46–47) users experiencing screenshot flash or shutter sound can use the one-click install script to fix it automatically:
 
@@ -280,7 +290,7 @@ Still being actively refined — interaction linkage, state expression, and pres
 <details>
 <summary>Bot Integration (Telegram / Feishu / DingTalk / WeCom)</summary>
 
-Query records and generate daily reports remotely from Telegram / Feishu / DingTalk / WeCom via local API + multi-device registration. Supported commands: `/devices`, `/report`, `/generate`, etc. Restricted to personal and own multi-device use only.
+Query records and generate daily reports remotely from Telegram / Feishu / DingTalk / WeCom via local API + multi-device registration. Supported commands: `/devices`, `/report`, `/generate`, etc. WeCom prefers the intelligent-bot long connection (Bot ID + Secret, no public URL); only one live connection is allowed per bot. Restricted to personal and own multi-device use only.
 
 </details>
 
@@ -322,6 +332,9 @@ Or via query parameter: `?token=<token>`
 | GET | `/v1/hourly-app-breakdown/{date}` | Hourly app breakdown |
 | GET | `/v1/weekly-review` | Weekly review (`?date_from=&date_to=&limit=`) |
 | GET | `/v1/storage/stats` | Storage stats |
+| POST | `/v1/screenshots/capture` | Capture the active screen immediately and return JPEG Base64 (requires screenshots enabled) |
+
+The capture response contains `capturedAt`, `width`, `height`, `mimeType`, `imageBase64`, and a data-directory-relative `relativePath`. It bypasses the scheduled capture interval but never bypasses the screenshot privacy switch, and it does not upload the image.
 
 ### Examples
 
@@ -372,7 +385,7 @@ npm run tauri:dev    # Development
 npm run tauri:build  # Build
 ```
 
-Requires: Node.js 18+ / Rust stable / Tauri 2 CLI · Tech stack: Tauri 2 + Rust + Svelte 4 + SQLite
+Requires: Node.js 22+ / Rust stable / Tauri 2 CLI · Tech stack: Tauri 2 + Rust + Svelte 4 + SQLite
 
 ---
 
@@ -415,8 +428,8 @@ Requires: Node.js 18+ / Rust stable / Tauri 2 CLI · Tech stack: Tauri 2 + Rust 
 
 <a href="https://www.star-history.com/#wm94i/Work-Review&Date">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=wm94i/Work-Review&type=Date&theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=wm94i/Work-Review&type=Date" />
-    <img alt="Star History" src="https://api.star-history.com/svg?repos=wm94i/Work-Review&type=Date" width="720" />
+    <source media="(prefers-color-scheme: dark)" srcset="docs/star-history-dark.svg" />
+    <source media="(prefers-color-scheme: light)" srcset="docs/star-history.svg" />
+    <img alt="Star History" src="docs/star-history.svg" width="720" />
   </picture>
 </a>

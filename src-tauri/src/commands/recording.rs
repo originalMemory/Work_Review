@@ -1,9 +1,9 @@
 //! Auto-extracted from the historical `commands.rs`. Behavior unchanged.
 
-use crate::error::AppError;
 use crate::AppState;
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, State};
+use work_review_core::error::AppError;
 
 /// 暂停录制
 #[tauri::command]

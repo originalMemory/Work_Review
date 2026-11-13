@@ -1,8 +1,11 @@
-<script>
+<script lang="ts">
   import { createEventDispatcher, onDestroy, onMount, tick } from 'svelte';
-  import { t } from '$lib/i18n/index.js';
+  import { t } from '$lib/i18n/index.ts';
 
-  export let mode = 'single';
+  type DatePickerMode = 'single' | 'range';
+  type RangeSelectionStage = 'start' | 'end';
+
+  export let mode: DatePickerMode = 'single';
   export let localeCode = 'zh-CN';
   export let value = '';
   export let startDate = '';
@@ -14,86 +17,90 @@
   export let hideTrigger = false;
   export let inlinePanel = false;
 
-  const dispatch = createEventDispatcher();
+  const dispatch = createEventDispatcher<{ change: void }>();
   const weekdayBase = new Date(Date.UTC(2026, 2, 1));
 
-  let rootElement;
-  let triggerElement;
-  let popoverElement;
+  let rootElement: HTMLDivElement | null = null;
+  let triggerElement: HTMLButtonElement | null = null;
+  let popoverElement: HTMLElement | null = null;
   let floatingPanelStyle = '';
-  let rangeSelectionStage = 'start';
+  let rangeSelectionStage: RangeSelectionStage = 'start';
   let viewDate = new Date();
 
-  function formatSelectionLabel(dateValue, compact = false) {
+  function formatSelectionLabel(dateValue: string, compact = false): string {
     return dateValue ? formatTriggerLabel(dateValue, compact) : t('datePicker.notSelected');
   }
 
-  function parseIsoDate(dateValue) {
+  function parseIsoDate(dateValue: string): Date {
     return new Date(`${dateValue}T12:00:00`);
   }
 
-  function formatIsoDate(date) {
+  function formatIsoDate(date: Date): string {
     return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
   }
 
-  function addDays(date, days) {
+  function addDays(date: Date, days: number): Date {
     const next = new Date(date);
     next.setDate(next.getDate() + days);
     return next;
   }
 
-  function startOfMonth(date) {
+  function startOfMonth(date: Date): Date {
     return new Date(date.getFullYear(), date.getMonth(), 1, 12);
   }
 
-  function startOfWeek(date) {
+  function startOfWeek(date: Date): Date {
     return addDays(date, -date.getDay());
   }
 
-  function sameMonth(left, right) {
+  function sameMonth(left: Date, right: Date): boolean {
     return left.getFullYear() === right.getFullYear() && left.getMonth() === right.getMonth();
   }
 
-  function clampDate(isoDate) {
+  function clampDate(isoDate: string): string {
     if (!isoDate) return isoDate;
     if (min && isoDate < min) return min;
     if (max && isoDate > max) return max;
     return isoDate;
   }
 
-  function formatTriggerLabel(dateValue, compact = false) {
+  function formatTriggerLabel(dateValue: string, compact = false): string {
     if (!dateValue) return '';
-    return new Intl.DateTimeFormat(localeCode, {
+    const options: Intl.DateTimeFormatOptions = {
       ...(compact ? {} : { year: 'numeric' }),
       month: '2-digit',
       day: '2-digit',
-    }).format(parseIsoDate(dateValue));
+    };
+    return new Intl.DateTimeFormat(localeCode, options).format(parseIsoDate(dateValue));
   }
 
-  function getMonthTitle(date) {
+  function getMonthTitle(date: Date): string {
     return new Intl.DateTimeFormat(localeCode, {
       year: 'numeric',
       month: 'long',
     }).format(date);
   }
 
-  function getWeekdayLabels() {
+  function getWeekdayLabels(): string[] {
     return Array.from({ length: 7 }, (_, offset) =>
       new Intl.DateTimeFormat(localeCode, { weekday: 'short' }).format(addDays(weekdayBase, offset))
     );
   }
 
-  function buildVisibleDays(date) {
+  function buildVisibleDays(date: Date): Date[] {
     const monthStart = startOfMonth(date);
     const gridStart = startOfWeek(monthStart);
     return Array.from({ length: 42 }, (_, index) => addDays(gridStart, index));
   }
 
-  function resetRangeSelectionStage() {
+  function resetRangeSelectionStage(): void {
     rangeSelectionStage = 'start';
   }
 
-  function portalToBody(node, enabled) {
+  function portalToBody(
+    node: HTMLElement,
+    enabled: boolean,
+  ): { destroy?: () => void } {
     if (!enabled) {
       return {};
     }
@@ -106,7 +113,7 @@
     };
   }
 
-  function updateFloatingPanelPosition() {
+  function updateFloatingPanelPosition(): void {
     if (!open || inlinePanel || !popoverElement) return;
 
     const anchorElement = triggerElement || rootElement;
@@ -130,7 +137,7 @@
     floatingPanelStyle = `left: ${Math.round(left)}px; top: ${Math.round(top)}px;`;
   }
 
-  function syncViewDate() {
+  function syncViewDate(): void {
     if (mode === 'range') {
       if (startDate) {
         viewDate = startOfMonth(parseIsoDate(startDate));
@@ -150,14 +157,14 @@
     viewDate = startOfMonth(new Date());
   }
 
-  function openPanel() {
+  function openPanel(): void {
     syncViewDate();
     resetRangeSelectionStage();
     open = true;
     tick().then(updateFloatingPanelPosition);
   }
 
-  function closePanel() {
+  function closePanel(): void {
     if (mode === 'range' && rangeSelectionStage === 'end' && startDate && !endDate) {
       endDate = startDate;
       dispatch('change');
@@ -166,7 +173,7 @@
     resetRangeSelectionStage();
   }
 
-  function togglePanel() {
+  function togglePanel(): void {
     if (open) {
       closePanel();
     } else {
@@ -174,12 +181,12 @@
     }
   }
 
-  function isDisabled(date) {
+  function isDisabled(date: Date): boolean {
     const isoDate = formatIsoDate(date);
-    return (min && isoDate < min) || (max && isoDate > max);
+    return Boolean((min && isoDate < min) || (max && isoDate > max));
   }
 
-  function isSelected(date) {
+  function isSelected(date: Date): boolean {
     const isoDate = formatIsoDate(date);
     if (mode === 'range') {
       return isoDate === startDate || isoDate === endDate;
@@ -187,7 +194,7 @@
     return isoDate === value;
   }
 
-  function isInRange(date) {
+  function isInRange(date: Date): boolean {
     if (mode !== 'range' || !startDate || !endDate || startDate === endDate) {
       return false;
     }
@@ -195,15 +202,15 @@
     return isoDate > startDate && isoDate < endDate;
   }
 
-  function isRangeStart(date) {
+  function isRangeStart(date: Date): boolean {
     return mode === 'range' && !!startDate && formatIsoDate(date) === startDate;
   }
 
-  function isRangeEnd(date) {
+  function isRangeEnd(date: Date): boolean {
     return mode === 'range' && !!endDate && formatIsoDate(date) === endDate;
   }
 
-  function selectToday() {
+  function selectToday(): void {
     const today = clampDate(formatIsoDate(new Date()));
     if (!today) return;
 
@@ -218,7 +225,7 @@
     closePanel();
   }
 
-  function selectDate(day) {
+  function selectDate(day: Date): void {
     const isoDate = clampDate(formatIsoDate(day));
     if (!isoDate || isDisabled(day)) return;
 
@@ -247,18 +254,18 @@
     closePanel();
   }
 
-  function shiftMonth(offset) {
+  function shiftMonth(offset: number): void {
     viewDate = startOfMonth(new Date(viewDate.getFullYear(), viewDate.getMonth() + offset, 1, 12));
   }
 
-  function handleDocumentPointerDown(event) {
+  function handleDocumentPointerDown(event: MouseEvent): void {
     if (!open || !rootElement) return;
-    if (rootElement.contains(event.target)) return;
-    if (popoverElement?.contains(event.target)) return;
+    if (event.target instanceof Node && rootElement.contains(event.target)) return;
+    if (event.target instanceof Node && popoverElement?.contains(event.target)) return;
     closePanel();
   }
 
-  function handleDocumentKeydown(event) {
+  function handleDocumentKeydown(event: KeyboardEvent): void {
     if (event.key === 'Escape') {
       closePanel();
     }

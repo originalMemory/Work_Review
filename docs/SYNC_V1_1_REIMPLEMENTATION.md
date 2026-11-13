@@ -2,7 +2,8 @@
 
 ## 基线
 
-- 上游：`cf79fec`（`v1.1.0` 后两次修复）
+- 上游：`c17a966`（`v1.1.4-rc.2`，2026-11-11）
+- 首次重实现基线：`cf79fec`（`v1.1.0` 后两次修复）
 - 旧实现：`feat/sync`，仅作为行为与协议参考
 - 原则：以上游模块和查询口径为主体，不移植旧页面或旧 `commands.rs`
 
@@ -39,3 +40,13 @@
 - `cargo check --workspace`
 - 前端测试与构建
 - 手动验证双设备推拉、筛选、截图保留和离线重试
+
+
+## 2026-11-13 合并上游
+
+- 合并前先独立提交同步服务的时间范围查询接口（`bf1c2df`）。
+- 前端设备筛选接入上游 TypeScript 与时间线网关；日报请求快照和缓存键保留设备维度。
+- 保留同步 schema、协议、设备目录和空闲豁免；WebDAV 配置同步不得覆盖本机同步身份、游标、设备筛选及空闲豁免列表。
+- 上游截图清理适配设备目录，并仅清空实际删除目录的本地路径；保留上游元数据自动清理默认关闭的行为。
+- 本轮只做上游合并及必要适配，不新增 OCR 或数据库保留策略，不对实际数据库执行清理。
+- 验证入口：`npm run verify:frontend`、`cargo test --workspace --all-targets`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --manifest-path sync-server/Cargo.toml`。

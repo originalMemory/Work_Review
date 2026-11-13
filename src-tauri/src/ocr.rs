@@ -2,7 +2,6 @@
 // Windows: 使用 PaddleOCR (轻量化版本)
 // macOS: 使用 Vision 框架
 
-use crate::error::{AppError, Result};
 use image::{imageops::FilterType, DynamicImage, ImageFormat};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
@@ -12,6 +11,7 @@ use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+use work_review_core::error::{AppError, Result};
 
 const OCR_COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
 const PADDLE_WORKER_READY_TIMEOUT: Duration = Duration::from_secs(45);
@@ -408,6 +408,12 @@ if __name__ == "__main__":
 
     /// 从图片中提取文字
     pub fn extract_text(&self, image_path: &Path) -> Result<Option<OcrResult>> {
+        // Windows 原生 OCR 每次识别都会启动 PowerShell；区域补救会把单次任务放大为 4 个进程。
+        #[cfg(target_os = "windows")]
+        if self.preferred_engine == OcrEngine::WindowsOCR {
+            return self.extract_text_once(image_path);
+        }
+
         execute_ocr_pipeline_with(image_path, |path| self.extract_text_once(path))
     }
 
@@ -488,6 +494,7 @@ function Write-OcrError([string]$message) {{
 # 加载 Windows.Media.Ocr
 [Windows.Media.Ocr.OcrEngine, Windows.Foundation.UniversalApiContract, ContentType = WindowsRuntime] | Out-Null
 [Windows.Graphics.Imaging.BitmapDecoder, Windows.Foundation.UniversalApiContract, ContentType = WindowsRuntime] | Out-Null
+[Windows.Graphics.Imaging.BitmapTransform, Windows.Foundation.UniversalApiContract, ContentType = WindowsRuntime] | Out-Null
 [Windows.Storage.StorageFile, Windows.Foundation.UniversalApiContract, ContentType = WindowsRuntime] | Out-Null
 [Windows.Globalization.Language, Windows.Foundation.UniversalApiContract, ContentType = WindowsRuntime] | Out-Null
 [Windows.System.UserProfile.GlobalizationPreferences, Windows.Foundation.UniversalApiContract, ContentType = WindowsRuntime] | Out-Null
@@ -522,7 +529,29 @@ try {{
     
     # 解码图片
     $decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
-    $bitmap = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+    $maxDimension = [Windows.Media.Ocr.OcrEngine]::MaxImageDimension
+    $sourceWidth = $decoder.PixelWidth
+    $sourceHeight = $decoder.PixelHeight
+    $boxScaleX = 1.0
+    $boxScaleY = 1.0
+    if ([Math]::Max($sourceWidth, $sourceHeight) -gt $maxDimension) {{
+        # 在同一个进程中按引擎上限等比缩小，避免先分配完整的超大位图。
+        $scale = [double]$maxDimension / [Math]::Max($sourceWidth, $sourceHeight)
+        $transform = [Windows.Graphics.Imaging.BitmapTransform]::new()
+        $transform.ScaledWidth = [uint32][Math]::Max(1, [Math]::Floor($sourceWidth * $scale))
+        $transform.ScaledHeight = [uint32][Math]::Max(1, [Math]::Floor($sourceHeight * $scale))
+        $bitmap = Await ($decoder.GetSoftwareBitmapAsync(
+            [Windows.Graphics.Imaging.BitmapPixelFormat]::Bgra8,
+            [Windows.Graphics.Imaging.BitmapAlphaMode]::Premultiplied,
+            $transform,
+            [Windows.Graphics.Imaging.ExifOrientationMode]::IgnoreExifOrientation,
+            [Windows.Graphics.Imaging.ColorManagementMode]::DoNotColorManage
+        )) ([Windows.Graphics.Imaging.SoftwareBitmap])
+        $boxScaleX = [double]$sourceWidth / $transform.ScaledWidth
+        $boxScaleY = [double]$sourceHeight / $transform.ScaledHeight
+    }} else {{
+        $bitmap = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+    }}
     if ($null -eq $bitmap) {{
         throw "解码截图失败: $imagePath"
     }}
@@ -573,10 +602,10 @@ try {{
             $boxes += @{{
                 text = $word.Text
                 confidence = 0.9
-                x = [int]$rect.X
-                y = [int]$rect.Y
-                width = [int]$rect.Width
-                height = [int]$rect.Height
+                x = [int]($rect.X * $boxScaleX)
+                y = [int]($rect.Y * $boxScaleY)
+                width = [int]($rect.Width * $boxScaleX)
+                height = [int]($rect.Height * $boxScaleY)
             }}
         }}
     }}
@@ -629,6 +658,8 @@ try {{
             Command::new(&powershell_path)
                 .args([
                     "-NoProfile",
+                    "-WindowStyle",
+                    "Hidden",
                     "-Sta",
                     "-ExecutionPolicy",
                     "Bypass",
@@ -1549,14 +1580,77 @@ pub fn filter_sensitive_text(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn windows_ocr应在单次进程内按引擎上限缩放后识别() {
+        // 非 Windows CI 也能检查内嵌脚本，避免 cfg(windows) 隐藏此回归。
+        let source = include_str!("ocr.rs");
+        let entry = source
+            .split("pub fn extract_text(&self")
+            .nth(1)
+            .unwrap()
+            .split("fn extract_text_once(")
+            .next()
+            .unwrap();
+        assert!(entry.contains("if self.preferred_engine == OcrEngine::WindowsOCR"));
+        assert!(entry.contains("return self.extract_text_once(image_path);"));
+
+        let native = source
+            .split("fn extract_with_windows_ocr(&self")
+            .nth(1)
+            .unwrap()
+            .split("fn extract_with_vision(&self")
+            .next()
+            .unwrap();
+        let limit = native
+            .find("$maxDimension = [Windows.Media.Ocr.OcrEngine]::MaxImageDimension")
+            .unwrap();
+        let decode = native
+            .find("$bitmap = Await ($decoder.GetSoftwareBitmapAsync(")
+            .unwrap();
+        let recognize = native
+            .find("$ocrEngine.RecognizeAsync($ocrBitmap)")
+            .unwrap();
+        assert!(limit < decode && decode < recognize);
+        assert!(native.contains("if ([Math]::Max($sourceWidth, $sourceHeight) -gt $maxDimension)"));
+        assert!(native
+            .contains("$scale = [double]$maxDimension / [Math]::Max($sourceWidth, $sourceHeight)"));
+        for dimension in ["Width", "Height"] {
+            assert!(native.contains(&format!(
+                "$transform.Scaled{dimension} = [uint32][Math]::Max(1, [Math]::Floor($source{dimension} * $scale))"
+            )));
+        }
+        assert!(native.contains("$transform,\n            [Windows.Graphics.Imaging.ExifOrientationMode]::IgnoreExifOrientation"));
+        assert!(native
+            .contains("}} else {{\n        $bitmap = Await ($decoder.GetSoftwareBitmapAsync())"));
+        for (axis, dimension, position) in [("X", "Width", "x"), ("Y", "Height", "y")] {
+            assert!(native.contains(&format!("$boxScale{axis} = 1.0")));
+            assert!(native.contains(&format!(
+                "$boxScale{axis} = [double]$source{dimension} / $transform.Scaled{dimension}"
+            )));
+            assert!(native.contains(&format!(
+                "{position} = [int]($rect.{axis} * $boxScale{axis})"
+            )));
+            assert!(native.contains(&format!(
+                "{} = [int]($rect.{dimension} * $boxScale{axis})",
+                dimension.to_lowercase()
+            )));
+        }
+        assert_eq!(native.matches("RecognizeAsync(").count(), 1);
+        assert_eq!(native.matches("Command::new(").count(), 1);
+        assert!(native.contains("\"-WindowStyle\",\n                    \"Hidden\""));
+        assert!(native.contains(".creation_flags(CREATE_NO_WINDOW)"));
+    }
+
     use super::{
-        build_retry_region_plans, execute_ocr_pipeline_with, merge_ocr_results, paddle_worker_slot,
-        preprocess_image_for_retry, request_paddle_via_worker, should_retry_after_initial_ocr,
-        OcrResult, PaddleModelConfig,
+        build_retry_region_plans, execute_ocr_pipeline_with, merge_ocr_results,
+        preprocess_image_for_retry, should_retry_after_initial_ocr, OcrResult,
     };
+    #[cfg(unix)]
+    use super::{paddle_worker_slot, request_paddle_via_worker, PaddleModelConfig};
     use image::{DynamicImage, Rgba, RgbaImage};
     use std::collections::VecDeque;
     use std::path::{Path, PathBuf};
+    #[cfg(unix)]
     use std::sync::{Mutex, OnceLock};
     use uuid::Uuid;
 

@@ -7,6 +7,7 @@ src-tauri/target/
 test_uia/target/
 sync-server/target/
 test_uia/*.txt
+*.tsbuildinfo
 
 # IDE
 .idea/
@@ -16,6 +17,7 @@ test_uia/*.txt
 
 # OS
 .DS_Store
+._*
 Thumbs.db
 
 # Logs
@@ -39,8 +41,8 @@ npm-debug.log*
 src/lib/components/Avatar/AvatarCanvasLive2D.svelte
 
 # Tauri
-src-tauri/target/
 src-tauri/WixTools/
+/src-tauri/gen/schemas/
 
 # Python
 __pycache__/
@@ -49,6 +51,14 @@ __pycache__/
 .Python
 /env/
 /venv/
+/learning/
+
+# GitHub Actions 发布临时产物
+/all-artifacts/
+/release_notes.md
+/updater.json
+/updater-ghproxy.json
+/updater-ghp.json
 
 # Bot config
 bots/config.json
@@ -56,13 +66,21 @@ bots/config.json
 # Project docs (local only)
 plan-*.md
 TEST_REPORT_*.md
+/docs/superpowers/plans/
+/docs/superpowers/specs/
+# 设计文档与 Windows OCR 说明：本地参考用，不上传 git
+/docs/design/
+/docs/WINDOWS_OCR.md
 src-tauri/icons.backup/
 .worktrees/
 .superpowers/
 # Cargo 工作区根目录的 target/（子 crate 的 target 已分别在上面显式列出）
 /target/
+# 临时 rustc 直编测试可能落到仓库根目录的中间产物
+/*.o
+/*.rmeta
 
 # 会话工作文件（plan-*.md 匹配不到根目录 plan.md，显式列出）
-plan.md
+/plan.md
 .claude/
 .zcode/

@@ -1,31 +1,178 @@
-<script>
+<script lang="ts">
   import { createEventDispatcher, onDestroy, onMount } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
-  import { aiStore } from '$lib/stores/ai.js';
-  import { locale, t } from '$lib/i18n/index.js';
+  import { aiStore } from '$lib/stores/ai.ts';
+  import type { AiTestStatus } from '$lib/stores/ai.ts';
+  import { locale, t } from '$lib/i18n/index.ts';
+  import type { Locale } from '$lib/i18n/index.ts';
+  import AssistantMemoryManager from './AssistantMemoryManager.svelte';
 
-  export let config;
-  export let providers = [];
+  type AiMode = 'local' | 'summary';
+  type SemanticStatus = 'idle' | 'building' | 'ready' | 'failed';
+  type ProviderId =
+    | 'ollama'
+    | 'openai'
+    | 'siliconflow'
+    | 'deepseek'
+    | 'qwen'
+    | 'zhipu'
+    | 'moonshot'
+    | 'doubao'
+    | 'minimax'
+    | 'gemini'
+    | 'claude'
+    | 'openrouter'
+    | 'groq'
+    | 'xai'
+    | 'mistral'
+    | 'lmstudio'
+    | 'custom';
 
-  const dispatch = createEventDispatcher();
+  interface TextModelConfig {
+    provider: ProviderId;
+    endpoint: string;
+    model: string;
+    api_key: string | null;
+    enable_thinking?: boolean | null;
+    thinking_budget?: number | null;
+    max_output_tokens?: number | null;
+  }
+
+  interface GenerationCapabilities {
+    thinking: boolean;
+    thinkingStreamingOnly: boolean;
+    thinkingBudget: boolean;
+    maxOutputTokens: boolean;
+  }
+
+  interface AiSettingsConfig {
+    ai_mode: AiMode;
+    text_model: TextModelConfig;
+    assistant_timeout_secs?: number;
+    report_generation_timeout_secs?: number;
+    text_model_provider_cache?: Partial<Record<ProviderId, ProviderConfigCache>>;
+    assistant_web_access_enabled: boolean;
+    assistant_search_provider: 'duckduckgo' | 'tavily' | 'bocha';
+    assistant_search_api_key: string;
+    memory_semantic_enabled: boolean;
+    embedding_provider: 'ollama' | 'openai';
+    embedding_endpoint: string;
+    embedding_model: string;
+    embedding_api_key: string;
+    assistant_memory_enabled: boolean;
+  }
+
+  interface AiProvider {
+    id: ProviderId;
+    name: string;
+    description: string;
+    default_endpoint: string;
+    default_model: string;
+    requires_api_key: boolean;
+    generation_capabilities?: GenerationCapabilities;
+  }
+
+  interface AiModeOption {
+    value: AiMode;
+    labelKey: string;
+    descriptionKey: string;
+    requiresText: boolean;
+  }
+
+  interface LocalizedAiMode extends AiModeOption {
+    label: string;
+    description: string;
+  }
+
+  interface SemanticMemoryState {
+    status: SemanticStatus;
+    rebuildRequired: boolean;
+    indexedActivities: number;
+    totalActivities: number;
+    lastError: string | null;
+  }
+
+  interface SemanticIndexProgress {
+    state: SemanticMemoryState;
+  }
+
+  interface ProviderConfigCache {
+    provider?: ProviderId;
+    endpoint: string;
+    model: string;
+    // 后端 ModelConfig.api_key 为 Option<String>，序列化可能为 null；消费点统一用 `|| ''` 兜底
+    api_key: string | null;
+    enable_thinking?: boolean | null;
+    thinking_budget?: number | null;
+    max_output_tokens?: number | null;
+  }
+
+  interface ProviderLabel {
+    name: string;
+    description: string;
+  }
+
+  interface SearchTestResult {
+    resultCount?: number;
+    latencyMs?: number;
+  }
+
+  interface EmbeddingTestResult {
+    dimension?: number;
+    latencyMs?: number;
+  }
+
+  interface ModelTestResult {
+    success: boolean;
+    response_time_ms?: number | null;
+    message?: string | null;
+  }
+
+  export let config: AiSettingsConfig;
+  export let providers: AiProvider[] = [];
+
+  const dispatch = createEventDispatcher<{ change: AiSettingsConfig }>();
   $: currentLocale = $locale;
-  let aiModes = [];
-  let localizedProviders = [];
+  let aiModes: LocalizedAiMode[] = [];
+  let localizedProviders: AiProvider[] = [];
   // 三入口分区：模型配置 / 助手联网 / 语义记忆（点击切换，互不打扰）
   let aiSection = 'model';
 
   // ══════════ 语义记忆索引管理（查询走助手，管理入口在这里）══════════
-  let semanticStats = { totalChunks: 0, embeddedChunks: 0 };
+  const emptySemanticState = (): SemanticMemoryState => ({
+    status: 'idle',
+    rebuildRequired: true,
+    indexedActivities: 0,
+    totalActivities: 0,
+    lastError: null,
+  });
+  let semanticState = emptySemanticState();
   let semanticIndexing = false;
   let semanticIndexText = '';
   let semanticError = '';
   let semanticDestroyed = false;
-  $: semanticPending = Math.max(0, (semanticStats.totalChunks || 0) - (semanticStats.embeddedChunks || 0));
+
+  function semanticStatusKey() {
+    if (semanticState.status === 'building') return 'settingsAI.semanticMemory.statusBuilding';
+    if (semanticState.status === 'failed') return 'settingsAI.semanticMemory.statusFailed';
+    if (semanticState.rebuildRequired) return 'settingsAI.semanticMemory.statusRebuildRequired';
+    if (semanticState.status === 'ready') return 'settingsAI.semanticMemory.statusReady';
+    return 'settingsAI.semanticMemory.statusIdle';
+  }
+
+  function semanticActionKey() {
+    if (semanticState.status === 'failed') return 'settingsAI.semanticMemory.retryIndex';
+    if (semanticState.status === 'ready') return 'settingsAI.semanticMemory.rebuildIndex';
+    if (semanticState.rebuildRequired && semanticState.indexedActivities > 0) {
+      return 'settingsAI.semanticMemory.rebuildIndex';
+    }
+    return 'settingsAI.semanticMemory.buildIndex';
+  }
 
   async function refreshSemanticStats() {
     if (!config?.memory_semantic_enabled) return;
     try {
-      semanticStats = await invoke('semantic_memory_status');
+      semanticState = await invoke<SemanticMemoryState>('semantic_memory_status');
     } catch (e) {
       console.warn('读取语义记忆状态失败:', e);
     }
@@ -35,31 +182,31 @@
     if (semanticIndexing) return;
     semanticIndexing = true;
     semanticError = '';
+    semanticIndexText = '';
     try {
-      // 前端驱动的渐进式索引：循环调用直到活动游标追平且无待嵌入块
-      for (let round = 0; round < 500; round += 1) {
-        if (semanticDestroyed) return;
-        const progress = await invoke('index_semantic_memory');
-        semanticStats = progress.stats;
-        semanticIndexText = t('memoryPage.indexProgress', {
-          embedded: progress.stats.embeddedChunks,
-          total: progress.stats.totalChunks,
+      // 索引命令读取的是已持久化配置；先把当前界面配置落盘，
+      // 避免开关已打开但未保存时出现"界面已启用、后端报未启用"的矛盾
+      await invoke('save_config', { config });
+      // 后端持久化真实状态；前端只分批推进，直到状态不再是 building。
+      while (!semanticDestroyed) {
+        const progress = await invoke<SemanticIndexProgress>('index_semantic_memory');
+        semanticState = progress.state;
+        semanticIndexText = t('settingsAI.semanticMemory.progress', {
+          indexed: semanticState.indexedActivities ?? 0,
+          total: semanticState.totalActivities ?? 0,
         });
-        if (progress.activitiesDone && progress.pendingEmbeddings === 0) {
-          semanticIndexText = t('memoryPage.indexDone', { total: progress.stats.embeddedChunks });
-          break;
-        }
+        if (semanticState.status !== 'building') break;
       }
     } catch (e) {
       semanticError = String(e);
     } finally {
       semanticIndexing = false;
-      refreshSemanticStats();
+      await refreshSemanticStats();
     }
   }
 
   // 日报生成模式：基础模板 vs AI 增强
-  const aiModeConfigs = [
+  const aiModeConfigs: AiModeOption[] = [
     {
       value: 'local',
       labelKey: 'settingsAI.modeLocal',
@@ -82,7 +229,7 @@
     }));
   }
 
-  const providerLabels = {
+  const providerLabels: Record<ProviderId, Partial<Record<Locale, ProviderLabel>>> = {
     ollama: {
       'zh-CN': { name: 'Ollama (本地)', description: '本机运行开源模型，数据不出本机' },
       en: { name: 'Ollama (Local)', description: 'Runs open models on your device, data stays local' },
@@ -170,7 +317,7 @@
     },
   };
 
-  function getLocalizedProvider(provider) {
+  function getLocalizedProvider(provider: AiProvider): AiProvider {
     const localized = providerLabels[provider?.id]?.[currentLocale];
     if (!localized) {
       return provider;
@@ -187,7 +334,7 @@
   }
 
   // 提供商默认配置
-  function getProviderDefaults(providerId) {
+  function getProviderDefaults(providerId: ProviderId) {
     const provider = localizedProviders.find(p => p.id === providerId);
     return {
       endpoint: provider?.default_endpoint || '',
@@ -197,11 +344,11 @@
   }
 
   // 从全局 store 订阅测试状态
-  let textTestStatus = null;
+  let textTestStatus: AiTestStatus = null;
   let textTestMessage = '';
   let textConnectionVerified = false;
   let showApiKey = false;
-  let fetchedModels = [];
+  let fetchedModels: string[] = [];
   let modelsLoading = false;
   let modelsError = '';
   let modelsLoaded = 0;
@@ -229,25 +376,44 @@
   // 当前提供商
   $: currentProvider = localizedProviders.find(p => p.id === config?.text_model?.provider) || localizedProviders[0];
   $: requiresApiKey = currentProvider?.requires_api_key ?? true;
+  $: generationCaps = currentProvider?.generation_capabilities;
+  $: thinkingModeValue = config.text_model?.enable_thinking === true
+    ? 'on'
+    : config.text_model?.enable_thinking === false
+      ? 'off'
+      : '';
+
+  function setThinkingMode(value: string) {
+    if (value === 'on') config.text_model.enable_thinking = true;
+    else if (value === 'off') config.text_model.enable_thinking = false;
+    else config.text_model.enable_thinking = null;
+    handleChange();
+  }
 
   // 是否选择了 AI 增强模式（决定是否展开配置面板）
   $: isAiMode = config.ai_mode === 'summary';
 
   // 每个 provider 的配置缓存（切换时保留配置）
-  let providerConfigs = {};
+  let providerConfigs: Partial<Record<ProviderId, ProviderConfigCache>> = {};
   let configInitialized = false;
 
   $: if (config?.text_model?.provider && !configInitialized) {
+    // 先载入持久化的各服务商缓存，再以激活中 provider 的实时值为准
+    providerConfigs = { ...(config.text_model_provider_cache || {}) };
     providerConfigs[config.text_model.provider] = {
+      provider: config.text_model.provider,
       endpoint: config.text_model.endpoint,
       model: config.text_model.model,
-      api_key: config.text_model.api_key || ''
+      api_key: config.text_model.api_key || '',
+      enable_thinking: config.text_model.enable_thinking ?? null,
+      thinking_budget: config.text_model.thinking_budget ?? null,
+      max_output_tokens: config.text_model.max_output_tokens ?? null,
     };
     configInitialized = true;
   }
 
   // 服务商品牌色（卡片网格头像底色，参考各家官方主色的近似值）
-  const PROVIDER_BRAND = {
+  const PROVIDER_BRAND: Record<ProviderId, string> = {
     ollama: '#111827',
     openai: '#10a37f',
     siliconflow: '#6e4ff6',
@@ -267,13 +433,13 @@
     custom: '#64748b',
   };
 
-  /** 品牌图标加载失败 → 回退到字母块（图标需运行 scripts/fetch-provider-icons.mjs 落盘） */
-  let providerIconFailed = {};
+  /** 品牌图标加载失败 → 回退到字母块（图标需运行 scripts/fetch-provider-icons.ts 落盘） */
+  let providerIconFailed: Partial<Record<ProviderId, boolean>> = {};
 
   // ══════════ 联网搜索 / 嵌入模型 连通性测试 ══════════
-  let webTestStatus = null; // null | 'testing' | 'success' | 'error'
+  let webTestStatus: AiTestStatus = null;
   let webTestMessage = '';
-  let memTestStatus = null;
+  let memTestStatus: AiTestStatus = null;
   let memTestMessage = '';
 
   async function testWebSearch() {
@@ -281,7 +447,7 @@
     webTestStatus = 'testing';
     webTestMessage = '';
     try {
-      const result = await invoke('test_assistant_search', {
+      const result = await invoke<SearchTestResult>('test_assistant_search', {
         provider: config.assistant_search_provider,
         apiKey: config.assistant_search_api_key,
       });
@@ -301,7 +467,7 @@
     memTestStatus = 'testing';
     memTestMessage = '';
     try {
-      const result = await invoke('test_embedding_model', {
+      const result = await invoke<EmbeddingTestResult>('test_embedding_model', {
         provider: config.embedding_provider,
         endpoint: config.embedding_endpoint,
         model: config.embedding_model,
@@ -318,26 +484,34 @@
     }
   }
 
-  function providerInitial(id) {
+  function providerInitial(id: string): string {
     return String(id || '?').charAt(0).toUpperCase();
   }
 
   /** 卡片点击入口：复用 handleProviderChange 的缓存/默认值/状态重置逻辑。 */
-  function selectProvider(providerId) {
+  function selectProvider(providerId: ProviderId) {
     if ((config.text_model?.provider || 'ollama') === providerId) return;
-    handleProviderChange({ target: { value: providerId } });
+    handleProviderChange(providerId);
   }
 
-  function handleProviderChange(e) {
-    const providerId = e.target.value;
-
-    // 缓存当前 provider 配置
+  function handleProviderChange(providerId: ProviderId) {
+    // 缓存当前 provider 配置：内存一份（本会话），持久化一份（随保存落盘，
+    // 组件销毁或重启后仍能恢复各家服务商的 Key）
     if (config.text_model.provider) {
-      providerConfigs[config.text_model.provider] = {
+      const snapshot: ProviderConfigCache = {
+        provider: config.text_model.provider,
         endpoint: config.text_model.endpoint,
         model: config.text_model.model,
-        api_key: config.text_model.api_key || ''
+        api_key: config.text_model.api_key || '',
+        enable_thinking: config.text_model.enable_thinking ?? null,
+        thinking_budget: config.text_model.thinking_budget ?? null,
+        max_output_tokens: config.text_model.max_output_tokens ?? null,
       };
+      providerConfigs[config.text_model.provider] = snapshot;
+      if (!config.text_model_provider_cache) {
+        config.text_model_provider_cache = {};
+      }
+      config.text_model_provider_cache[config.text_model.provider] = snapshot;
     }
 
     // 恢复缓存或使用默认值
@@ -348,6 +522,9 @@
     config.text_model.endpoint = cached?.endpoint || defaults.endpoint;
     config.text_model.model = cached?.model || defaults.model;
     config.text_model.api_key = cached?.api_key || '';
+    config.text_model.enable_thinking = cached?.enable_thinking ?? null;
+    config.text_model.thinking_budget = cached?.thinking_budget ?? null;
+    config.text_model.max_output_tokens = cached?.max_output_tokens ?? null;
 
     // 切换提供商时清空状态
     textTestStatus = null;
@@ -369,11 +546,11 @@
     dispatch('change', config);
   }
 
-  function shouldHideRawMessage(message) {
+  function shouldHideRawMessage(message: string): boolean {
     return currentLocale === 'en' && /[一-鿿]/.test(message);
   }
 
-  function parseTestErrorMessage(raw) {
+  function parseTestErrorMessage(raw: unknown): string | null {
     const msg = String(raw || '').trim();
     if (!msg) return null;
 
@@ -410,7 +587,7 @@
     return null;
   }
 
-  function formatTestError(raw) {
+  function formatTestError(raw: unknown): string {
     const parsed = parseTestErrorMessage(raw);
     if (parsed) return parsed;
     const rawTrimmed = String(raw || '').trim();
@@ -421,7 +598,7 @@
   async function testTextModel() {
     aiStore.startTesting();
     try {
-      const result = await invoke('test_model', {
+      const result = await invoke<ModelTestResult>('test_model', {
         modelConfig: {
           provider: config.text_model.provider,
           endpoint: config.text_model.endpoint,
@@ -456,7 +633,7 @@
 
     modelsLoading = true;
     try {
-      const models = await invoke('fetch_models', {
+      const models = await invoke<string[]>('fetch_models', {
         provider: config.text_model.provider,
         endpoint: config.text_model.endpoint,
         apiKey: config.text_model.api_key || null,
@@ -470,7 +647,7 @@
     } catch (e) {
       fetchedModels = [];
       modelsLoaded = 0;
-      const msg = e.toString();
+      const msg = String(e);
       modelsError = msg;
       aiStore.setError(
         msg && !shouldHideRawMessage(msg)
@@ -482,7 +659,7 @@
     }
   }
 
-  function getConfigHash() {
+  function getConfigHash(): string | null {
     if (!config?.text_model) return null;
     const { provider, endpoint, model, api_key } = config.text_model;
     return `${provider}|${endpoint}|${model}|${api_key || ''}`;
@@ -490,10 +667,10 @@
 
   onMount(async () => {
     refreshSemanticStats();
-    await new Promise(r => setTimeout(r, 200));
+    await new Promise<void>((resolve) => setTimeout(resolve, 200));
 
     const currentHash = getConfigHash();
-    let lastHash = null;
+    let lastHash: string | null = null;
     const unsub = aiStore.subscribe(s => { lastHash = s.lastTestedConfigHash; });
     unsub();
 
@@ -553,7 +730,7 @@
       {#each [
         { id: 'model', label: t('settingsAI.sectionModel'), on: isTextModelConfigured },
         { id: 'web', label: t('settingsAI.sectionWeb'), on: Boolean(config.assistant_web_access_enabled) },
-        { id: 'memory', label: t('settingsAI.sectionMemory'), on: Boolean(config.memory_semantic_enabled) },
+        { id: 'memory', label: t('settingsAI.sectionMemory'), on: Boolean(config.memory_semantic_enabled || config.assistant_memory_enabled) },
       ] as section (section.id)}
         <button
           type="button"
@@ -709,12 +886,12 @@
               id="ai-model"
               value={config.text_model.model}
               on:change={(e) => {
-                if (e.target.value === '__manual__') {
+                if (e.currentTarget.value === '__manual__') {
                   showManualInput = true;
                   config.text_model.model = '';
                   return;
                 }
-                config.text_model.model = e.target.value;
+                config.text_model.model = e.currentTarget.value;
                 handleChange();
               }}
               class="control-input"
@@ -759,6 +936,97 @@
         <p class="settings-note">{t('settingsAI.loadedModels', { count: modelsLoaded })}</p>
       {/if}
     </div>
+
+    <div class="settings-responsive-field-grid grid gap-2">
+      <label class="block">
+        <span class="settings-label">{t('settingsAI.assistantTimeout')}</span>
+        <input
+          type="number"
+          min="30"
+          max="900"
+          class="control-input mt-1"
+          value={config.assistant_timeout_secs ?? 120}
+          on:change={(e) => {
+            const next = Number.parseInt(e.currentTarget.value, 10);
+            config.assistant_timeout_secs = Number.isFinite(next) ? next : 120;
+            handleChange();
+          }}
+        />
+        <p class="settings-note mt-1">{t('settingsAI.assistantTimeoutHint')}</p>
+      </label>
+      <label class="block">
+        <span class="settings-label">{t('settingsAI.reportTimeout')}</span>
+        <input
+          type="number"
+          min="60"
+          max="1800"
+          class="control-input mt-1"
+          value={config.report_generation_timeout_secs ?? 300}
+          on:change={(e) => {
+            const next = Number.parseInt(e.currentTarget.value, 10);
+            config.report_generation_timeout_secs = Number.isFinite(next) ? next : 300;
+            handleChange();
+          }}
+        />
+        <p class="settings-note mt-1">{t('settingsAI.reportTimeoutHint')}</p>
+      </label>
+    </div>
+
+    {#if generationCaps?.thinking || generationCaps?.maxOutputTokens}
+      <div class="settings-responsive-field-grid grid gap-2">
+        {#if generationCaps.thinking}
+          <label class="block">
+            <span class="settings-label">{t('settingsAI.thinkingMode')}</span>
+            <select
+              class="control-input mt-1"
+              value={thinkingModeValue}
+              on:change={(e) => setThinkingMode(e.currentTarget.value)}
+            >
+              <option value="">{t('settingsAI.thinkingServerDefault')}</option>
+              <option value="on">{t('settingsAI.thinkingOn')}</option>
+              <option value="off">{t('settingsAI.thinkingOff')}</option>
+            </select>
+            {#if generationCaps.thinkingStreamingOnly}
+              <p class="settings-note mt-1">{t('settingsAI.thinkingStreamingOnlyHint')}</p>
+            {/if}
+          </label>
+        {:else}
+          <p class="settings-note">{t('settingsAI.thinkingUnsupported')}</p>
+        {/if}
+        {#if generationCaps.thinkingBudget && thinkingModeValue === 'on'}
+          <label class="block">
+            <span class="settings-label">{t('settingsAI.thinkingBudget')}</span>
+            <input
+              type="number"
+              min="1"
+              class="control-input mt-1"
+              value={config.text_model.thinking_budget ?? ''}
+              on:change={(e) => {
+                const next = Number.parseInt(e.currentTarget.value, 10);
+                config.text_model.thinking_budget = Number.isFinite(next) && next > 0 ? next : null;
+                handleChange();
+              }}
+            />
+          </label>
+        {/if}
+        {#if generationCaps.maxOutputTokens}
+          <label class="block">
+            <span class="settings-label">{t('settingsAI.maxOutputTokens')}</span>
+            <input
+              type="number"
+              min="1"
+              class="control-input mt-1"
+              value={config.text_model.max_output_tokens ?? ''}
+              on:change={(e) => {
+                const next = Number.parseInt(e.currentTarget.value, 10);
+                config.text_model.max_output_tokens = Number.isFinite(next) && next > 0 ? next : null;
+                handleChange();
+              }}
+            />
+          </label>
+        {/if}
+      </div>
+    {/if}
 
     <!-- 测试结果详情 -->
     {#if textTestMessage}
@@ -954,33 +1222,73 @@
             {/if}
           </div>
 
-          <!-- 索引管理：查询直接问助手（semantic_search 工具），这里只管建索引 -->
-          <div class="flex flex-wrap items-center gap-x-4 gap-y-1 pt-1 text-xs text-slate-400 dark:text-[#636c76]">
-            <span>{t('memoryPage.indexStatus', { embedded: semanticStats.embeddedChunks ?? 0, total: semanticStats.totalChunks ?? 0 })}</span>
-            <button
-              type="button"
-              class="text-indigo-500 hover:text-indigo-600 dark:text-indigo-400 dark:hover:text-indigo-300 disabled:opacity-50"
-              on:click={startSemanticIndexing}
-              disabled={semanticIndexing}
-            >
-              {#if semanticIndexing}
-                {semanticIndexText || t('memoryPage.indexing')}
-              {:else if semanticPending > 0 || (semanticStats.totalChunks ?? 0) === 0}
-                {t('memoryPage.startIndex')}
-              {:else}
-                {t('memoryPage.incrementalIndex')}
-              {/if}
-            </button>
-            {#if !semanticIndexing && semanticIndexText}
-              <span>{semanticIndexText}</span>
+          <!-- 索引管理：状态由后端持久化，未 ready 时助手自动降级为 FTS -->
+          <div class="space-y-2 rounded-lg border border-slate-200 px-3 py-2.5 dark:border-[#30363d]">
+            <div class="flex flex-wrap items-center justify-between gap-2 text-xs">
+              <span class="settings-muted">
+                {t('settingsAI.semanticMemory.statusLabel')}：
+                <strong class="text-slate-700 dark:text-[#c9d1d9]">{t(semanticStatusKey())}</strong>
+              </span>
+              <button
+                type="button"
+                class="text-indigo-500 hover:text-indigo-600 dark:text-indigo-400 dark:hover:text-indigo-300 disabled:opacity-50"
+                on:click={startSemanticIndexing}
+                disabled={semanticIndexing}
+              >
+                {semanticIndexing ? t('settingsAI.semanticMemory.statusBuilding') : t(semanticActionKey())}
+              </button>
+            </div>
+            <p class="settings-muted">
+              {t('settingsAI.semanticMemory.progress', {
+                indexed: semanticState.indexedActivities ?? 0,
+                total: semanticState.totalActivities ?? 0,
+              })}
+            </p>
+            {#if semanticState.lastError}
+              <p class="text-xs text-rose-500 dark:text-rose-400 break-words">
+                {t('settingsAI.semanticMemory.lastError', { error: semanticState.lastError })}
+              </p>
+            {:else if semanticError}
+              <!-- 兜底：仅在状态区未记录到错误时显示，避免同一错误重复出现 -->
+              <p class="text-xs text-rose-500 dark:text-rose-400 break-words">{semanticError}</p>
             {/if}
+            {#if semanticIndexText}
+              <p class="settings-muted">{semanticIndexText}</p>
+            {/if}
+            <p class="settings-muted">{t('settingsAI.semanticMemory.ftsFallback')}</p>
           </div>
-          {#if semanticError}
-            <p class="text-xs text-rose-500 dark:text-rose-400 break-words">{semanticError}</p>
-          {/if}
           <p class="settings-muted">{t('settingsAI.semanticMemory.askHint')}</p>
         </div>
       {/if}
+
+      <div class="space-y-3 border-t border-slate-200 pt-4 dark:border-[#30363d]">
+        <label class="flex items-center justify-between gap-3 cursor-pointer">
+          <div class="min-w-0">
+            <span class="settings-text text-sm inline-flex items-center gap-2">
+              {t('settingsAI.assistantMemory.title')}
+              <span class="rounded-full px-1.5 py-0.5 text-[10px] font-medium {config.assistant_memory_enabled ? 'bg-emerald-50 text-emerald-600 dark:bg-emerald-950/40 dark:text-emerald-400' : 'bg-slate-100 text-slate-400 dark:bg-[#21262d] dark:text-[#636c76]'}">
+                {config.assistant_memory_enabled ? t('settingsAI.statusEnabled') : t('settingsAI.statusDisabled')}
+              </span>
+            </span>
+            <p class="settings-muted mt-0.5">{t('settingsAI.assistantMemory.hint')}</p>
+          </div>
+          <button
+            type="button"
+            class="switch-track shrink-0 {config.assistant_memory_enabled ? 'bg-emerald-500' : 'bg-slate-300 dark:bg-[#484f58]'}"
+            role="switch"
+            aria-label={t('settingsAI.assistantMemory.enabled')}
+            aria-checked={config.assistant_memory_enabled}
+            on:click={() => {
+              config.assistant_memory_enabled = !config.assistant_memory_enabled;
+              handleChange();
+            }}
+          >
+            <span class="switch-thumb {config.assistant_memory_enabled ? 'translate-x-5' : 'translate-x-0'}"></span>
+          </button>
+        </label>
+
+        <AssistantMemoryManager enabled={Boolean(config.assistant_memory_enabled)} {t} />
+      </div>
     </div>
     {/if}
   </div>

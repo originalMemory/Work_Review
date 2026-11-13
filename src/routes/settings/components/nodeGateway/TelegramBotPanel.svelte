@@ -1,13 +1,39 @@
-<script>
-  import { t } from '$lib/i18n/index.js';
+<script lang="ts">
+  import { t } from '$lib/i18n/index.ts';
   import { invoke } from '@tauri-apps/api/core';
   import { createEventDispatcher } from 'svelte';
 
-  export let config;
-  export let tgBotStatus = null;
+  interface TelegramConfig {
+    telegram_bot_enabled: boolean;
+    telegram_bot_token: string;
+    telegram_bot_proxy: string;
+    telegram_bot_allowed_chat_ids: number[];
+  }
+
+  interface TelegramBotStatus {
+    starting: boolean;
+    running: boolean;
+    lastError: string | null;
+    bindCode?: string | null;
+    bindCodeExpired?: boolean;
+    allowedChatIds?: number[];
+  }
+
+  interface ToastDetail {
+    message: string;
+    type: 'success' | 'error';
+  }
+
+  export let config: TelegramConfig;
+  export let tgBotStatus: TelegramBotStatus | null = null;
   export let saving = false;
 
-  const dispatch = createEventDispatcher();
+  const dispatch = createEventDispatcher<{
+    save: null;
+    startTgPolling: null;
+    reloadStatus: null;
+    toast: ToastDetail;
+  }>();
   let tgTokenVisible = false;
 
   function toggle() {
@@ -29,7 +55,7 @@
   }
 </script>
 
-<div class="rounded-xl bg-white/70 px-3.5 py-3 ring-1 ring-slate-200/70 dark:bg-[#161b22]/20 dark:ring-[#30363d]/70">
+<div class="settings-subsection">
   <div class="flex items-center justify-between gap-3">
     <div class="flex items-center gap-2">
       <svg class="w-4 h-4 text-[#229ED9]" viewBox="0 0 24 24" fill="currentColor">
@@ -144,7 +170,7 @@
           type="text"
           value={(config.telegram_bot_allowed_chat_ids || []).join(', ')}
           on:blur={(e) => {
-            const ids = e.target.value.split(',').map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n));
+            const ids = e.currentTarget.value.split(',').map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n));
             config.telegram_bot_allowed_chat_ids = ids;
             dispatch('save');
           }}

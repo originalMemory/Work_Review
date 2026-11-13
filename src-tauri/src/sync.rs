@@ -1,9 +1,11 @@
-use crate::config::{SyncConfig, SyncScreenshotsMode};
-use crate::database::{SyncActivity, SyncDailyReport, SyncEntityCategory, SyncHourlySummary};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use work_review_core::config::{SyncConfig, SyncScreenshotsMode};
+use work_review_core::database::{
+    SyncActivity, SyncDailyReport, SyncEntityCategory, SyncHourlySummary,
+};
 
 const PUSH_ACTIVITY_BATCH_SIZE: usize = 150;
 const PULL_BATCH_SIZE: usize = 500;

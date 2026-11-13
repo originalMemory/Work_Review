@@ -1,13 +1,35 @@
-<script>
-  import { t } from '$lib/i18n/index.js';
+<script lang="ts">
+  import { t } from '$lib/i18n/index.ts';
   import { invoke } from '@tauri-apps/api/core';
   import { createEventDispatcher } from 'svelte';
 
-  export let config;
-  export let localStatus = { enabled: false, baseUrl: '', tokenPreview: '', lastError: null };
+  interface LocalApiConfig {
+    localhost_api_enabled: boolean;
+    localhost_api_host: string | null;
+    localhost_api_port: number;
+  }
+
+  interface LocalApiStatus {
+    enabled: boolean;
+    baseUrl: string;
+    tokenPreview: string;
+    lastError: string | null;
+  }
+
+  interface ToastDetail {
+    message: string;
+    type: 'success' | 'error';
+  }
+
+  export let config: LocalApiConfig;
+  export let localStatus: LocalApiStatus = { enabled: false, baseUrl: '', tokenPreview: '', lastError: null };
   export let saving = false;
 
-  const dispatch = createEventDispatcher();
+  const dispatch = createEventDispatcher<{
+    save: null;
+    reloadStatus: null;
+    toast: ToastDetail;
+  }>();
   let tokenVisible = false;
   let tokenValue = '';
 
@@ -18,7 +40,7 @@
 
   async function revealToken() {
     try {
-      tokenValue = await invoke('reveal_localhost_api_token');
+      tokenValue = await invoke<string>('reveal_localhost_api_token');
       tokenVisible = true;
     } catch (e) {
       dispatch('toast', { message: t('nodeGatewayPage.tokenRevealFailed', { error: e }), type: 'error' });
@@ -38,7 +60,7 @@
   async function copyToken() {
     try {
       if (!tokenValue) {
-        tokenValue = await invoke('reveal_localhost_api_token');
+        tokenValue = await invoke<string>('reveal_localhost_api_token');
         tokenVisible = true;
       }
       await navigator.clipboard.writeText(tokenValue);
@@ -49,7 +71,7 @@
   }
 </script>
 
-<div class="rounded-xl bg-white/70 px-3.5 py-3 ring-1 ring-slate-200/70 dark:bg-[#161b22]/20 dark:ring-[#30363d]/70">
+<div class="settings-subsection">
   <div class="flex items-center justify-between gap-3 mb-2">
     <div class="flex items-center gap-2">
       <div class="flex h-5 w-5 items-center justify-center rounded-md bg-primary-100 dark:bg-primary-900/30">

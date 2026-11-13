@@ -1,15 +1,42 @@
-<script>
+<script lang="ts">
   import { createEventDispatcher } from 'svelte';
   import { cubicOut } from 'svelte/easing';
   import { tweened } from 'svelte/motion';
   import {
     getAvatarPresetDefinition,
     normalizeAvatarPresetId,
-  } from './avatarPresetRegistry.js';
-  import { getAvatarIdleMotionMeta, getAvatarModeMeta } from './avatarStateMeta.js';
-  import { t } from '$lib/i18n/index.js';
+    type AvatarMouseMotionModel,
+    type AvatarPreviewInputActivity,
+  } from './avatarPresetRegistry.ts';
+  import {
+    getAvatarIdleMotionMeta,
+    getAvatarModeMeta,
+    type AvatarMode,
+  } from './avatarStateMeta.ts';
+  import { t } from '$lib/i18n/index.ts';
 
-  const dispatch = createEventDispatcher();
+  interface Point {
+    x: number;
+    y: number;
+  }
+
+  interface AvatarCanvasState {
+    mode: AvatarMode;
+    appName: string;
+    contextLabel: string;
+    hint: string;
+    isIdle: boolean;
+    isGeneratingReport: boolean;
+    avatarOpacity: number;
+    avatarPreset: string;
+  }
+
+  interface AvatarCanvasEvents {
+    avatarpointerdown: { originalEvent: MouseEvent };
+    avataractivate: { originalEvent: MouseEvent };
+  }
+
+  const dispatch = createEventDispatcher<AvatarCanvasEvents>();
   const SCENE_WIDTH = 612;
   const SCENE_HEIGHT = 354;
   const DEVICE_WIDTH = 104;
@@ -19,7 +46,7 @@
   const STANDARD_HAND_DX = -38;
   const STANDARD_HAND_DY = -50;
   const clipIdBase = `avatar-scene-${Math.random().toString(36).slice(2, 10)}`;
-  const STANDARD_SCENE_MODES = new Set([
+  const STANDARD_SCENE_MODES = new Set<AvatarMode>([
     'idle',
     'working',
     'reading',
@@ -31,18 +58,18 @@
   ]);
   const cursorRatioXTween = tweened(0.5, { duration: 70, easing: cubicOut });
   const cursorRatioYTween = tweened(0.5, { duration: 70, easing: cubicOut });
-  function clamp01(value) {
+  function clamp01(value: number): number {
     return Math.min(1, Math.max(0, value));
   }
 
-  function bezierPoint(ratio, flatPoints) {
-    let points = [];
+  function bezierPoint(ratio: number, flatPoints: readonly number[]): [number, number] {
+    let points: Point[] = [];
     for (let index = 0; index < flatPoints.length; index += 2) {
       points.push({ x: flatPoints[index], y: flatPoints[index + 1] });
     }
 
     while (points.length > 1) {
-      let nextPoints = [];
+      const nextPoints: Point[] = [];
       for (let index = 0; index < points.length - 1; index += 1) {
         nextPoints.push({
           x: points[index].x + (points[index + 1].x - points[index].x) * ratio,
@@ -126,7 +153,7 @@
     return { armPoints, mouseX, mouseY };
   }
 
-  function getMousePointerIndicatorTone(mouseGroup) {
+  function getMousePointerIndicatorTone(mouseGroup: string) {
     switch (mouseGroup) {
       case 'mouse-left':
         return {
@@ -155,7 +182,11 @@
     }
   }
 
-  function computeStaticSceneMouseGeometry(mouseMotionModel, cursorRatioX = 0.5, cursorRatioY = 0.5) {
+  function computeStaticSceneMouseGeometry(
+    mouseMotionModel: AvatarMouseMotionModel | undefined,
+    cursorRatioX = 0.5,
+    cursorRatioY = 0.5,
+  ) {
     if (!mouseMotionModel?.bounds) {
       return null;
     }
@@ -173,7 +204,7 @@
     const controlX = anchorX + dx * 0.5 + normalX * distance * bend;
     const controlY = anchorY + dy * 0.5 + normalY * distance * bend;
     const samples = 18;
-    const points = [];
+    const points: Point[] = [];
 
     for (let index = 0; index <= samples; index += 1) {
       const t = index / samples;
@@ -194,7 +225,7 @@
     };
   }
 
-  function deriveKeyboardGroupFromVisualKey(baseGroup, visualKey) {
+  function deriveKeyboardGroupFromVisualKey(baseGroup: string, visualKey: string): string {
     if (baseGroup && baseGroup !== 'idle') {
       return baseGroup;
     }
@@ -279,7 +310,7 @@
     }
   }
 
-  export let state = {
+  export let state: AvatarCanvasState = {
     mode: 'idle',
     appName: 'Work Review',
     contextLabel: '待命中',
@@ -289,7 +320,7 @@
     avatarOpacity: 0.82,
     avatarPreset: 'original-standard',
   };
-  export let inputActivity = {
+  export let inputActivity: AvatarPreviewInputActivity = {
     keyboardActive: false,
     mouseActive: false,
     keyboardGroup: 'idle',
@@ -393,11 +424,11 @@
   $: mouseArmStyle = `opacity:${preset.mouseArmOpacity ?? 1};`;
   $: shellStyle = `--avatar-shell-opacity:${state.avatarOpacity ?? 0.82};`;
 
-  function handlePointerDown(event) {
+  function handlePointerDown(event: MouseEvent): void {
     dispatch('avatarpointerdown', { originalEvent: event });
   }
 
-  function handleActivate(event) {
+  function handleActivate(event: MouseEvent): void {
     dispatch('avataractivate', { originalEvent: event });
   }
 </script>

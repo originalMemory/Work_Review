@@ -1,7 +1,28 @@
-<script>
-  import { locale, formatDurationLocalized, t } from '$lib/i18n/index.js';
+<script lang="ts">
+  import { locale, formatDurationLocalized, t } from '$lib/i18n/index.ts';
 
-  export let data = [];
+  interface HourlyBucket {
+    hour: number;
+    duration: number;
+  }
+
+  interface CategorySegment {
+    category: string;
+    duration: number;
+  }
+
+  interface HourlyAppUsage {
+    app_name: string;
+    duration: number;
+    category: string;
+  }
+
+  interface HourlyAppBucket {
+    hour: number;
+    apps: HourlyAppUsage[];
+  }
+
+  export let data: HourlyBucket[] = [];
   export let distributionTitle = '';
   export let distributionSubtitleKey = 'hourlyChart.distributionSubtitle';
   export let peakHourLabel = '';
@@ -10,49 +31,49 @@
   // 按分类着色（堆叠柱）：categoryMode 开启时，每根柱按应用分类分段着色
   export let categoryMode = true;
   // 概览构成条选中的分类；为空时展示完整堆叠。
-  export let selectedCategory = null;
+  export let selectedCategory: string | null = null;
   // { [hour]: [{ category, duration }, ...] }，由 Overview 从 hourly_app_breakdown 聚合
-  export let categoryBreakdown = null;
+  export let categoryBreakdown: Partial<Record<number, CategorySegment[]>> | null = null;
   // { [category]: '#RRGGBB' }，来自 custom_categories
-  export let categoryColors = null;
+  export let categoryColors: Record<string, string> | null = null;
   // { [category]: '分类名' }，用于图例
-  export let categoryNames = null;
+  export let categoryNames: Record<string, string> | null = null;
   // 每小时×应用明细（HourlyAppBucket[]），点击柱子时展示该小时 top 应用
-  export let appBreakdown = null;
+  export let appBreakdown: HourlyAppBucket[] | null = null;
   // 今日工作时长（秒），用于目标进度卡片
   export let workDuration = 0;
   // 每日工作目标（分钟），null = 不设目标
-  export let workGoalMinutes = null;
+  export let workGoalMinutes: number | null = null;
 
   const keyHours = [0, 6, 12, 18, 23];
-  let selectedHour = null;
+  let selectedHour: number | null = null;
   $: currentLocale = $locale;
 
-  function formatHourLabel(hour) {
+  function formatHourLabel(hour: number): string {
     return `${String(hour).padStart(2, '0')}:00`;
   }
 
-  function formatHourRangeLabel(hour) {
+  function formatHourRangeLabel(hour: number): string {
     return `${formatHourLabel(hour)} - ${formatHourLabel((hour + 1) % 24)}`;
   }
 
-  function showHourLabel(hour) {
+  function showHourLabel(hour: number): boolean {
     return keyHours.includes(hour);
   }
 
-  function formatAxisTickLabel(seconds) {
+  function formatAxisTickLabel(seconds: number): string {
     if (!seconds || seconds <= 0) {
       return '0';
     }
     return formatDurationLocalized(seconds, { compact: true });
   }
 
-  function selectHour(hour) {
+  function selectHour(hour: number): void {
     selectedHour = hour;
   }
 
   // 统一紧凑时长格式，并跟随当前语言。
-  function formatCompact(seconds) {
+  function formatCompact(seconds: number): string {
     return formatDurationLocalized(seconds, { compact: true });
   }
 
@@ -68,7 +89,7 @@
   // 图例：从 categoryBreakdown 聚合出当前用到的分类（按时长降序）
   $: usedCategories = (() => {
     if (!categoryBreakdown) return [];
-    const totals = {};
+    const totals: Record<string, number> = {};
     for (const hour in categoryBreakdown) {
       for (const seg of categoryBreakdown[hour] || []) {
         totals[seg.category] = (totals[seg.category] || 0) + seg.duration;
@@ -85,7 +106,7 @@
   $: topBuckets = [...activeBuckets]
     .sort((left, right) => right.duration - left.duration || left.hour - right.hour)
     .slice(0, 3);
-  $: selectedBucket = buckets[selectedHour] || null;
+  $: selectedBucket = selectedHour === null ? null : (buckets[selectedHour] ?? null);
   $: axisMax = (() => {
     const raw = Math.max(maxDuration, 60);
     const minute = 60;
@@ -95,13 +116,13 @@
   })();
   $: yAxisTicks = [axisMax, Math.round(axisMax * 2 / 3), Math.round(axisMax / 3), 0];
   $: summaryCardClass = embedded
-    ? 'min-h-[88px] rounded-[22px] bg-slate-50/90 px-2 py-3 text-center dark:bg-[#161b22]/30'
-    : 'min-h-[104px] rounded-2xl border border-slate-100 bg-white p-4 text-center dark:border-[#30363d]/60 dark:bg-[#21262d]/80';
+    ? 'min-h-[88px] rounded-lg bg-slate-50/90 px-2 py-3 text-center dark:bg-[#161b22]/30'
+    : 'min-h-[104px] rounded-lg border border-slate-100 bg-white p-4 text-center dark:border-[#30363d]/60 dark:bg-[#21262d]/80';
   $: summaryValueClass =
     'mt-2 text-center text-base font-semibold text-slate-900 dark:text-[#e6edf3] leading-tight';
   $: chartShellClass = embedded
-    ? 'rounded-[24px] bg-transparent p-0'
-    : 'rounded-2xl border border-slate-100 bg-white p-4 dark:border-[#30363d]/60 dark:bg-[#21262d]/80';
+    ? 'rounded-lg bg-transparent p-0'
+    : 'rounded-lg border border-slate-100 bg-white p-4 dark:border-[#30363d]/60 dark:bg-[#21262d]/80';
 </script>
 
 <div class="space-y-4" data-locale={currentLocale}>
@@ -172,14 +193,14 @@
       <div class="mb-3 flex flex-wrap items-center gap-x-3 gap-y-1.5">
         {#each usedCategories as cat}
           <span class="inline-flex items-center gap-1.5 text-xs text-slate-500 dark:text-[#7d8590]">
-            <span class="inline-block h-2.5 w-2.5 rounded-[3px]" style={`background: ${(categoryColors && categoryColors[cat.category]) || '#94a3b8'};`}></span>
+            <span class="inline-block h-2.5 w-2.5 rounded-[var(--radius-xs)]" style={`background: ${(categoryColors && categoryColors[cat.category]) || '#94a3b8'};`}></span>
             {(categoryNames && categoryNames[cat.category]) || cat.category}
           </span>
         {/each}
       </div>
     {/if}
 
-    <div class="overflow-hidden rounded-2xl bg-slate-50 px-3 pb-3 pt-4 dark:bg-[#161b22]/40">
+    <div class="overflow-hidden rounded-lg bg-slate-50 px-3 pb-3 pt-4 dark:bg-[#161b22]/40">
         <div class="grid grid-cols-[2.9rem_minmax(0,1fr)] gap-2">
           <div class="relative h-44">
             {#each yAxisTicks as tick, index}
@@ -205,13 +226,13 @@
                     <button
                       type="button"
                       class={`w-full overflow-hidden transition-all duration-300 focus:outline-none focus:ring-2 focus:ring-sky-300 dark:focus:ring-sky-500 ${selectedHour === bucket.hour ? 'ring-2 ring-sky-300 dark:focus:ring-sky-500' : ''} ${categoryMode && bucket.duration > 0 ? '' : isPeak ? 'bg-sky-500 dark:bg-sky-400' : 'bg-slate-300 dark:bg-[#484f58]'}`}
-                      style={`height: ${height}%; opacity: ${bucket.duration > 0 ? 1 : 0.35}; border-top-left-radius: 10px; border-top-right-radius: 10px;`}
+                      style={`height: ${height}%; opacity: ${bucket.duration > 0 ? 1 : 0.35}; border-top-left-radius: var(--radius-md); border-top-right-radius: var(--radius-md);`}
                       title={`${formatHourRangeLabel(bucket.hour)} · ${formatDurationLocalized(bucket.duration)}`}
                       aria-pressed={selectedHour === bucket.hour}
                       on:click={() => selectHour(bucket.hour)}
                     >
                       {#if categoryMode && bucket.duration > 0}
-                        <div class="flex h-full w-full flex-col justify-end overflow-hidden" style="border-top-left-radius: 10px; border-top-right-radius: 10px;">
+                        <div class="flex h-full w-full flex-col justify-end overflow-hidden" style="border-top-left-radius: var(--radius-md); border-top-right-radius: var(--radius-md);">
                           {#each (categoryBreakdown?.[bucket.hour] || []) as seg}
                             <div
                               class={`activity-hourly-category-segment ${selectedCategory === seg.category ? 'activity-hourly-category-segment-selected' : ''} ${selectedCategory && seg.category !== selectedCategory ? 'activity-hourly-category-segment-muted' : ''}`}
@@ -243,7 +264,7 @@
         {@const hourApps = (appBreakdown?.find(b => b.hour === selectedBucket.hour)?.apps || [])
           .filter((app) => !selectedCategory || app.category === selectedCategory)
           .slice().sort((a, b) => b.duration - a.duration).slice(0, 5)}
-        <div class="activity-hourly-selected-apps mt-3 rounded-2xl bg-sky-50 px-3.5 py-3 text-left dark:bg-sky-500/10">
+        <div class="activity-hourly-selected-apps mt-3 rounded-lg bg-sky-50 px-3.5 py-3 text-left dark:bg-sky-500/10">
           <div class="grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-3">
             <span class="inline-flex items-center rounded-full bg-white px-2.5 py-1 text-[11px] font-semibold tracking-[0.08em] text-sky-700 shadow-[inset_0_1px_0_rgba(255,255,255,0.8)] dark:bg-[#161b22]/80 dark:text-sky-300 dark:shadow-none">
               {t('chart.currentlySelected')}
@@ -259,7 +280,7 @@
             <div class="mt-2 flex flex-wrap gap-x-3 gap-y-1">
               {#each hourApps as app}
                 <span class="inline-flex items-center gap-1 text-[11px] text-slate-500 dark:text-[#7d8590]">
-                  <span class="inline-block h-2 w-2 rounded-sm" style={`background: ${(categoryColors && categoryColors[app.category]) || '#94a3b8'};`}></span>
+                  <span class="inline-block h-2 w-2 rounded-[var(--radius-xs)]" style={`background: ${(categoryColors && categoryColors[app.category]) || '#94a3b8'};`}></span>
                   <span>{app.app_name}</span>
                   <span class="tabular-nums text-slate-400">{formatCompact(app.duration)}</span>
                 </span>

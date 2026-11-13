@@ -9,6 +9,7 @@ use crate::database::{Activity, DailyStats};
 use crate::error::Result;
 use async_trait::async_trait;
 use std::path::Path;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppLocale {
@@ -120,6 +121,7 @@ pub fn create_analyzer(
     locale: AppLocale,
     pinned_blocks: Vec<String>,
     cached_ai_order: Option<Vec<String>>,
+    generation_timeout: Duration,
 ) -> Box<dyn Analyzer + Send + Sync> {
     log::info!(
         "create_analyzer: mode={:?}, provider={:?}, endpoint={}, model={}, has_api_key={}",
@@ -147,6 +149,7 @@ pub fn create_analyzer(
             locale,
             pinned_blocks,
             cached_ai_order,
+            generation_timeout,
         )),
         AiMode::Cloud => Box::new(cloud::CloudAnalyzer::new(
             endpoint,

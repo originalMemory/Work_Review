@@ -1,20 +1,21 @@
 //! Auto-extracted from the historical `commands.rs`. Behavior unchanged.
 
-use crate::config::AppConfig;
-use crate::database::Database;
-use crate::error::AppError;
-use crate::privacy::PrivacyFilter;
 use crate::screenshot::ScreenshotService;
 use crate::storage::StorageManager;
 use crate::AppState;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, State};
+use work_review_core::config::AppConfig;
+use work_review_core::database::Database;
+use work_review_core::error::AppError;
+use work_review_core::privacy::PrivacyFilter;
 
 use super::shared::persist_app_config;
 
 const MANAGED_DATA_ENTRIES: &[&str] = &[
     "config.json",
+    "config.json.bak",
     "workreview.db",
     "screenshots",
     "ocr_logs",
@@ -44,6 +45,9 @@ pub async fn save_config(
     super::ai::validate_model_endpoint(&config.ai_provider.endpoint)?;
     for profile in &config.text_model_profiles {
         super::ai::validate_model_endpoint(&profile.model_config.endpoint)?;
+    }
+    for cached in config.text_model_provider_cache.values() {
+        super::ai::validate_model_endpoint(&cached.endpoint)?;
     }
     persist_app_config(config, app, state.inner())
 }
@@ -83,7 +87,7 @@ fn is_ignorable_dir_entry(name: &str) -> bool {
 }
 
 fn is_managed_dir_entry(name: &str) -> bool {
-    MANAGED_DATA_ENTRIES.contains(&name)
+    MANAGED_DATA_ENTRIES.contains(&name) || LIVE_DATABASE_FILES.contains(&name)
 }
 
 fn is_cleanup_managed_dir_entry(name: &str) -> bool {
@@ -98,11 +102,26 @@ fn to_absolute_path(path: &Path) -> Result<PathBuf, AppError> {
     }
 }
 
+fn resolve_migration_target(
+    current_dir: &Path,
+    requested_path: &Path,
+) -> Result<PathBuf, AppError> {
+    std::fs::create_dir_all(requested_path)?;
+    let target_dir = requested_path.canonicalize()?;
+    if target_dir != current_dir
+        && (target_dir.starts_with(current_dir) || current_dir.starts_with(&target_dir))
+    {
+        return Err(AppError::Config(
+            "新旧数据目录不能互为父子目录，请选择独立目录".to_string(),
+        ));
+    }
+    Ok(target_dir)
+}
+
 fn ensure_target_dir_ready(target_dir: &Path) -> Result<bool, AppError> {
     std::fs::create_dir_all(target_dir)?;
 
     let mut has_existing_app_data = false;
-
     for entry in std::fs::read_dir(target_dir)? {
         let entry = entry?;
         let name = entry.file_name();
@@ -121,25 +140,123 @@ fn ensure_target_dir_ready(target_dir: &Path) -> Result<bool, AppError> {
         has_existing_app_data = true;
     }
 
-    if !has_existing_app_data {
-        return Ok(false);
-    }
+    // 这里只校验目录，绝不提前删除旧数据；迁移副本验证完成后才会替换受管条目。
+    Ok(has_existing_app_data)
+}
 
-    // 目标目录若已存在旧版应用数据，先清空受管条目，再完整覆盖为当前数据。
-    for entry_name in MANAGED_DATA_ENTRIES {
-        let path = target_dir.join(entry_name);
-        if !path.exists() {
+fn migration_entry_names() -> Vec<&'static str> {
+    let mut names = Vec::with_capacity(MANAGED_DATA_ENTRIES.len() + LIVE_DATABASE_FILES.len());
+    for name in MANAGED_DATA_ENTRIES
+        .iter()
+        .chain(LIVE_DATABASE_FILES.iter())
+    {
+        if !names.contains(name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
+fn remove_migration_path(path: &Path) -> Result<(), AppError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+
+    if metadata.file_type().is_dir() {
+        std::fs::remove_dir_all(path)?;
+    } else {
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn migration_sibling_path(target_dir: &Path, label: &str) -> Result<PathBuf, AppError> {
+    let parent = target_dir
+        .parent()
+        .ok_or_else(|| AppError::Config("无法为数据迁移创建临时目录".to_string()))?;
+    Ok(parent.join(format!(
+        ".work-review-{label}-{}",
+        uuid::Uuid::new_v4().simple()
+    )))
+}
+
+fn restore_migration_entries(
+    target_dir: &Path,
+    backup_dir: &Path,
+    moved_entries: &[String],
+    installed_entries: &[String],
+) -> Result<(), AppError> {
+    let mut restored = true;
+    for entry_name in installed_entries.iter().rev() {
+        if let Err(error) = remove_migration_path(&target_dir.join(entry_name)) {
+            log::error!("回滚迁移新条目 {} 失败: {error}", entry_name);
+            restored = false;
+        }
+    }
+    for entry_name in moved_entries.iter().rev() {
+        let backup_path = backup_dir.join(entry_name);
+        if !backup_path.exists() {
             continue;
         }
-
-        if path.is_dir() {
-            std::fs::remove_dir_all(&path)?;
-        } else {
-            std::fs::remove_file(&path)?;
+        if let Err(error) = std::fs::rename(&backup_path, target_dir.join(entry_name)) {
+            log::error!("恢复迁移旧条目 {} 失败: {error}", entry_name);
+            restored = false;
         }
     }
+    // 只允许删除空备份目录，回滚不完整时绝不能递归清理剩余的旧数据。
+    if !restored || std::fs::remove_dir(backup_dir).is_err() {
+        return Err(AppError::Config(format!(
+            "未能完整回滚，原目标数据的备份保留在 {}，请勿删除该目录",
+            backup_dir.display()
+        )));
+    }
+    Ok(())
+}
 
-    Ok(true)
+fn commit_migration_stage(stage_dir: &Path, target_dir: &Path) -> Result<(), AppError> {
+    let backup_dir = migration_sibling_path(target_dir, "migration-backup")?;
+    std::fs::create_dir_all(&backup_dir)?;
+    let mut moved_entries = Vec::new();
+    let mut installed_entries = Vec::new();
+
+    let committed: Result<(), AppError> = (|| {
+        for entry_name in migration_entry_names() {
+            let source = target_dir.join(entry_name);
+            if source.exists() {
+                std::fs::rename(&source, backup_dir.join(entry_name))?;
+                moved_entries.push(entry_name.to_string());
+            }
+        }
+        for entry_name in migration_entry_names() {
+            let source = stage_dir.join(entry_name);
+            if source.exists() {
+                std::fs::rename(&source, target_dir.join(entry_name))?;
+                installed_entries.push(entry_name.to_string());
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = committed {
+        let restored =
+            restore_migration_entries(target_dir, &backup_dir, &moved_entries, &installed_entries);
+        let _ = remove_migration_path(stage_dir);
+        if let Err(rollback_error) = restored {
+            return Err(AppError::Config(format!(
+                "迁移失败：{error}；{rollback_error}"
+            )));
+        }
+        return Err(error);
+    }
+
+    if let Err(error) = remove_migration_path(&backup_dir) {
+        log::warn!("清理迁移备份目录失败（数据已切换成功）: {error}");
+    }
+    if let Err(error) = remove_migration_path(stage_dir) {
+        log::warn!("清理迁移临时目录失败（数据已切换成功）: {error}");
+    }
+    Ok(())
 }
 
 fn copy_managed_data_without_live_db(
@@ -226,15 +343,14 @@ pub async fn change_data_dir(
     }
 
     let requested_path = to_absolute_path(Path::new(requested_dir))?;
+    crate::data_dir::validate_data_dir_target(&requested_path)?;
     let current_dir = {
         let state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
-        state
-            .data_dir
-            .canonicalize()
-            .unwrap_or_else(|_| state.data_dir.clone())
+        state.data_dir.canonicalize()?
     };
 
-    if requested_path == current_dir {
+    let target_dir = resolve_migration_target(&current_dir, &requested_path)?;
+    if target_dir == current_dir {
         return Ok(serde_json::json!({
             "dataDir": current_dir.to_string_lossy().to_string(),
             "copiedFiles": 0,
@@ -242,38 +358,44 @@ pub async fn change_data_dir(
         }));
     }
 
-    if requested_path.starts_with(&current_dir) || current_dir.starts_with(&requested_path) {
-        return Err(AppError::Config(
-            "新旧数据目录不能互为父子目录，请选择独立目录".to_string(),
-        ));
-    }
-
-    let target_dir = {
-        std::fs::create_dir_all(&requested_path)?;
-        requested_path
-            .canonicalize()
-            .unwrap_or_else(|_| requested_path.clone())
-    };
-
-    // 先清空目标目录中已有的受管条目（必须在 backup_to 之前，否则会删掉刚备份的数据库）
+    // 只校验目标目录，不先删除其中的旧数据。
     let replaced_existing_data = ensure_target_dir_ready(&target_dir)?;
+    let staging_dir = migration_sibling_path(&target_dir, "migration-stage")?;
+    std::fs::create_dir_all(&staging_dir)?;
 
-    // 复制截图等文件（在锁外执行，不阻塞截图循环）
-    let copied_files = copy_managed_data_without_live_db(&current_dir, &target_dir)?;
-
-    // 短暂获取锁，做安全 SQLite 备份，然后立即释放
-    let config = {
-        let state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
-        // SQLite 备份必须在持锁状态下执行（backup_to 内部做 WAL checkpoint + VACUUM INTO）
-        state
-            .database
-            .backup_to(&target_dir.join("workreview.db"))?;
-        state.config.clone()
+    // 先在目标目录旁构建完整副本；复制或 SQLite 备份失败时，目标旧数据完全不变。
+    let staged_result: Result<(u64, AppConfig), AppError> = (|| {
+        let copied_files = copy_managed_data_without_live_db(&current_dir, &staging_dir)?;
+        let config = {
+            let state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
+            // SQLite 备份必须在持锁状态下执行（backup_to 内部做 WAL checkpoint + VACUUM INTO）
+            state
+                .database
+                .backup_to(&staging_dir.join("workreview.db"))?;
+            state.config.clone()
+        };
+        config.save(&staging_dir.join("config.json"))?;
+        Ok((copied_files, config))
+    })();
+    let (copied_files, config) = match staged_result {
+        Ok(result) => result,
+        Err(error) => {
+            if let Err(cleanup_error) = remove_migration_path(&staging_dir) {
+                log::warn!("清理失败的迁移临时目录失败: {cleanup_error}");
+            }
+            return Err(error);
+        }
     };
 
+    commit_migration_stage(&staging_dir, &target_dir)?;
     let config_path = target_dir.join("config.json");
-    config.save(&config_path)?;
-    crate::save_data_dir_preference(&target_dir)?;
+    let preference_warning = match crate::save_data_dir_preference(&target_dir) {
+        Ok(()) => None,
+        Err(error) => {
+            log::error!("保存数据目录偏好失败，当前运行仍已切换: {error}");
+            Some(format!("；但保存数据目录偏好失败：{error}"))
+        }
+    };
 
     // 重新获取锁，仅做轻量状态更新
     let mut state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
@@ -302,7 +424,7 @@ pub async fn change_data_dir(
             "数据目录已更新，已迁移 {} 个文件{}",
             copied_files,
             if replaced_existing_data { "，并覆盖旧目录中的 Work Review 数据" } else { "" }
-        ),
+        ) + preference_warning.as_deref().unwrap_or(""),
     }))
 }
 
@@ -369,6 +491,120 @@ pub async fn cleanup_old_data_dir(
         "preservedEntries": preserved_entries,
         "message": message,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        commit_migration_stage, ensure_target_dir_ready, migration_sibling_path,
+        resolve_migration_target, restore_migration_entries,
+    };
+
+    #[test]
+    fn 迁移应按真实路径拒绝父子目录并识别当前目录别名() {
+        let root = std::env::temp_dir().join(format!("migration-path-{}", uuid::Uuid::new_v4()));
+        let current = root.join("current");
+        std::fs::create_dir_all(current.join("screenshots")).unwrap();
+        let current = current.canonicalize().unwrap();
+        let root = root.canonicalize().unwrap();
+
+        assert_eq!(
+            resolve_migration_target(&current, &current).unwrap(),
+            current
+        );
+        assert!(resolve_migration_target(&current, &root).is_err());
+        assert!(resolve_migration_target(&current, &current.join("screenshots/new")).is_err());
+        assert_eq!(
+            resolve_migration_target(&current, &root.join("sibling")).unwrap(),
+            root.join("sibling"),
+        );
+        assert!(resolve_migration_target(
+            &current,
+            &root.join("sibling/../current/screenshots/new"),
+        )
+        .is_err());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            symlink(&current, root.join("same-alias")).unwrap();
+            symlink(current.join("screenshots"), root.join("child-alias")).unwrap();
+            symlink(&root, root.join("parent-alias")).unwrap();
+            assert_eq!(
+                resolve_migration_target(&current, &root.join("same-alias")).unwrap(),
+                current,
+            );
+            assert!(resolve_migration_target(&current, &root.join("child-alias/new")).is_err());
+            assert!(resolve_migration_target(&current, &root.join("parent-alias")).is_err());
+        }
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn 回滚受阻时必须保留备份并报告恢复路径() {
+        let root =
+            std::env::temp_dir().join(format!("migration-rollback-{}", uuid::Uuid::new_v4()));
+        let target = root.join("target");
+        let backup = root.join("backup");
+        std::fs::create_dir_all(target.join("config.json")).unwrap();
+        std::fs::create_dir_all(&backup).unwrap();
+        std::fs::write(backup.join("config.json"), b"irreplaceable-old-config").unwrap();
+        std::fs::write(target.join("config.json/blocker"), b"user-file").unwrap();
+        let error =
+            restore_migration_entries(&target, &backup, &["config.json".into()], &[]).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains(&backup.to_string_lossy().to_string()));
+        assert_eq!(
+            std::fs::read(backup.join("config.json")).unwrap(),
+            b"irreplaceable-old-config"
+        );
+        assert_eq!(
+            std::fs::read(target.join("config.json/blocker")).unwrap(),
+            b"user-file"
+        );
+
+        std::fs::remove_dir_all(target.join("config.json")).unwrap();
+        restore_migration_entries(&target, &backup, &["config.json".into()], &[]).unwrap();
+        assert!(!backup.exists());
+        assert_eq!(
+            std::fs::read(target.join("config.json")).unwrap(),
+            b"irreplaceable-old-config"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn 迁移构建阶段不得删除目标旧数据并能替换受管条目() {
+        let root = std::env::temp_dir().join(format!("migration-stage-{}", uuid::Uuid::new_v4()));
+        let target = root.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("config.json"), b"old-config").unwrap();
+        std::fs::write(target.join(".keep.txt"), b"user-file").unwrap();
+
+        assert!(ensure_target_dir_ready(&target).unwrap());
+        assert_eq!(
+            std::fs::read(target.join("config.json")).unwrap(),
+            b"old-config"
+        );
+
+        let stage = migration_sibling_path(&target, "test-stage").unwrap();
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(stage.join("config.json"), b"new-config").unwrap();
+        commit_migration_stage(&stage, &target).unwrap();
+
+        assert_eq!(
+            std::fs::read(target.join("config.json")).unwrap(),
+            b"new-config"
+        );
+        assert_eq!(
+            std::fs::read(target.join(".keep.txt")).unwrap(),
+            b"user-file"
+        );
+        assert!(!stage.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 /// 在系统文件管理器中打开数据目录

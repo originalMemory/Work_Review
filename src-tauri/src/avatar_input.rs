@@ -19,8 +19,15 @@ static LAST_KEYBOARD_KEY_CODE: AtomicU16 = AtomicU16::new(0);
 static LAST_MOUSE_GROUP_CODE: AtomicU8 = AtomicU8::new(0);
 static CURSOR_RATIO_X_PERMILLE: AtomicU32 = AtomicU32::new(500);
 static CURSOR_RATIO_Y_PERMILLE: AtomicU32 = AtomicU32::new(500);
+static CURSOR_RATIO_INITIALIZED: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "linux")]
+static WAYLAND_CURSOR_POSITION: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "linux")]
+static WAYLAND_CURSOR_UPDATED_AT_MS: AtomicU64 = AtomicU64::new(0);
 static INPUT_BRIDGE_STARTED: AtomicBool = AtomicBool::new(false);
 static INPUT_MONITOR_STARTED: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+static INPUT_MONITOR_RETRY_STARTED: AtomicBool = AtomicBool::new(false);
 // 智能穿透运行时状态（无锁读，避免轮询每轮锁 Mutex）
 static AVATAR_CLICK_THROUGH_ENABLED: AtomicBool = AtomicBool::new(false);
 static AVATAR_ENABLED_FLAG: AtomicBool = AtomicBool::new(false);
@@ -32,6 +39,10 @@ pub fn set_avatar_click_through_flag(on: bool) {
 }
 pub fn set_avatar_enabled_flag(on: bool) {
     AVATAR_ENABLED_FLAG.store(on, Ordering::Relaxed);
+    if !on {
+        clear_avatar_input_state();
+        force_resync_click_through();
+    }
 }
 /// 重置 ignore 缓存，强制下一轮命中测试重新同步（穿透配置/窗口变更时调）。
 pub fn force_resync_click_through() {
@@ -39,6 +50,22 @@ pub fn force_resync_click_through() {
 }
 static KEYBOARD_STATE: Lazy<Mutex<KeyboardInputState>> =
     Lazy::new(|| Mutex::new(KeyboardInputState::default()));
+
+fn clear_avatar_input_state() {
+    LAST_KEYBOARD_INPUT_AT_MS.store(0, Ordering::Relaxed);
+    LAST_MOUSE_INPUT_AT_MS.store(0, Ordering::Relaxed);
+    LAST_KEYBOARD_GROUP_CODE.store(0, Ordering::Relaxed);
+    LAST_KEYBOARD_KEY_CODE.store(0, Ordering::Relaxed);
+    LAST_MOUSE_GROUP_CODE.store(0, Ordering::Relaxed);
+    CURSOR_RATIO_INITIALIZED.store(false, Ordering::Relaxed);
+    KEYBOARD_STATE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .pressed_keys
+        .clear();
+    #[cfg(target_os = "linux")]
+    WAYLAND_CURSOR_UPDATED_AT_MS.store(0, Ordering::Relaxed);
+}
 
 const KEYBOARD_GROUP_DIGIT_1: u8 = 1;
 const KEYBOARD_GROUP_DIGIT_2: u8 = 2;
@@ -61,9 +88,12 @@ const MOUSE_GROUP_LEFT: u8 = 2;
 const MOUSE_GROUP_RIGHT: u8 = 3;
 const MOUSE_GROUP_SIDE: u8 = 4;
 const INPUT_BRIDGE_POLL_INTERVAL: Duration = Duration::from_millis(16);
+#[cfg(target_os = "macos")]
+const INPUT_MONITOR_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 const PRESSED_KEY_STALE_MS: u64 = KEYBOARD_ACTIVE_WINDOW_MS;
 #[cfg(target_os = "linux")]
 const WAYLAND_MOUSE_POLL_INTERVAL: Duration = Duration::from_millis(120);
+const WAYLAND_CURSOR_STALE_MS: u64 = 500;
 
 #[derive(Default)]
 struct KeyboardInputState {
@@ -660,27 +690,90 @@ fn query_wayland_mouse_cursor_point(
     }
 }
 
-#[cfg(target_os = "linux")]
-fn virtual_desktop_bounds_from_monitors(app: &AppHandle) -> Option<(i32, i32, u32, u32)> {
-    let monitors = app.available_monitors().ok()?;
-    let first = monitors.first()?;
-    let mut min_x = first.position().x;
-    let mut min_y = first.position().y;
-    let mut max_x = first.position().x + first.size().width as i32;
-    let mut max_y = first.position().y + first.size().height as i32;
-
-    for monitor in monitors.iter().skip(1) {
-        let position = monitor.position();
-        let size = monitor.size();
-        min_x = min_x.min(position.x);
-        min_y = min_y.min(position.y);
-        max_x = max_x.max(position.x + size.width as i32);
-        max_y = max_y.max(position.y + size.height as i32);
+fn logical_monitor_rect_from_physical(
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    scale_factor: f64,
+) -> Option<(i32, i32, u32, u32)> {
+    if !scale_factor.is_finite() || scale_factor <= 0.0 || width == 0 || height == 0 {
+        return None;
     }
 
-    let width = max_x.checked_sub(min_x)? as u32;
-    let height = max_y.checked_sub(min_y)? as u32;
-    Some((min_x, min_y, width, height))
+    let logical_x = (x as f64 / scale_factor).round();
+    let logical_y = (y as f64 / scale_factor).round();
+    let logical_width = (width as f64 / scale_factor).round();
+    let logical_height = (height as f64 / scale_factor).round();
+
+    if !logical_x.is_finite()
+        || logical_x < i32::MIN as f64
+        || logical_x > i32::MAX as f64
+        || !logical_y.is_finite()
+        || logical_y < i32::MIN as f64
+        || logical_y > i32::MAX as f64
+        || !logical_width.is_finite()
+        || logical_width < 1.0
+        || logical_width > u32::MAX as f64
+        || !logical_height.is_finite()
+        || logical_height < 1.0
+        || logical_height > u32::MAX as f64
+    {
+        return None;
+    }
+
+    Some((
+        logical_x as i32,
+        logical_y as i32,
+        logical_width as u32,
+        logical_height as u32,
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn virtual_desktop_logical_bounds_from_monitors(app: &AppHandle) -> Option<(i32, i32, u32, u32)> {
+    let monitors = app.available_monitors().ok()?;
+    let mut bounds: Option<(i64, i64, i64, i64)> = None;
+
+    for monitor in monitors {
+        let position = monitor.position();
+        let size = monitor.size();
+        let (x, y, width, height) = logical_monitor_rect_from_physical(
+            position.x,
+            position.y,
+            size.width,
+            size.height,
+            monitor.scale_factor(),
+        )?;
+        let left = i64::from(x);
+        let top = i64::from(y);
+        let right = left.checked_add(i64::from(width))?;
+        let bottom = top.checked_add(i64::from(height))?;
+
+        bounds = Some(match bounds {
+            Some((min_x, min_y, max_x, max_y)) => (
+                min_x.min(left),
+                min_y.min(top),
+                max_x.max(right),
+                max_y.max(bottom),
+            ),
+            None => (left, top, right, bottom),
+        });
+    }
+
+    let (min_x, min_y, max_x, max_y) = bounds?;
+    let width = u32::try_from(max_x.checked_sub(min_x)?).ok()?;
+    let height = u32::try_from(max_y.checked_sub(min_y)?).ok()?;
+    if width == 0 || height == 0 {
+        return None;
+    }
+
+    Some((
+        i32::try_from(min_x).ok()?,
+        i32::try_from(min_y).ok()?,
+        width,
+        height,
+    ))
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -965,6 +1058,9 @@ pub(crate) fn build_avatar_input_payload(now_ms: u64) -> AvatarInputPayload {
 }
 
 pub(crate) fn record_keyboard_input(group_code: u8, key_code: u16) {
+    if !AVATAR_ENABLED_FLAG.load(Ordering::Relaxed) {
+        return;
+    }
     let pressed_at_ms = now_ms();
     {
         let mut state = KEYBOARD_STATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -982,6 +1078,9 @@ pub(crate) fn record_keyboard_input(group_code: u8, key_code: u16) {
 }
 
 pub(crate) fn release_keyboard_input(key_code: u16) {
+    if !AVATAR_ENABLED_FLAG.load(Ordering::Relaxed) {
+        return;
+    }
     let next_primary = {
         let mut state = KEYBOARD_STATE.lock().unwrap_or_else(|e| e.into_inner());
         state
@@ -1002,15 +1101,22 @@ pub(crate) fn release_keyboard_input(key_code: u16) {
 }
 
 pub(crate) fn record_mouse_input(group_code: u8) {
+    if !AVATAR_ENABLED_FLAG.load(Ordering::Relaxed) {
+        return;
+    }
     LAST_MOUSE_INPUT_AT_MS.store(now_ms(), Ordering::Relaxed);
     LAST_MOUSE_GROUP_CODE.store(group_code, Ordering::Relaxed);
 }
 
 pub(crate) fn record_cursor_ratio(x_ratio: f64, y_ratio: f64) {
+    if !AVATAR_ENABLED_FLAG.load(Ordering::Relaxed) {
+        return;
+    }
     let to_permille = |value: f64| -> u32 { (value.clamp(0.0, 1.0) * 1000.0).round() as u32 };
 
     CURSOR_RATIO_X_PERMILLE.store(to_permille(x_ratio), Ordering::Relaxed);
     CURSOR_RATIO_Y_PERMILLE.store(to_permille(y_ratio), Ordering::Relaxed);
+    CURSOR_RATIO_INITIALIZED.store(true, Ordering::Release);
 }
 
 pub fn spawn_avatar_input_bridge(app: AppHandle) {
@@ -1025,6 +1131,11 @@ pub fn spawn_avatar_input_bridge(app: AppHandle) {
         let mut tick: u32 = 0;
 
         loop {
+            if !AVATAR_ENABLED_FLAG.load(Ordering::Relaxed) {
+                INPUT_BRIDGE_STARTED.store(false, Ordering::SeqCst);
+                return;
+            }
+
             let next_payload = build_avatar_input_payload(now_ms());
             if last_payload.as_ref() != Some(&next_payload) {
                 crate::avatar_engine::emit_avatar_input(&app, &next_payload);
@@ -1052,18 +1163,34 @@ fn smart_click_through_polling_enabled_for_platform() -> bool {
     true
 }
 
-/// 智能穿透：穿透开启且桌宠启用时，鼠标在桌宠窗口内→不穿透（可交互），外→穿透。
+fn should_ignore_avatar_cursor(
+    precise: bool,
+    click_through_on: bool,
+    cursor_hit: Option<bool>,
+) -> bool {
+    if precise {
+        // 精确模式拿不到坐标时优先保证通知可点击，避免整个窗口永久穿透。
+        cursor_hit.is_some_and(|hit| !hit)
+    } else {
+        // 非精确模式保持旧语义：穿透开启且无法确认命中时继续穿透。
+        click_through_on && !cursor_hit.unwrap_or(false)
+    }
+}
+
+/// 智能穿透：精确模式仅在前端交互区域内关闭穿透；非精确模式保留用户开关语义。
 /// 仅当目标状态与缓存不同时（或 force_resync 重置后）才经主线程调 setter，避免高频闪烁。
 fn apply_smart_click_through(app: &AppHandle) {
     if !AVATAR_ENABLED_FLAG.load(Ordering::Relaxed) {
         return; // 桌宠禁用，不触碰穿透
     }
+    let precise = crate::avatar_engine::avatar_precise_hit_testing_enabled();
     let click_through_on = AVATAR_CLICK_THROUGH_ENABLED.load(Ordering::Relaxed);
-    let desired_ignore = if click_through_on {
-        !crate::avatar_engine::avatar_window_hit_by_cursor(app)
+    let cursor_hit = if precise || click_through_on {
+        crate::avatar_engine::avatar_window_hit_by_cursor(app)
     } else {
-        false
+        None
     };
+    let desired_ignore = should_ignore_avatar_cursor(precise, click_through_on, cursor_hit);
     let desired_cache: i8 = if desired_ignore { 1 } else { 0 };
     if AVATAR_CLICK_THROUGH_IGNORE_CACHE.swap(desired_cache, Ordering::Relaxed) != desired_cache {
         let app_clone = app.clone();
@@ -1073,10 +1200,139 @@ fn apply_smart_click_through(app: &AppHandle) {
     }
 }
 
-/// 全局鼠标绝对坐标（Tauri 虚拟屏幕物理像素，y 向下，与 `window.outer_position()` 同系）。
-/// 用三平台已采集的 cursor_ratio（static）+ Tauri available_monitors 虚拟 bounds 还原，
-/// 避免每平台单独 FFI。精度为虚拟屏幕尺寸的 1/1000（permille），命中测试窗口矩形足够。
-pub fn global_cursor_position(app: &AppHandle) -> Option<(i64, i64)> {
+fn select_cursor_position(
+    prefer_provider_position: bool,
+    native_position: Option<(i64, i64)>,
+    provider_position: Option<(i64, i64)>,
+) -> Option<(i64, i64)> {
+    if prefer_provider_position {
+        provider_position
+    } else {
+        native_position.or(provider_position)
+    }
+}
+
+fn logical_cursor_position_to_target(
+    position: (i32, i32),
+    target_scale_factor: f64,
+) -> Option<(i64, i64)> {
+    if !target_scale_factor.is_finite() || target_scale_factor <= 0.0 {
+        return None;
+    }
+
+    let target_x = (position.0 as f64 * target_scale_factor).round();
+    let target_y = (position.1 as f64 * target_scale_factor).round();
+    if !target_x.is_finite()
+        || target_x < i64::MIN as f64
+        || target_x > i64::MAX as f64
+        || !target_y.is_finite()
+        || target_y < i64::MIN as f64
+        || target_y > i64::MAX as f64
+    {
+        return None;
+    }
+
+    Some((target_x as i64, target_y as i64))
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn pack_wayland_cursor_position(position: (i32, i32)) -> u64 {
+    (u64::from(position.0 as u32) << 32) | u64::from(position.1 as u32)
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn unpack_wayland_cursor_position(position: u64) -> (i32, i32) {
+    ((position >> 32) as u32 as i32, position as u32 as i32)
+}
+
+fn fresh_wayland_cursor_position(
+    position: (i32, i32),
+    updated_at_ms: u64,
+    current_time_ms: u64,
+    target_scale_factor: f64,
+) -> Option<(i64, i64)> {
+    if updated_at_ms == 0 {
+        return None;
+    }
+
+    let age_ms = current_time_ms.checked_sub(updated_at_ms)?;
+    if age_ms > WAYLAND_CURSOR_STALE_MS {
+        return None;
+    }
+
+    logical_cursor_position_to_target(position, target_scale_factor)
+}
+
+#[cfg(target_os = "linux")]
+fn record_wayland_cursor_position(position: (i32, i32)) {
+    WAYLAND_CURSOR_POSITION.store(pack_wayland_cursor_position(position), Ordering::Relaxed);
+    // 时间戳使用 Release 发布，读取端 Acquire 后可见对应的完整 packed 坐标。
+    WAYLAND_CURSOR_UPDATED_AT_MS.store(now_ms(), Ordering::Release);
+}
+
+#[cfg(target_os = "linux")]
+fn recorded_wayland_cursor_position(target_scale_factor: f64) -> Option<(i64, i64)> {
+    let updated_at_ms = WAYLAND_CURSOR_UPDATED_AT_MS.load(Ordering::Acquire);
+    let position = WAYLAND_CURSOR_POSITION.load(Ordering::Relaxed);
+    fresh_wayland_cursor_position(
+        unpack_wayland_cursor_position(position),
+        updated_at_ms,
+        now_ms(),
+        target_scale_factor,
+    )
+}
+
+fn scale_cursor_position_to_target(
+    position: (f64, f64),
+    source_scale_factor: f64,
+    target_scale_factor: f64,
+) -> Option<(i64, i64)> {
+    if !position.0.is_finite()
+        || !position.1.is_finite()
+        || !source_scale_factor.is_finite()
+        || source_scale_factor <= 0.0
+        || !target_scale_factor.is_finite()
+        || target_scale_factor <= 0.0
+    {
+        return None;
+    }
+
+    Some((
+        (position.0 / source_scale_factor * target_scale_factor).round() as i64,
+        (position.1 / source_scale_factor * target_scale_factor).round() as i64,
+    ))
+}
+
+fn native_cursor_position(app: &AppHandle, target_scale_factor: f64) -> Option<(i64, i64)> {
+    let position = app.cursor_position().ok()?;
+
+    #[cfg(target_os = "macos")]
+    {
+        // Tao 使用主显示器 DPR 把 NSEvent 的全局逻辑坐标转成物理坐标，
+        // 而窗口位置使用窗口所在显示器 DPR；先还原逻辑坐标，再转到目标窗口 DPR。
+        let source_scale_factor = app.primary_monitor().ok().flatten()?.scale_factor();
+        scale_cursor_position_to_target(
+            (position.x, position.y),
+            source_scale_factor,
+            target_scale_factor,
+        )
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        scale_cursor_position_to_target(
+            (position.x, position.y),
+            target_scale_factor,
+            target_scale_factor,
+        )
+    }
+}
+
+fn cursor_position_from_recorded_ratio(app: &AppHandle) -> Option<(i64, i64)> {
+    if !CURSOR_RATIO_INITIALIZED.load(Ordering::Acquire) {
+        return None;
+    }
+
     let ratio_x = CURSOR_RATIO_X_PERMILLE.load(Ordering::Relaxed) as f64 / 1000.0;
     let ratio_y = CURSOR_RATIO_Y_PERMILLE.load(Ordering::Relaxed) as f64 / 1000.0;
     let monitors = app.available_monitors().ok()?;
@@ -1087,18 +1343,97 @@ pub fn global_cursor_position(app: &AppHandle) -> Option<(i64, i64)> {
     let mut min_y = i32::MAX;
     let mut max_x = i32::MIN;
     let mut max_y = i32::MIN;
-    for m in &monitors {
-        let pos = m.position();
-        let size = m.size();
-        min_x = min_x.min(pos.x);
-        min_y = min_y.min(pos.y);
-        max_x = max_x.max(pos.x + size.width as i32);
-        max_y = max_y.max(pos.y + size.height as i32);
+    for monitor in &monitors {
+        let position = monitor.position();
+        let size = monitor.size();
+        min_x = min_x.min(position.x);
+        min_y = min_y.min(position.y);
+        max_x = max_x.max(position.x.saturating_add(size.width as i32));
+        max_y = max_y.max(position.y.saturating_add(size.height as i32));
     }
-    let abs_x = min_x as f64 + ratio_x * (max_x - min_x) as f64;
-    let abs_y = min_y as f64 + ratio_y * (max_y - min_y) as f64;
+    let width = max_x.checked_sub(min_x)?;
+    let height = max_y.checked_sub(min_y)?;
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    let abs_x = min_x as f64 + ratio_x * width as f64;
+    let abs_y = min_y as f64 + ratio_y * height as f64;
     Some((abs_x.round() as i64, abs_y.round() as i64))
 }
+
+/// 全局鼠标绝对坐标（目标窗口物理像素，y 向下）。
+/// macOS、Windows 和 X11 优先使用 Tauri 原生绝对坐标，避免依赖输入监听权限；
+/// Tao 在 Wayland 下会返回占位坐标，因此直接使用 provider 的合成器逻辑坐标。
+pub fn global_cursor_position(app: &AppHandle, target_scale_factor: f64) -> Option<(i64, i64)> {
+    #[cfg(target_os = "linux")]
+    let prefer_provider_position = matches!(
+        crate::linux_session::current_linux_desktop_session(),
+        crate::linux_session::LinuxDesktopSession::Wayland
+    );
+    #[cfg(not(target_os = "linux"))]
+    let prefer_provider_position = false;
+
+    let native_position = if prefer_provider_position {
+        None
+    } else {
+        native_cursor_position(app, target_scale_factor)
+    };
+    #[cfg(target_os = "linux")]
+    let provider_position = if prefer_provider_position {
+        recorded_wayland_cursor_position(target_scale_factor)
+    } else {
+        cursor_position_from_recorded_ratio(app)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let provider_position = cursor_position_from_recorded_ratio(app);
+
+    select_cursor_position(prefer_provider_position, native_position, provider_position)
+}
+
+fn should_retry_avatar_input_monitor(
+    monitor_started: bool,
+    has_accessibility_permission: bool,
+    has_input_monitoring_permission: bool,
+) -> bool {
+    !monitor_started && has_accessibility_permission && has_input_monitoring_permission
+}
+
+#[cfg(target_os = "macos")]
+pub fn spawn_avatar_input_monitor_retry(app: AppHandle) {
+    if INPUT_MONITOR_RETRY_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    tauri::async_runtime::spawn(async move {
+        loop {
+            if !AVATAR_ENABLED_FLAG.load(Ordering::Relaxed) {
+                INPUT_MONITOR_RETRY_STARTED.store(false, Ordering::SeqCst);
+                return;
+            }
+            let monitor_started = INPUT_MONITOR_STARTED.load(Ordering::SeqCst);
+            if !monitor_started {
+                let has_accessibility_permission =
+                    crate::screenshot::has_accessibility_permission(false);
+                let has_input_monitoring_permission =
+                    crate::screenshot::has_input_monitoring_permission();
+
+                if should_retry_avatar_input_monitor(
+                    monitor_started,
+                    has_accessibility_permission,
+                    has_input_monitoring_permission,
+                ) {
+                    log::info!("桌宠输入联动权限已就绪，重新注册全局键鼠监听");
+                    start_avatar_input_monitor(&app);
+                }
+            }
+
+            tokio::time::sleep(INPUT_MONITOR_RETRY_INTERVAL).await;
+        }
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn spawn_avatar_input_monitor_retry(_app: AppHandle) {}
 
 #[cfg(target_os = "macos")]
 thread_local! {
@@ -1516,6 +1851,7 @@ pub fn start_avatar_input_monitor(app: &AppHandle) {
 
                 loop {
                     if let Some(snapshot) = query_wayland_mouse_cursor_point(provider) {
+                        record_wayland_cursor_position((snapshot.x, snapshot.y));
                         let next_mouse_state = (snapshot.x, snapshot.y, snapshot.group_code);
                         if last_mouse_state != Some(next_mouse_state) {
                             record_mouse_input(snapshot.group_code);
@@ -1535,7 +1871,7 @@ pub fn start_avatar_input_monitor(app: &AppHandle) {
                         }
 
                         if let Some((min_x, min_y, width, height)) =
-                            virtual_desktop_bounds_from_monitors(&app)
+                            virtual_desktop_logical_bounds_from_monitors(&app)
                         {
                             let (cursor_ratio_x, cursor_ratio_y) =
                                 cursor_ratio_from_virtual_desktop_bounds(
@@ -1578,12 +1914,21 @@ mod tests {
         LAST_MOUSE_GROUP_CODE.store(0, Ordering::Relaxed);
         CURSOR_RATIO_X_PERMILLE.store(500, Ordering::Relaxed);
         CURSOR_RATIO_Y_PERMILLE.store(500, Ordering::Relaxed);
+        CURSOR_RATIO_INITIALIZED.store(false, Ordering::Relaxed);
         KEYBOARD_STATE
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .pressed_keys
             .clear();
         guard
+    }
+
+    #[test]
+    fn macos权限恢复且监听尚未启动时应触发重试() {
+        assert!(!should_retry_avatar_input_monitor(true, true, true));
+        assert!(!should_retry_avatar_input_monitor(false, false, true));
+        assert!(!should_retry_avatar_input_monitor(false, true, false));
+        assert!(should_retry_avatar_input_monitor(false, true, true));
     }
 
     #[test]
@@ -1599,6 +1944,108 @@ mod tests {
         // issue #137 诉求三：Windows 此前被禁用，导致穿透模式下通知按钮无法点击。
         // 现统一启用，鼠标进入窗口矩形（含通知按钮区域）时临时关闭穿透，按钮可点。
         assert!(smart_click_through_polling_enabled_for_platform());
+    }
+
+    #[test]
+    fn 精确模式穿透只由交互区域命中决定() {
+        assert!(should_ignore_avatar_cursor(true, false, Some(false)));
+        assert!(!should_ignore_avatar_cursor(true, false, Some(true)));
+        assert!(should_ignore_avatar_cursor(true, true, Some(false)));
+        assert!(!should_ignore_avatar_cursor(true, true, Some(true)));
+    }
+
+    #[test]
+    fn 精确模式坐标不可用时应保持通知可交互() {
+        assert!(!should_ignore_avatar_cursor(true, false, None));
+        assert!(!should_ignore_avatar_cursor(true, true, None));
+    }
+
+    #[test]
+    fn 非精确模式应保持用户穿透开关语义() {
+        assert!(!should_ignore_avatar_cursor(false, false, Some(false)));
+        assert!(!should_ignore_avatar_cursor(false, false, Some(true)));
+        assert!(should_ignore_avatar_cursor(false, true, Some(false)));
+        assert!(!should_ignore_avatar_cursor(false, true, Some(true)));
+        assert!(should_ignore_avatar_cursor(false, true, None));
+    }
+
+    #[test]
+    fn 原生鼠标坐标应转换到目标窗口的物理缩放空间() {
+        assert_eq!(
+            scale_cursor_position_to_target((1800.0, -300.0), 2.0, 1.0),
+            Some((900, -150))
+        );
+        assert_eq!(
+            scale_cursor_position_to_target((900.0, 450.0), 1.0, 2.0),
+            Some((1800, 900))
+        );
+        assert_eq!(
+            scale_cursor_position_to_target((900.0, 450.0), 0.0, 2.0),
+            None
+        );
+    }
+
+    #[test]
+    fn 非_wayland_应优先原生鼠标坐标并仅在失败时回退() {
+        let native = Some((120, -80));
+        let fallback = Some((500, 400));
+        assert_eq!(select_cursor_position(false, native, fallback), native);
+        assert_eq!(select_cursor_position(false, None, fallback), fallback);
+    }
+
+    #[test]
+    fn wayland_provider逻辑坐标应直接转换到目标窗口缩放空间() {
+        assert_eq!(
+            logical_cursor_position_to_target((-320, 240), 1.5),
+            Some((-480, 360))
+        );
+        assert_eq!(logical_cursor_position_to_target((20, 40), 0.0), None);
+        assert_eq!(
+            unpack_wayland_cursor_position(pack_wayland_cursor_position((-320, 240))),
+            (-320, 240)
+        );
+    }
+
+    #[test]
+    fn wayland_provider过期坐标不应继续参与命中测试() {
+        assert_eq!(
+            fresh_wayland_cursor_position((-320, 240), 1_000, 1_500, 1.5),
+            Some((-480, 360))
+        );
+        assert_eq!(
+            fresh_wayland_cursor_position((-320, 240), 1_000, 1_501, 1.5),
+            None
+        );
+        assert_eq!(
+            fresh_wayland_cursor_position((-320, 240), 0, 1_000, 1.5),
+            None
+        );
+        assert_eq!(
+            fresh_wayland_cursor_position((-320, 240), 1_000, 999, 1.5),
+            None
+        );
+    }
+
+    #[test]
+    fn wayland混合缩放显示器应先还原各自逻辑边界() {
+        assert_eq!(
+            logical_monitor_rect_from_physical(-1920, 0, 1920, 1080, 1.0),
+            Some((-1920, 0, 1920, 1080))
+        );
+        assert_eq!(
+            logical_monitor_rect_from_physical(0, 0, 3840, 2160, 2.0),
+            Some((0, 0, 1920, 1080))
+        );
+    }
+
+    #[test]
+    fn wayland_应使用已有_provider_坐标而不是_tao_占位值() {
+        let tao_placeholder = Some((0, 0));
+        let provider = Some((-320, 240));
+        assert_eq!(
+            select_cursor_position(true, tao_placeholder, provider),
+            provider
+        );
     }
 
     #[test]

@@ -1,9 +1,9 @@
 //! Auto-extracted from the historical `commands.rs`. Behavior unchanged.
 
-use crate::config::{AiProvider, AiProviderConfig, ModelConfig};
-use crate::error::AppError;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+use work_review_core::config::{AiProvider, AiProviderConfig, ModelConfig};
+use work_review_core::error::AppError;
 
 /// 模型测试结果
 #[derive(Serialize, Deserialize, Debug)]
@@ -203,7 +203,8 @@ async fn test_ollama(
 
 /// 测试 OpenAI 连接
 fn openai_connection_test_max_tokens() -> u32 {
-    16
+    // 思考型模型先输出思维链再出正文，额度太小会"HTTP 200 但无内容"造成假阳性
+    256
 }
 
 /// 判断端点路径是否已含 OpenAI 风格版本号段（/v1、/v2、/v3 … /v9）。
@@ -275,6 +276,21 @@ async fn test_openai(
                 .json()
                 .await
                 .map_err(|e| format!("解析响应失败: {e}"))?;
+            // 必须拿到非空输出才算"模型可用"：正文或思维链（思考型模型测试额度内
+            // 可能只有思维链）任一非空即可；HTTP 200 但无内容视为不可用。
+            let message = &data["choices"][0]["message"];
+            let has_output = message["content"]
+                .as_str()
+                .is_some_and(|s| !s.trim().is_empty())
+                || message["reasoning_content"]
+                    .as_str()
+                    .is_some_and(|s| !s.trim().is_empty());
+            if !has_output {
+                last_error = Some(format!(
+                    "{url} API 可达但模型未返回内容，请确认模型名称是否正确"
+                ));
+                continue;
+            }
             let model_used = data["model"].as_str().unwrap_or(&config.model);
             return Ok(format!("模型 {model_used} 响应正常"));
         }
@@ -420,25 +436,6 @@ fn ollama_model_should_be_listed(
         Some(supports_completion) => supports_completion,
         None => !is_ollama_embedding_model(model),
     }
-}
-
-#[allow(dead_code)]
-fn parse_ollama_model_names(data: &serde_json::Value) -> Result<Vec<String>, AppError> {
-    let models = data["models"]
-        .as_array()
-        .ok_or_else(|| AppError::Unknown("无法获取 Ollama 模型列表".to_string()))?;
-
-    let mut names = models
-        .iter()
-        .filter(|model| !is_ollama_embedding_model(model))
-        .filter_map(|model| model["name"].as_str().map(|name| name.trim().to_string()))
-        .filter(|name| !name.is_empty())
-        .collect::<Vec<_>>();
-
-    names.sort();
-    names.dedup();
-
-    Ok(names)
 }
 
 async fn fetch_ollama_show_response(
@@ -689,7 +686,7 @@ pub async fn fetch_models(
         return Err(AppError::Config("API 地址不能为空".to_string()));
     }
 
-    let provider: crate::config::AiProvider =
+    let provider: work_review_core::config::AiProvider =
         serde_json::from_value(serde_json::Value::String(provider))
             .map_err(|_| AppError::Config("未知的 AI 提供商类型".to_string()))?;
 
@@ -698,7 +695,7 @@ pub async fn fetch_models(
         .build()?;
 
     match provider {
-        crate::config::AiProvider::Ollama => {
+        work_review_core::config::AiProvider::Ollama => {
             let response = client
                 .get(format!("{endpoint}/api/tags"))
                 .send()
@@ -713,13 +710,13 @@ pub async fn fetch_models(
             let data: serde_json::Value = response.json().await?;
             resolve_ollama_text_model_names(&client, &endpoint, &data).await
         }
-        crate::config::AiProvider::Gemini => {
+        work_review_core::config::AiProvider::Gemini => {
             let api_key = api_key
                 .filter(|k| !k.is_empty())
                 .ok_or(AppError::Config("Gemini 需要 API Key".to_string()))?;
             fetch_gemini_models(&client, &endpoint, &api_key).await
         }
-        crate::config::AiProvider::Claude => {
+        work_review_core::config::AiProvider::Claude => {
             let api_key = api_key
                 .filter(|k| !k.is_empty())
                 .ok_or(AppError::Config("Claude 需要 API Key".to_string()))?;
@@ -823,13 +820,11 @@ pub async fn test_assistant_search(
 
 #[tauri::command]
 pub async fn get_ai_providers() -> Result<Vec<serde_json::Value>, AppError> {
-    Ok(vec![
+    let mut providers = vec![
         serde_json::json!({
             "id": "ollama",
             "name": "Ollama (本地)",
             "description": "在本机运行的开源大模型，数据不出本机",
-            "default_endpoint": "http://localhost:11434",
-            "default_model": "qwen3",
             "requires_api_key": false,
             "supports_vision": false,
         }),
@@ -837,8 +832,6 @@ pub async fn get_ai_providers() -> Result<Vec<serde_json::Value>, AppError> {
             "id": "openai",
             "name": "OpenAI / 兼容API",
             "description": "支持 OpenAI 官方及兼容 API（Azure、Cloudflare 等）",
-            "default_endpoint": "https://api.openai.com/v1",
-            "default_model": "gpt-5.1",
             "requires_api_key": true,
             "supports_vision": false,
         }),
@@ -846,8 +839,6 @@ pub async fn get_ai_providers() -> Result<Vec<serde_json::Value>, AppError> {
             "id": "siliconflow",
             "name": "硅基流动 SiliconFlow",
             "description": "国内高性价比 API，兼容 OpenAI 格式",
-            "default_endpoint": "https://api.siliconflow.cn/v1",
-            "default_model": "Qwen/Qwen3-8B",
             "requires_api_key": true,
             "supports_vision": false,
         }),
@@ -855,8 +846,6 @@ pub async fn get_ai_providers() -> Result<Vec<serde_json::Value>, AppError> {
             "id": "deepseek",
             "name": "DeepSeek",
             "description": "国产开源模型，性能强劲，兼容 OpenAI 格式",
-            "default_endpoint": "https://api.deepseek.com",
-            "default_model": "deepseek-v4-flash",
             "requires_api_key": true,
             "supports_vision": false,
         }),
@@ -864,8 +853,6 @@ pub async fn get_ai_providers() -> Result<Vec<serde_json::Value>, AppError> {
             "id": "qwen",
             "name": "通义千问 Qwen",
             "description": "阿里云通义大模型，兼容 OpenAI 格式",
-            "default_endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-            "default_model": "qwen-flash",
             "requires_api_key": true,
             "supports_vision": false,
         }),
@@ -873,8 +860,6 @@ pub async fn get_ai_providers() -> Result<Vec<serde_json::Value>, AppError> {
             "id": "zhipu",
             "name": "智谱 ChatGLM",
             "description": "智谱 AI 大模型",
-            "default_endpoint": "https://open.bigmodel.cn/api/paas/v4",
-            "default_model": "glm-4.6",
             "requires_api_key": true,
             "supports_vision": false,
         }),
@@ -882,8 +867,6 @@ pub async fn get_ai_providers() -> Result<Vec<serde_json::Value>, AppError> {
             "id": "moonshot",
             "name": "月之暗面 Kimi",
             "description": "Moonshot AI，擅长长文本",
-            "default_endpoint": "https://api.moonshot.cn/v1",
-            "default_model": "moonshot-v1-8k",
             "requires_api_key": true,
             "supports_vision": false,
         }),
@@ -891,8 +874,6 @@ pub async fn get_ai_providers() -> Result<Vec<serde_json::Value>, AppError> {
             "id": "doubao",
             "name": "火山引擎 豆包",
             "description": "字节跳动大模型",
-            "default_endpoint": "https://ark.cn-beijing.volces.com/api/v3",
-            "default_model": "doubao-lite-4k",
             "requires_api_key": true,
             "supports_vision": false,
         }),
@@ -900,8 +881,6 @@ pub async fn get_ai_providers() -> Result<Vec<serde_json::Value>, AppError> {
             "id": "minimax",
             "name": "稀宇科技 MiniMax",
             "description": "MiniMax 文本模型，兼容 OpenAI 格式",
-            "default_endpoint": "https://api.minimaxi.com/v1",
-            "default_model": "MiniMax-M2.5",
             "requires_api_key": true,
             "supports_vision": false,
         }),
@@ -909,8 +888,6 @@ pub async fn get_ai_providers() -> Result<Vec<serde_json::Value>, AppError> {
             "id": "openrouter",
             "name": "OpenRouter",
             "description": "多模型聚合网关，一个 Key 调用上百个模型",
-            "default_endpoint": "https://openrouter.ai/api/v1",
-            "default_model": "openrouter/auto",
             "requires_api_key": true,
             "supports_vision": false,
         }),
@@ -918,8 +895,6 @@ pub async fn get_ai_providers() -> Result<Vec<serde_json::Value>, AppError> {
             "id": "groq",
             "name": "Groq",
             "description": "超高速推理，兼容 OpenAI 格式",
-            "default_endpoint": "https://api.groq.com/openai/v1",
-            "default_model": "llama-3.3-70b-versatile",
             "requires_api_key": true,
             "supports_vision": false,
         }),
@@ -927,8 +902,6 @@ pub async fn get_ai_providers() -> Result<Vec<serde_json::Value>, AppError> {
             "id": "xai",
             "name": "xAI Grok",
             "description": "xAI 的 Grok 系列模型，兼容 OpenAI 格式",
-            "default_endpoint": "https://api.x.ai/v1",
-            "default_model": "grok-2-latest",
             "requires_api_key": true,
             "supports_vision": false,
         }),
@@ -936,8 +909,6 @@ pub async fn get_ai_providers() -> Result<Vec<serde_json::Value>, AppError> {
             "id": "mistral",
             "name": "Mistral",
             "description": "Mistral AI 系列模型，兼容 OpenAI 格式",
-            "default_endpoint": "https://api.mistral.ai/v1",
-            "default_model": "mistral-small-latest",
             "requires_api_key": true,
             "supports_vision": false,
         }),
@@ -945,8 +916,6 @@ pub async fn get_ai_providers() -> Result<Vec<serde_json::Value>, AppError> {
             "id": "lmstudio",
             "name": "LM Studio (本地)",
             "description": "本机运行的 LM Studio 服务，数据不出本机",
-            "default_endpoint": "http://localhost:1234/v1",
-            "default_model": "local-model",
             "requires_api_key": false,
             "supports_vision": false,
         }),
@@ -954,8 +923,6 @@ pub async fn get_ai_providers() -> Result<Vec<serde_json::Value>, AppError> {
             "id": "custom",
             "name": "自定义接口",
             "description": "任何 OpenAI 兼容接口，自行填写地址与模型",
-            "default_endpoint": "",
-            "default_model": "",
             "requires_api_key": false,
             "supports_vision": false,
         }),
@@ -963,8 +930,6 @@ pub async fn get_ai_providers() -> Result<Vec<serde_json::Value>, AppError> {
             "id": "gemini",
             "name": "Google Gemini",
             "description": "Google 的 Gemini 系列模型",
-            "default_endpoint": "https://generativelanguage.googleapis.com/v1",
-            "default_model": "gemini-2.5-flash",
             "requires_api_key": true,
             "supports_vision": false,
         }),
@@ -972,12 +937,24 @@ pub async fn get_ai_providers() -> Result<Vec<serde_json::Value>, AppError> {
             "id": "claude",
             "name": "Anthropic Claude",
             "description": "Anthropic 的 Claude 系列模型",
-            "default_endpoint": "https://api.anthropic.com/v1",
-            "default_model": "claude-3-7-sonnet-latest",
             "requires_api_key": true,
             "supports_vision": false,
         }),
-    ])
+    ];
+    for provider in &mut providers {
+        let id = provider["id"].as_str().unwrap_or("custom").to_string();
+        let parsed = serde_json::from_value::<AiProvider>(serde_json::Value::String(id))
+            .unwrap_or(AiProvider::Custom);
+        // Endpoints and default models come from AiProvider as the single source of truth,
+        // so this list cannot drift from config.rs.
+        // 端点与默认模型统一以 AiProvider 为单一事实源，避免与 config.rs 漂移
+        provider["default_endpoint"] =
+            serde_json::Value::String(parsed.default_endpoint().to_string());
+        provider["default_model"] = serde_json::Value::String(parsed.default_model().to_string());
+        provider["generation_capabilities"] =
+            work_review_core::generation_params::capabilities_for(parsed).to_json();
+    }
+    Ok(providers)
 }
 
 #[cfg(test)]
@@ -985,8 +962,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn openai兼容探测请求的输出上限不应低于十六() {
-        assert_eq!(openai_connection_test_max_tokens(), 16);
+    fn openai兼容探测请求的输出上限不应低于二百五十六() {
+        assert_eq!(openai_connection_test_max_tokens(), 256);
+    }
+
+    #[tokio::test]
+    async fn 提供商列表应带上生成能力映射() {
+        let providers = get_ai_providers().await.expect("应返回提供商列表");
+        let qwen = providers
+            .iter()
+            .find(|provider| provider["id"] == "qwen")
+            .expect("应包含 qwen");
+        assert_eq!(qwen["generation_capabilities"]["thinking"], true);
+        assert_eq!(
+            qwen["generation_capabilities"]["thinkingStreamingOnly"],
+            true
+        );
+        let openai = providers
+            .iter()
+            .find(|provider| provider["id"] == "openai")
+            .expect("应包含 openai");
+        assert_eq!(openai["generation_capabilities"]["thinking"], false);
+        assert_eq!(openai["generation_capabilities"]["maxOutputTokens"], true);
     }
 
     #[test]
@@ -1052,39 +1049,17 @@ mod tests {
     }
 
     #[test]
-    fn 应能解析_ollama_模型列表响应() {
-        let payload = serde_json::json!({
-            "models": [
-                { "name": "qwen2.5:latest" },
-                { "name": "llama3.1:8b" },
-                { "name": "qwen2.5:latest" }
-            ]
-        });
-
-        let names = parse_ollama_model_names(&payload).expect("应能解析模型列表");
-
-        assert_eq!(
-            names,
-            vec!["llama3.1:8b".to_string(), "qwen2.5:latest".to_string()]
-        );
-    }
-
-    #[test]
-    fn 解析_ollama_模型列表时应过滤嵌入模型() {
-        let payload = serde_json::json!({
-            "models": [
-                { "name": "qwen3.5:4b" },
-                { "name": "nomic-embed-text:latest" },
-                { "name": "llama3.2:latest" }
-            ]
-        });
-
-        let names = parse_ollama_model_names(&payload).expect("应能解析模型列表");
-
-        assert_eq!(
-            names,
-            vec!["llama3.2:latest".to_string(), "qwen3.5:4b".to_string()]
-        );
+    fn ollama名称启发式应过滤嵌入模型() {
+        assert!(!is_ollama_embedding_model(&serde_json::json!({
+            "name": "qwen3.5:4b"
+        })));
+        assert!(is_ollama_embedding_model(&serde_json::json!({
+            "name": "nomic-embed-text:latest"
+        })));
+        assert!(!ollama_model_should_be_listed(
+            &serde_json::json!({ "name": "nomic-embed-text:latest" }),
+            None
+        ));
     }
 
     #[test]

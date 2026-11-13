@@ -1,10 +1,10 @@
 use crate::bot_common::{build_device_list, handle_cmd, NON_TEXT_REPLY, UNKNOWN_CMD_REPLY};
-use crate::config::AppConfig;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use reqwest::Client;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
+use work_review_core::config::AppConfig;
 
 /// 企业微信回调允许的 timestamp 窗口：±5 分钟（WeCom timestamp 单位为秒）。
 const WECOM_SIGN_WINDOW_SECS: i64 = 5 * 60;
@@ -319,9 +319,14 @@ pub async fn handle_wecom_callback(
     };
 
     // WeCom 被动回复必须在 5 秒内返回，所以不发送"处理中"提示，直接执行命令并回包。
-    let reply = handle_cmd(&client, &devices, &text)
-        .await
-        .unwrap_or_else(|| UNKNOWN_CMD_REPLY.to_string());
+    let reply = handle_cmd(
+        &client,
+        &devices,
+        &text,
+        crate::bot_common::report_generate_timeout(config),
+    )
+    .await
+    .unwrap_or_else(|| UNKNOWN_CMD_REPLY.to_string());
 
     let reply_xml = encrypt_reply(&key, token, corp_id, &reply, timestamp, nonce);
     WecomResponse::xml(200, reply_xml)

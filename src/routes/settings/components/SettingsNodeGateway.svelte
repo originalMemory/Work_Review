@@ -1,29 +1,106 @@
-<script>
+<script lang="ts">
   import { createEventDispatcher, onMount, onDestroy } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
-  import { locale, t } from '$lib/i18n/index.js';
+  import { locale, t } from '$lib/i18n/index.ts';
   import CollapsibleSection from '../../../lib/components/CollapsibleSection.svelte';
 
   import McpServerPanel from './nodeGateway/McpServerPanel.svelte';
   import LocalApiPanel from './nodeGateway/LocalApiPanel.svelte';
   import TelegramBotPanel from './nodeGateway/TelegramBotPanel.svelte';
+  import WecomBotPanel from './nodeGateway/WecomBotPanel.svelte';
   import BotCredentialsPanel from './nodeGateway/BotCredentialsPanel.svelte';
   import DeviceIdentityPanel from './nodeGateway/DeviceIdentityPanel.svelte';
   import DeviceRegistryPanel from './nodeGateway/DeviceRegistryPanel.svelte';
   import ApiExamplesPanel from './nodeGateway/ApiExamplesPanel.svelte';
 
-  export let config;
-  export let dataDir;
+  interface NodeGatewaySettings {
+    device_name: string | null;
+    endpoint: string | null;
+  }
 
-  const dispatch = createEventDispatcher();
+  interface NodeDevice {
+    name: string;
+    url: string;
+    token: string;
+  }
+
+  interface NodeGatewayConfig {
+    node_gateway: NodeGatewaySettings;
+    node_devices?: NodeDevice[];
+    mcp_server_enabled: boolean;
+    localhost_api_enabled: boolean;
+    localhost_api_host: string | null;
+    localhost_api_port: number;
+    telegram_bot_enabled: boolean;
+    telegram_bot_token: string;
+    telegram_bot_proxy: string;
+    telegram_bot_allowed_chat_ids: number[];
+    feishu_bot_enabled: boolean;
+    feishu_app_id: string;
+    feishu_app_secret: string;
+    feishu_verification_token: string;
+    wecom_bot_enabled: boolean;
+    wecom_bot_id: string;
+    wecom_bot_secret: string;
+    wecom_corp_id: string;
+    wecom_token: string;
+    wecom_encoding_aes_key: string;
+    dingtalk_bot_enabled: boolean;
+    dingtalk_app_secret: string;
+  }
+
+  interface NodeGatewayStatus {
+    deviceId: string;
+    protocolVersion: string;
+    deviceName: string;
+  }
+
+  interface LocalApiStatus {
+    enabled: boolean;
+    baseUrl: string;
+    tokenPreview: string;
+    lastError: string | null;
+  }
+
+  interface TelegramBotStatus {
+    starting: boolean;
+    running: boolean;
+    lastError: string | null;
+    bindCode?: string | null;
+    bindCodeExpired?: boolean;
+    allowedChatIds?: number[];
+  }
+
+  interface WecomBotStatus {
+    starting: boolean;
+    running: boolean;
+    lastError: string | null;
+    longConnectionConfigured?: boolean;
+    callbackConfigured?: boolean;
+  }
+
+  interface ToastDetail {
+    message: string;
+    type: 'success' | 'error';
+  }
+
+  export let config: NodeGatewayConfig;
+  export let dataDir: string;
+
+  const dispatch = createEventDispatcher<{
+    change: NodeGatewayConfig;
+    toast: ToastDetail;
+  }>();
   $: currentLocale = $locale;
 
-  let nodeStatus = { deviceId: '', protocolVersion: '', deviceName: '' };
-  let localStatus = { enabled: false, baseUrl: '', tokenPreview: '', lastError: null };
-  let tgBotStatus = null;
+  let nodeStatus: NodeGatewayStatus = { deviceId: '', protocolVersion: '', deviceName: '' };
+  let localStatus: LocalApiStatus = { enabled: false, baseUrl: '', tokenPreview: '', lastError: null };
+  let tgBotStatus: TelegramBotStatus | null = null;
+  let wecomBotStatus: WecomBotStatus | null = null;
   let loading = true;
   let saving = false;
-  let tgStatusPollId = null;
+  let tgStatusPollId: ReturnType<typeof setInterval> | null = null;
+  let wecomStatusPollId: ReturnType<typeof setInterval> | null = null;
 
   $: mcpDbPath = dataDir ? `${dataDir}/work_review.db` : '';
   $: mcpConfigPath = dataDir ? `${dataDir}/config.json` : '';
@@ -63,7 +140,7 @@
 
   async function refreshTelegramBotStatus() {
     try {
-      tgBotStatus = await invoke('get_telegram_bot_status');
+      tgBotStatus = await invoke<TelegramBotStatus>('get_telegram_bot_status');
       if (tgBotStatus?.allowedChatIds) {
         config.telegram_bot_allowed_chat_ids = tgBotStatus.allowedChatIds;
       }
@@ -85,22 +162,55 @@
     }, 3000);
   }
 
+  function stopWecomStatusPolling() {
+    if (wecomStatusPollId) {
+      clearInterval(wecomStatusPollId);
+      wecomStatusPollId = null;
+    }
+  }
+
+  async function refreshWecomBotStatus() {
+    try {
+      wecomBotStatus = await invoke<WecomBotStatus>('get_wecom_bot_status');
+    } catch (e) {
+      /* ignore */
+    }
+  }
+
+  function startWecomStatusPolling() {
+    stopWecomStatusPolling();
+    refreshWecomBotStatus();
+    let attempts = 0;
+    wecomStatusPollId = setInterval(async () => {
+      attempts++;
+      await refreshWecomBotStatus();
+      if (attempts >= 8 || (wecomBotStatus && !wecomBotStatus.starting)) {
+        stopWecomStatusPolling();
+      }
+    }, 3000);
+  }
+
   async function loadStatus() {
     loading = true;
     try {
-      const [node, local, tg] = await Promise.all([
-        invoke('get_node_gateway_status'),
-        invoke('get_localhost_api_status'),
-        invoke('get_telegram_bot_status'),
+      const [node, local, tg, wecom] = await Promise.all([
+        invoke<NodeGatewayStatus>('get_node_gateway_status'),
+        invoke<LocalApiStatus>('get_localhost_api_status'),
+        invoke<TelegramBotStatus>('get_telegram_bot_status'),
+        invoke<WecomBotStatus>('get_wecom_bot_status'),
       ]);
       nodeStatus = node;
       localStatus = local;
       tgBotStatus = tg;
+      wecomBotStatus = wecom;
       if (tgBotStatus?.allowedChatIds) {
         config.telegram_bot_allowed_chat_ids = tgBotStatus.allowedChatIds;
       }
       if (config.telegram_bot_enabled) {
         startTelegramStatusPolling();
+      }
+      if (config.wecom_bot_enabled) {
+        startWecomStatusPolling();
       }
     } catch (e) {
       console.error('加载接入管理状态失败:', e);
@@ -112,24 +222,29 @@
     saving = true;
     normalizeConfig();
     try {
-      await invoke('save_config', { config });
+      await invoke<void>('save_config', { config });
       dispatch('change', config);
       // Reload status after save
-      const [node, local, tg] = await Promise.all([
-        invoke('get_node_gateway_status'),
-        invoke('get_localhost_api_status'),
-        invoke('get_telegram_bot_status'),
+      const [node, local, tg, wecom] = await Promise.all([
+        invoke<NodeGatewayStatus>('get_node_gateway_status'),
+        invoke<LocalApiStatus>('get_localhost_api_status'),
+        invoke<TelegramBotStatus>('get_telegram_bot_status'),
+        invoke<WecomBotStatus>('get_wecom_bot_status'),
       ]);
       nodeStatus = node;
       localStatus = local;
       tgBotStatus = tg;
+      wecomBotStatus = wecom;
+      if (config.wecom_bot_enabled) {
+        startWecomStatusPolling();
+      }
     } catch (e) {
       dispatch('toast', { message: t('nodeGatewayPage.saveFailed', { error: e }), type: 'error' });
     }
     saving = false;
   }
 
-  function handleToast(e) {
+  function handleToast(e: CustomEvent<ToastDetail>) {
     dispatch('toast', e.detail);
   }
   function handleSave() {
@@ -141,6 +256,9 @@
   function handleStartTgPolling() {
     startTelegramStatusPolling();
   }
+  function handleStartWecomPolling() {
+    startWecomStatusPolling();
+  }
 
   onMount(() => {
     normalizeConfig();
@@ -149,6 +267,7 @@
 
   onDestroy(() => {
     stopTelegramStatusPolling();
+    stopWecomStatusPolling();
   });
 </script>
 
@@ -213,21 +332,12 @@
             ]}
             on:save={handleSave}
           />
-          <BotCredentialsPanel
+          <WecomBotPanel
             {config}
+            {wecomBotStatus}
             {saving}
-            enabledKey="wecom_bot_enabled"
-            titleKey="nodeGatewayPage.wecomBot"
-            enabledLabelKey="nodeGatewayPage.wecomEnabled"
-            hintKey="nodeGatewayPage.wecomBotHint"
-            iconColor="#07C160"
-            iconPath="M9.5 4C5.36 4 2 6.91 2 10.5c0 2.08 1.13 3.93 2.88 5.13-.14.8-.5 2-.5 2l2-.5c.5.24 1.04.42 1.6.54-.13-.5-.2-1.02-.2-1.55C8.78 13.69 12 12 16 12c.3 0 .6.01.89.04C16.96 7.56 13.64 4 9.5 4z"
-            fields={[
-              { key: 'wecom_corp_id', labelKey: 'nodeGatewayPage.wecomCorpId', placeholder: 'Corp ID' },
-              { key: 'wecom_token', labelKey: 'nodeGatewayPage.wecomToken', placeholder: 'Token' },
-              { key: 'wecom_encoding_aes_key', labelKey: 'nodeGatewayPage.wecomEncodingAesKey', placeholder: 'EncodingAESKey' },
-            ]}
             on:save={handleSave}
+            on:startWecomPolling={handleStartWecomPolling}
           />
           <BotCredentialsPanel
             {config}

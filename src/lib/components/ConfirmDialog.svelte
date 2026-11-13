@@ -1,8 +1,12 @@
-<script>
-  import { confirmDialog, resolveConfirm } from '$lib/stores/confirm.js';
-  import { trapFocus } from '$lib/utils/focusTrap.js';
+<script lang="ts">
+  import {
+    confirmDialog,
+    resolveConfirm,
+    type ConfirmTone,
+  } from '$lib/stores/confirm.ts';
+  import { trapFocus } from '$lib/utils/focusTrap.ts';
 
-  const toneMap = {
+  const toneMap: Record<ConfirmTone, { iconBg: string; button: string }> = {
     info: {
       iconBg: 'bg-blue-50 text-blue-600 dark:bg-blue-950/50 dark:text-blue-300',
       button: 'bg-indigo-500 hover:bg-indigo-600 text-white',
@@ -18,9 +22,9 @@
   };
 
   $: dialogState = $confirmDialog;
-  $: tone = toneMap[dialogState?.tone] || toneMap.info;
+  $: tone = toneMap[dialogState?.tone ?? 'info'];
 
-  function handleKeydown(event) {
+  function handleKeydown(event: KeyboardEvent): void {
     if (event.key === 'Escape') {
       resolveConfirm(false);
     }
@@ -33,13 +37,13 @@
   <div class="fixed inset-0 z-[200] flex items-center justify-center px-4 py-6 bg-slate-950/48 backdrop-blur-md animate-fadeIn">
     <div
       use:trapFocus
-      class="w-full max-w-md rounded-3xl border border-slate-200 dark:border-[#30363d] bg-white dark:bg-[#161b22] shadow-2xl shadow-slate-950/24 dark:shadow-black/50 p-6"
+      class="w-full max-w-md rounded-[var(--radius-lg)] border border-slate-200 dark:border-[#30363d] bg-white dark:bg-[#161b22] shadow-2xl shadow-slate-950/24 dark:shadow-black/50 p-6"
       role="dialog"
       aria-modal="true"
       aria-labelledby="confirm-dialog-title"
     >
       <div class="flex items-start gap-4">
-        <div class={`flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl ${tone.iconBg}`}>
+        <div class={`flex h-12 w-12 shrink-0 items-center justify-center rounded-[var(--radius-md)] ${tone.iconBg}`}>
           <svg class="h-6 w-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v3.75m0 3.75h.008v.008H12v-.008ZM10.29 3.86 1.82 18a2 2 0 0 0 1.72 3h16.92a2 2 0 0 0 1.72-3L13.71 3.86a2 2 0 0 0-3.42 0Z" />
           </svg>
@@ -58,14 +62,14 @@
         <button
           type="button"
           on:click={() => resolveConfirm(false)}
-          class="inline-flex min-h-11 items-center justify-center rounded-2xl border border-slate-200 dark:border-[#30363d] bg-white dark:bg-[#21262d] px-5 text-sm font-medium text-slate-700 dark:text-[#adbac7] transition-colors hover:bg-slate-50 dark:hover:bg-[#30363d]"
+          class="inline-flex min-h-11 items-center justify-center rounded-[var(--radius-md)] border border-slate-200 dark:border-[#30363d] bg-white dark:bg-[#21262d] px-5 text-sm font-medium text-slate-700 dark:text-[#adbac7] transition-colors hover:bg-slate-50 dark:hover:bg-[#30363d]"
         >
           {dialogState.cancelText}
         </button>
         <button
           type="button"
           on:click={() => resolveConfirm(true)}
-          class={`inline-flex min-h-11 items-center justify-center rounded-2xl px-5 text-sm font-medium transition-colors ${tone.button}`}
+          class={`inline-flex min-h-11 items-center justify-center rounded-[var(--radius-md)] px-5 text-sm font-medium transition-colors ${tone.button}`}
         >
           {dialogState.confirmText}
         </button>

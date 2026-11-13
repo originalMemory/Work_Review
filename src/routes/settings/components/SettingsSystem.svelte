@@ -1,21 +1,72 @@
-<script>
+<script lang="ts">
   import { onMount } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
-  import { locale, t } from '$lib/i18n/index.js';
-  import { showToast } from '$lib/stores/toast.js';
+  import { locale, t } from '$lib/i18n/index.ts';
+  import { showToast } from '$lib/stores/toast.ts';
+
+  type PermissionId = 'screen_capture' | 'accessibility' | 'input_monitoring';
+
+  interface RawPermissionStatus {
+    screen_capture: boolean;
+    accessibility: boolean;
+    input_monitoring: boolean;
+    screenshot_supported: boolean;
+    avatar_input_supported: boolean;
+    all_granted: boolean;
+  }
+
+  interface PermissionStatus {
+    screenCapture: boolean;
+    accessibility: boolean;
+    inputMonitoring: boolean;
+    screenshotSupported: boolean;
+    avatarInputSupported: boolean;
+    allGranted: boolean;
+  }
+
+  interface LinuxSessionSupport {
+    sessionType: string;
+    desktopEnvironment: string;
+    screenshotSupported: boolean;
+    avatarInputSupportLevel: 'full' | 'mouse-only' | 'none';
+    gnomeAvatarExtensionEnabled: boolean;
+    gnomeAvatarExtensionNeedsRelogin: boolean;
+  }
+
+  interface PermissionItem {
+    id: PermissionId;
+    labelKey: string;
+    descriptionKey: string;
+    granted: boolean;
+  }
+
+  interface PermissionSummary {
+    ready: number;
+    total: number;
+    pending: number;
+    attention: boolean;
+    platformLabel: string;
+  }
+
+  interface GnomeExtensionInstallResult {
+    message: string;
+    requiresRelogin: boolean;
+    enabled: boolean;
+  }
 
   $: currentLocale = $locale;
 
   let runtimePlatform = '';
-  let permissionStatus = null;
-  let linuxSessionSupport = null;
+  let permissionStatus: PermissionStatus | null = null;
+  let linuxSessionSupport: LinuxSessionSupport | null = null;
   let refreshing = false;
   let gnomeExtensionInstalling = false;
-  let pendingPermissionItem = null;
+  let pendingPermissionItem: PermissionItem | null = null;
   let permissionDetailsExpanded = false;
   let permissionDetailsTouched = false;
+  let macPermissionItems: PermissionItem[] = [];
 
-  function normalizePermissionStatus(rawStatus) {
+  function normalizePermissionStatus(rawStatus: RawPermissionStatus | null): PermissionStatus | null {
     if (!rawStatus || typeof rawStatus !== 'object') {
       return null;
     }
@@ -30,7 +81,12 @@
     };
   }
 
-  function buildPermissionSummary(platform, rawPermissionStatus, support, macCount) {
+  function buildPermissionSummary(
+    platform: string,
+    rawPermissionStatus: PermissionStatus | null,
+    support: LinuxSessionSupport | null,
+    macCount: number,
+  ): PermissionSummary {
     if (platform === 'macos' && rawPermissionStatus) {
       return {
         ready: macCount,
@@ -123,11 +179,13 @@
     refreshing = true;
 
     try {
-      runtimePlatform = await invoke('get_runtime_platform');
-      permissionStatus = normalizePermissionStatus(await invoke('check_permissions'));
+      runtimePlatform = await invoke<string>('get_runtime_platform');
+      permissionStatus = normalizePermissionStatus(
+        await invoke<RawPermissionStatus | null>('check_permissions'),
+      );
 
       if (runtimePlatform === 'linux') {
-        linuxSessionSupport = await invoke('get_linux_session_support');
+        linuxSessionSupport = await invoke<LinuxSessionSupport>('get_linux_session_support');
       } else {
         linuxSessionSupport = null;
       }
@@ -159,7 +217,7 @@
     permissionDetailsExpanded = !permissionDetailsExpanded;
   }
 
-  function beginPermissionSetup(item) {
+  function beginPermissionSetup(item: PermissionItem) {
     pendingPermissionItem = item;
   }
 
@@ -167,7 +225,7 @@
     pendingPermissionItem = null;
   }
 
-  async function openPermissionSettings(permission) {
+  async function openPermissionSettings(permission: PermissionId) {
     try {
       await invoke('open_permission_settings', { permission });
     } catch (error) {
@@ -194,7 +252,7 @@
 
     gnomeExtensionInstalling = true;
     try {
-      const result = await invoke('install_gnome_avatar_extension');
+      const result = await invoke<GnomeExtensionInstallResult>('install_gnome_avatar_extension');
       showToast(
         result.message,
         result.requiresRelogin ? 'warning' : result.enabled ? 'success' : 'info'
@@ -208,7 +266,7 @@
     }
   }
 
-  function permissionSetupMessageKey(permissionId) {
+  function permissionSetupMessageKey(permissionId: PermissionId) {
     if (permissionId === 'input_monitoring') {
       return 'settingsGeneral.permissionsInputMonitoringGuide';
     }
@@ -449,8 +507,6 @@
 {/if}
 
 <style>
-  .permission-overview {}
-
   .permission-summary-strip {
     display: flex;
     flex-wrap: wrap;
@@ -486,7 +542,7 @@
     justify-content: center;
     min-height: 24px;
     padding: 0 10px;
-    border-radius: 999px;
+    border-radius: var(--radius-full);
     font-size: 11px;
     font-weight: 700;
     white-space: nowrap;
@@ -525,7 +581,7 @@
     justify-content: center;
     min-height: 32px;
     padding: 0 12px;
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     font-size: 12px;
     font-weight: 600;
     transition: border-color 160ms ease, background-color 160ms ease, color 160ms ease;
@@ -568,7 +624,7 @@
   }
 
   .permission-item-card {
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     border: 1px solid rgba(226, 232, 240, 0.9);
     background: rgba(248, 250, 252, 0.7);
     padding: 10px 12px;
@@ -601,7 +657,7 @@
   .permission-item-marker {
     width: 7px;
     height: 7px;
-    border-radius: 999px;
+    border-radius: var(--radius-full);
     margin-top: 6px;
     flex-shrink: 0;
   }
@@ -643,7 +699,7 @@
     justify-content: center;
     min-height: 28px;
     padding: 0 10px;
-    border-radius: 999px;
+    border-radius: var(--radius-full);
     font-size: 11px;
     font-weight: 700;
     white-space: nowrap;
@@ -685,7 +741,7 @@
   .permission-setup-accent {
     width: 36px;
     height: 4px;
-    border-radius: 999px;
+    border-radius: var(--radius-full);
     background: linear-gradient(90deg, rgba(59, 130, 246, 0.88), rgba(99, 102, 241, 0.74));
     margin-bottom: 16px;
   }
@@ -714,7 +770,7 @@
 
   .permission-setup-button {
     min-height: 44px;
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     padding: 0 16px;
     font-size: 14px;
     font-weight: 700;

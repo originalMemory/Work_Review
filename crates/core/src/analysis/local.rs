@@ -8,7 +8,6 @@ use crate::analysis::{
 use crate::database::{Activity, DailyStats};
 use crate::error::{AppError, Result};
 use async_trait::async_trait;
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use reqwest::Client;
 use serde_json::json;
 use std::collections::HashMap;
@@ -352,43 +351,6 @@ Do not add any extra preface or explanation."#,
         }
 
         Ok(ai_content)
-    }
-
-    #[allow(dead_code)]
-    async fn analyze_screenshot(&self, screenshot_path: &Path) -> Result<String> {
-        let image_data = tokio::fs::read(screenshot_path).await?;
-        let image_base64 = BASE64_STANDARD.encode(&image_data);
-
-        let screenshot_prompt = match self.locale {
-            AppLocale::ZhCn => "请简要描述这张截图里的工作内容，用中文回答，限制在 50 字以内。",
-            AppLocale::ZhTw => "請簡要描述這張截圖裡的工作內容，請用繁體中文回答，限制在 50 字內。",
-            AppLocale::En => {
-                "Briefly describe what work is shown in this screenshot in under 50 words."
-            }
-            AppLocale::Ar => "صف بإيجاز العمل الموضح في هذه اللقطة في أقل من 50 كلمة.",
-        };
-
-        let response = self
-            .client
-            .post(format!("{}/api/generate", self.host))
-            .json(&json!({
-                "model": self.model,
-                "prompt": screenshot_prompt,
-                "images": [image_base64],
-                "stream": false,
-            }))
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            return Err(AppError::Analysis(format!(
-                "Ollama API 错误: {}",
-                response.status()
-            )));
-        }
-
-        let result: serde_json::Value = response.json().await?;
-        Ok(result["response"].as_str().unwrap_or("").to_string())
     }
 }
 

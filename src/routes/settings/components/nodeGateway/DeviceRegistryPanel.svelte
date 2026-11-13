@@ -1,11 +1,21 @@
-<script>
-  import { t } from '$lib/i18n/index.js';
+<script lang="ts">
+  import { t } from '$lib/i18n/index.ts';
   import { createEventDispatcher } from 'svelte';
 
-  export let config;
-  export let localStatus = { baseUrl: '' };
+  interface NodeDevice {
+    name: string;
+    url: string;
+    token: string;
+  }
 
-  const dispatch = createEventDispatcher();
+  interface DeviceRegistryConfig {
+    node_devices?: NodeDevice[];
+  }
+
+  export let config: DeviceRegistryConfig;
+  export let localStatus: { baseUrl: string } = { baseUrl: '' };
+
+  const dispatch = createEventDispatcher<{ save: null }>();
 </script>
 
 <div class="space-y-2">
@@ -62,7 +72,7 @@
         type="button"
         class="text-xs text-red-400 hover:text-red-500 mt-3 shrink-0"
         on:click={() => {
-          config.node_devices = config.node_devices.filter((_, j) => j !== i);
+          config.node_devices = (config.node_devices ?? []).filter((_, j) => j !== i);
           dispatch('save');
         }}
       >

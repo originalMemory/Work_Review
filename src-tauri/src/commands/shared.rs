@@ -1,12 +1,12 @@
 //! Auto-extracted from the historical `commands.rs`. Behavior unchanged.
 
-use crate::config::{AppConfig, AvatarFollowupItem, PrivacyConfig};
-use crate::database::Activity;
-use crate::error::AppError;
-use crate::work_intelligence::TodoExtractionResult;
 use crate::AppState;
 use std::sync::{Arc, Mutex};
 use tauri::AppHandle;
+use work_review_core::config::{AppConfig, AvatarFollowupItem, PrivacyConfig};
+use work_review_core::database::Activity;
+use work_review_core::error::AppError;
+use work_review_core::work_intelligence::TodoExtractionResult;
 
 /// 从问题中提取时间范围关键词，返回 (date_from, date_to)
 ///
@@ -147,7 +147,7 @@ pub(crate) fn validate_relative_path(path: &str) -> Result<(), AppError> {
 }
 
 pub(crate) fn collect_privacy_filters(state: &AppState) -> (Vec<String>, Vec<String>) {
-    crate::privacy::collect_privacy_filters(&state.config)
+    work_review_core::privacy::collect_privacy_filters(&state.config)
 }
 
 pub(crate) fn filter_activities_by_privacy(
@@ -250,14 +250,16 @@ pub(crate) fn merge_manual_followups_into_todos(
             continue;
         }
 
-        extracted.items.push(crate::work_intelligence::TodoItem {
-            title: item.title.clone(),
-            date: item.date.clone(),
-            source_title: item.source_title.clone(),
-            source_app: item.source_app.clone(),
-            confidence: 96,
-            reason: "桌宠手动加入待跟进".to_string(),
-        });
+        extracted
+            .items
+            .push(work_review_core::work_intelligence::TodoItem {
+                title: item.title.clone(),
+                date: item.date.clone(),
+                source_title: item.source_title.clone(),
+                source_app: item.source_app.clone(),
+                confidence: 96,
+                reason: "桌宠手动加入待跟进".to_string(),
+            });
     }
 
     extracted.items.sort_by(|a, b| {
@@ -281,6 +283,9 @@ pub(crate) fn persist_app_config(
 ) -> Result<(), AppError> {
     config.sync.ensure_device_identity();
     config.normalize();
+    let new_embedding_config_fingerprint =
+        super::semantic_memory::embedding_config_fingerprint(&config);
+    let new_privacy_fingerprint = super::semantic_memory::privacy_fingerprint(&config.privacy);
     let (
         previous_avatar_enabled,
         previous_avatar_scale,
@@ -296,8 +301,24 @@ pub(crate) fn persist_app_config(
     ) = {
         let mut state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
         let previous_config = state.config.clone();
+        let previous_embedding_config_fingerprint =
+            super::semantic_memory::embedding_config_fingerprint(&previous_config);
+        let previous_privacy_fingerprint =
+            super::semantic_memory::privacy_fingerprint(&previous_config.privacy);
 
-        // 更新配置
+        // Embedding 或隐私规则变化时必须先失效旧向量，再保存并启用新配置。
+        // API Key 不参与指纹，因此单纯轮换密钥不会触发无必要的全量重建。
+        if previous_embedding_config_fingerprint != new_embedding_config_fingerprint
+            || previous_privacy_fingerprint != new_privacy_fingerprint
+        {
+            super::semantic_memory::invalidate_semantic_memory_index(&state.database)?;
+        }
+
+        // 先持久化文件；失败时内存配置和运行时隐私过滤器保持旧值。
+        let config_path = state.config_path.clone();
+        crate::config_sync::stamp_local_sync(&mut config);
+        config.save(&config_path)?;
+
         state.config = config.clone();
         state.database.set_local_device_id(&config.sync.device_id);
         state.storage_manager.update_config(config.storage.clone());
@@ -305,12 +326,6 @@ pub(crate) fn persist_app_config(
         state
             .screenshot_service
             .update_device_id(&config.sync.device_id);
-
-        // 保存到文件
-        let config_path = state.config_path.clone();
-        config.save(&config_path)?;
-
-        // 更新隐私过滤器
         state.privacy_filter.update_config(&config.privacy);
         state.avatar_state = crate::avatar_engine::apply_avatar_visual_settings(
             state.avatar_state.clone(),
@@ -378,6 +393,11 @@ pub(crate) fn persist_app_config(
     // 同步智能穿透运行时 flag（供 spawn_avatar_input_bridge 轮询无锁读）
     crate::avatar_input::set_avatar_enabled_flag(config.avatar_enabled);
     crate::avatar_input::set_avatar_click_through_flag(config.avatar_click_through);
+    if config.avatar_enabled && !previous_avatar_enabled {
+        crate::avatar_input::start_avatar_input_monitor(&app);
+        crate::avatar_input::spawn_avatar_input_monitor_retry(app.clone());
+        crate::avatar_input::spawn_avatar_input_bridge(app.clone());
+    }
     if avatar_window_changed || avatar_click_through_changed {
         crate::avatar_input::force_resync_click_through();
     }
@@ -388,6 +408,8 @@ pub(crate) fn persist_app_config(
 
     crate::localhost_api::sync_localhost_api_runtime(&app, state)?;
     crate::telegram_bot::sync_telegram_bot_runtime(state)?;
+    crate::wecom_aibot::sync_wecom_bot_runtime(state)?;
+    crate::config_sync::spawn_push(config.clone());
     crate::emit_config_changed(&app, &config);
 
     log::info!("配置已保存");
@@ -439,8 +461,8 @@ fn refresh_avatar_state_for_current_window(app: &AppHandle, state: &Arc<Mutex<Ap
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::{BrowserUsage, DailyStats, DomainUsage, UrlDetail, UrlUsage};
-    use crate::privacy::apply_excluded_domains_to_stats;
+    use work_review_core::database::{BrowserUsage, DailyStats, DomainUsage, UrlDetail, UrlUsage};
+    use work_review_core::privacy::apply_excluded_domains_to_stats;
 
     #[test]
     fn 概览统计应过滤排除域名并重算浏览器时长() {

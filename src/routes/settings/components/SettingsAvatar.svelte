@@ -1,12 +1,17 @@
-<script>
+<script lang="ts">
   import { createEventDispatcher } from 'svelte';
+  import type { ComponentEvents, ComponentProps } from 'svelte';
   import SettingsAppearance from './SettingsAppearance.svelte';
 
-  export let config;
+  type AppearanceConfig = ComponentProps<SettingsAppearance>['config'];
+  type AppearanceChangeEvent = ComponentEvents<SettingsAppearance>['change'];
+  type AppearanceChangeDetail = AppearanceChangeEvent['detail'];
 
-  const dispatch = createEventDispatcher();
+  export let config: AppearanceConfig;
 
-  function handleChange(event) {
+  const dispatch = createEventDispatcher<{ change: AppearanceChangeDetail }>();
+
+  function handleChange(event: AppearanceChangeEvent) {
     dispatch('change', event.detail);
   }
 </script>

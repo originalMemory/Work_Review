@@ -1,8 +1,4 @@
-// 小时摘要生成器
-// 第二层分析：每小时汇总活动数据，调用 AI 生成摘要
-// 当前为预留模块
-
-#![allow(dead_code)]
+// 小时摘要生成器：按小时聚合活动，供时间线小时摘要使用。
 
 use crate::database::Activity;
 use std::collections::HashMap;
@@ -47,20 +43,17 @@ fn calculate_activity_covered_duration(activities: &[Activity]) -> i64 {
 /// 小时活动统计
 #[derive(Debug, Clone)]
 pub struct HourlyStats {
-    pub date: String,
-    pub hour: i32,
-    pub activities: Vec<Activity>,
-    pub app_durations: HashMap<String, i64>,
+    app_durations: HashMap<String, i64>,
     pub total_duration: i64,
     pub activity_count: i32,
     pub representative_screenshots: Vec<String>,
     pub urls: Vec<String>,
-    pub ocr_keywords: Vec<String>, // OCR 提取的关键词
+    pub ocr_keywords: Vec<String>,
 }
 
 impl HourlyStats {
     /// 从活动列表构建统计
-    pub fn from_activities(date: &str, hour: i32, activities: Vec<Activity>) -> Self {
+    pub fn from_activities(activities: Vec<Activity>) -> Self {
         let mut app_durations: HashMap<String, i64> = HashMap::new();
         let mut representative_screenshots = Vec::new();
         let mut urls = Vec::new();
@@ -124,9 +117,6 @@ impl HourlyStats {
         let total_duration = calculate_activity_covered_duration(&activities);
 
         Self {
-            date: date.to_string(),
-            hour,
-            activities,
             app_durations,
             total_duration,
             activity_count,
@@ -145,47 +135,6 @@ impl HourlyStats {
             .take(5)
             .collect()
     }
-
-    /// 生成用于 AI 的 JSON 数据
-    pub fn to_ai_prompt_data(&self) -> serde_json::Value {
-        let main_apps: Vec<serde_json::Value> = self
-            .get_main_apps()
-            .into_iter()
-            .map(|app| {
-                let duration = self.app_durations.get(&app).unwrap_or(&0);
-                serde_json::json!({
-                    "app": app,
-                    "duration_min": duration / 60
-                })
-            })
-            .collect();
-
-        serde_json::json!({
-            "hour": format!("{:02}:00-{:02}:00", self.hour, (self.hour + 1) % 24),
-            "total_duration_min": self.total_duration / 60,
-            "activity_count": self.activity_count,
-            "main_apps": main_apps,
-            "urls_visited": self.urls.iter().take(10).collect::<Vec<_>>(),
-        })
-    }
-}
-
-/// 生成小时摘要的 AI 提示词
-pub fn build_hourly_summary_prompt(stats: &HourlyStats) -> String {
-    let data = stats.to_ai_prompt_data();
-
-    format!(
-        r#"请根据以下数据，用简洁的中文总结这一小时的工作内容（50字以内）：
-
-{}
-
-要求：
-1. 突出主要活动和成果
-2. 使用简洁的语言
-3. 不要包含具体时间
-4. 如果有浏览网页，提及主要访问内容"#,
-        serde_json::to_string_pretty(&data).unwrap_or_default()
-    )
 }
 
 /// 生成小时摘要（无 AI 时的备选方案）
@@ -272,7 +221,7 @@ mod tests {
             sample_activity("WeChat", 10 * 3600 + 55 * 60, 35 * 60),
         ];
 
-        let stats = HourlyStats::from_activities("2026-04-01", 10, activities);
+        let stats = HourlyStats::from_activities(activities);
 
         assert_eq!(stats.total_duration, 55 * 60);
         assert!(generate_fallback_summary(&stats).contains("55分钟"));

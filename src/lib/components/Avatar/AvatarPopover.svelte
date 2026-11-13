@@ -1,8 +1,14 @@
-<script>
-  import { formatBubbleMessage } from './bubbleMessage.js';
-  import { t } from '$lib/i18n/index.js';
+<script lang="ts">
+  import { formatBubbleMessage } from './bubbleMessage.ts';
+  import { t } from '$lib/i18n/index.ts';
 
-  export let bubble = null;
+  interface AvatarBubble {
+    message?: unknown;
+    tone?: string;
+    persistent?: boolean;
+  }
+
+  export let bubble: AvatarBubble | null = null;
   export let flipLeft = false;
   export let onClose = () => {};
 
@@ -23,8 +29,8 @@
   $: compactBubbleMessage = !bubbleMessage?.includes('\n') && (bubbleMessage?.trim().length ?? 0) <= 14;
   // 约束弹框宽度不超出桌宠窗口：82vw 在 276px 窗口内 ≈ 226px，留出边距
   $: bubblePanelStyle = compactBubbleMessage
-    ? 'width: fit-content; min-width: 120px; max-width: min(82vw, 196px);'
-    : 'width: min(82vw, 336px); min-width: 160px; max-width: min(82vw, 336px);';
+    ? 'width: fit-content; min-width: min(82vw, 120px); max-width: min(82vw, 196px);'
+    : 'width: min(82vw, 336px); min-width: min(82vw, 160px); max-width: min(82vw, 336px);';
 </script>
 
 {#if bubble}
@@ -32,19 +38,21 @@
     <div class={`avatar-popover-anchor absolute ${flipLeft ? 'left-[6%]' : 'right-[6%]'} top-[8px]`}>
       <div class="relative overflow-visible">
         <div
-          class="pointer-events-auto relative rounded-[16px] border shadow-[0_10px_24px_rgba(15,23,42,0.1),0_3px_10px_rgba(15,23,42,0.05)]"
+          class="relative rounded-lg border shadow-[0_10px_24px_rgba(15,23,42,0.1),0_3px_10px_rgba(15,23,42,0.05)]"
+          class:pointer-events-auto={bubble?.persistent}
+          data-avatar-hit-region={bubble?.persistent ? 'bubble' : undefined}
           style="{bubblePanelStyle} min-height: 40px; padding: 6px 14px 7px 14px; {panelStyle}"
         >
           {#if bubble?.persistent}
             <button
               type="button"
-              class="absolute inset-0 rounded-[16px]"
+              class="absolute inset-0 rounded-lg"
               aria-label={t('avatar.dismissReminder')}
               on:click={onClose}
             ></button>
           {/if}
           <div
-            class="pointer-events-none absolute inset-[1px] rounded-[15px] border"
+            class="pointer-events-none absolute inset-[1px] rounded-lg border"
             style={innerPanelStyle}
           ></div>
           {#if bubble?.persistent}
@@ -66,7 +74,7 @@
           </div>
         </div>
         <div
-          class={`bubble-tail absolute ${flipLeft ? 'right-[18px]' : 'left-[18px]'} top-[calc(100%-5px)] h-[12px] w-[12px] rotate-45 rounded-[3px] border shadow-[0_6px_14px_rgba(15,23,42,0.06)]`}
+          class={`bubble-tail absolute ${flipLeft ? 'right-[18px]' : 'left-[18px]'} top-[calc(100%-5px)] h-[12px] w-[12px] rotate-45 rounded-[var(--radius-xs)] border shadow-[0_6px_14px_rgba(15,23,42,0.06)]`}
           style={tailStyle}
         ></div>
         <div

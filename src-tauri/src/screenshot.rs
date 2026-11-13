@@ -1,5 +1,3 @@
-use crate::config::{ScreenshotDisplayMode, ScreenshotWidthMode, StorageConfig};
-use crate::error::{AppError, Result};
 #[cfg(target_os = "linux")]
 use crate::linux_session::{current_linux_desktop_environment, current_linux_desktop_session};
 #[cfg(any(target_os = "linux", test))]
@@ -14,13 +12,18 @@ use image::{imageops::FilterType, ColorType};
 use regex::Regex;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-use std::process::Command;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::process::{Command, Output, Stdio};
+use std::sync::{Arc, Mutex};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::time::Duration;
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux", test))]
 use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
 };
+use work_review_core::config::{ScreenshotDisplayMode, ScreenshotWidthMode, StorageConfig};
+use work_review_core::error::{AppError, Result};
 
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,9 +143,6 @@ pub fn has_input_monitoring_permission() -> bool {
     true
 }
 
-#[cfg(not(target_os = "macos"))]
-pub fn request_input_monitoring_permission() {}
-
 /// 截屏结果
 #[derive(Debug, Clone)]
 pub struct ScreenshotResult {
@@ -156,6 +156,7 @@ pub struct ScreenshotResult {
 }
 
 /// 截屏服务配置
+#[derive(Clone)]
 pub struct ScreenshotConfig {
     /// 最大宽度（超过此宽度会按比例缩放）
     pub max_width: u32,
@@ -189,11 +190,52 @@ impl From<&StorageConfig> for ScreenshotConfig {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const SCREENSHOT_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn run_screenshot_command_with_timeout(command: &mut Command, context: &str) -> Result<Output> {
+    command.stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = command
+        .spawn()
+        .map_err(|error| AppError::Screenshot(format!("{context} 启动失败: {error}")))?;
+    let started_at = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started_at.elapsed() < SCREENSHOT_COMMAND_TIMEOUT => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(AppError::Screenshot(format!(
+                    "{context} 执行超时（>{}s）",
+                    SCREENSHOT_COMMAND_TIMEOUT.as_secs()
+                )));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(AppError::Screenshot(format!("{context} 等待失败: {error}")));
+            }
+        }
+    };
+
+    Ok(Output {
+        status,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    })
+}
+
 /// 截屏服务
+#[derive(Clone)]
 pub struct ScreenshotService {
     data_dir: PathBuf,
     config: ScreenshotConfig,
     device_id: String,
+    capture_lock: Arc<Mutex<()>>,
 }
 
 impl ScreenshotService {
@@ -203,6 +245,7 @@ impl ScreenshotService {
             data_dir: data_dir.to_path_buf(),
             config: ScreenshotConfig::from(storage_config),
             device_id: device_id.to_string(),
+            capture_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -228,6 +271,10 @@ impl ScreenshotService {
         &self,
         active_window: Option<&crate::monitor::ActiveWindow>,
     ) -> Result<ScreenshotResult> {
+        let _capture_guard = self
+            .capture_lock
+            .lock()
+            .map_err(|e| AppError::Screenshot(format!("截图任务锁异常: {e}")))?;
         self.capture_impl(active_window)
     }
 
@@ -236,6 +283,10 @@ impl ScreenshotService {
         &self,
         _active_window: Option<&crate::monitor::ActiveWindow>,
     ) -> Result<ScreenshotResult> {
+        let _capture_guard = self
+            .capture_lock
+            .lock()
+            .map_err(|e| AppError::Screenshot(format!("截图任务锁异常: {e}")))?;
         self.capture_impl()
     }
 
@@ -293,18 +344,19 @@ impl ScreenshotService {
         // 降级使用 Windows Graphics Capture API（可能显示黄色边框）
         match self.capture_with_wgc(&screenshots_dir, &time_str, active_window) {
             Ok(result) => {
-                return self.persist_existing_png_capture(
+                let _temp_guard = TemporaryCaptureFile::new(&result.0);
+                self.persist_existing_png_capture(
                     &result.0,
                     &screenshots_dir,
                     &time_str,
                     now.timestamp(),
-                );
+                )
             }
             Err(e) => {
                 log::warn!("Windows Graphics Capture 也失败: {e}");
-                return Err(AppError::Screenshot(format!(
+                Err(AppError::Screenshot(format!(
                     "截图失败（GDI 和 WGC 均不可用）: {e}"
-                )));
+                )))
             }
         }
     }
@@ -333,6 +385,7 @@ impl ScreenshotService {
         };
 
         let temp_png = screenshots_dir.join(format!("{time_str}_temp.png"));
+        let mut temp_guard = TemporaryCaptureFile::new(&temp_png);
 
         struct CaptureResult {
             success: bool,
@@ -480,6 +533,7 @@ impl ScreenshotService {
             return Err(AppError::Screenshot(msg));
         }
 
+        temp_guard.disarm();
         Ok((temp_png, width, height))
     }
 
@@ -608,7 +662,7 @@ impl ScreenshotService {
             }
 
             // BGRA -> RGBA
-            for chunk in pixels.chunks_exact_mut(4) {
+            for chunk in pixels.as_chunks_mut::<4>().0 {
                 chunk.swap(0, 2); // B <-> R
             }
 
@@ -634,17 +688,31 @@ impl ScreenshotService {
         let (archive_path, ocr_source_path) =
             capture_output_paths(&self.data_dir, screenshots_dir, time_str);
         ensure_parent_dir(&ocr_source_path)?;
-        if temp_png != ocr_source_path {
-            move_or_copy_file(temp_png, &ocr_source_path)?;
-        }
+        let persist_result = (|| -> Result<(u32, u32)> {
+            if temp_png != ocr_source_path {
+                move_or_copy_file(temp_png, &ocr_source_path)?;
+            }
 
-        let image = image::open(&ocr_source_path)
-            .map_err(|e| AppError::Screenshot(format!("读取截图失败: {e}")))?;
-        let archive_image = prepare_archive_image_with_config(image, &self.config);
-        let width = archive_image.width();
-        let height = archive_image.height();
+            let image = image::open(&ocr_source_path)
+                .map_err(|e| AppError::Screenshot(format!("读取截图失败: {e}")))?;
+            let archive_image = prepare_archive_image_with_config(image, &self.config);
+            let width = archive_image.width();
+            let height = archive_image.height();
 
-        save_archive_jpeg_with_quality(&archive_image, &archive_path, self.config.jpeg_quality)?;
+            save_archive_jpeg_with_quality(
+                &archive_image,
+                &archive_path,
+                self.config.jpeg_quality,
+            )?;
+            Ok((width, height))
+        })();
+        let (width, height) = match persist_result {
+            Ok(dimensions) => dimensions,
+            Err(error) => {
+                cleanup_failed_capture_outputs(&archive_path, &ocr_source_path);
+                return Err(error);
+            }
+        };
 
         let file_size = std::fs::metadata(&archive_path)
             .map(|m| m.len())
@@ -666,7 +734,7 @@ impl ScreenshotService {
         })
     }
 
-    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", test))]
     fn persist_dynamic_image_capture(
         &self,
         dynamic_image: DynamicImage,
@@ -677,14 +745,28 @@ impl ScreenshotService {
         let (archive_path, ocr_source_path) =
             capture_output_paths(&self.data_dir, screenshots_dir, time_str);
         ensure_parent_dir(&ocr_source_path)?;
-        dynamic_image
-            .save_with_format(&ocr_source_path, image::ImageFormat::Png)
-            .map_err(|e| AppError::Screenshot(format!("保存 OCR 临时图失败: {e}")))?;
+        let persist_result = (|| -> Result<(u32, u32)> {
+            dynamic_image
+                .save_with_format(&ocr_source_path, image::ImageFormat::Png)
+                .map_err(|e| AppError::Screenshot(format!("保存 OCR 临时图失败: {e}")))?;
 
-        let archive_image = prepare_archive_image_with_config(dynamic_image, &self.config);
-        let width = archive_image.width();
-        let height = archive_image.height();
-        save_archive_jpeg_with_quality(&archive_image, &archive_path, self.config.jpeg_quality)?;
+            let archive_image = prepare_archive_image_with_config(dynamic_image, &self.config);
+            let width = archive_image.width();
+            let height = archive_image.height();
+            save_archive_jpeg_with_quality(
+                &archive_image,
+                &archive_path,
+                self.config.jpeg_quality,
+            )?;
+            Ok((width, height))
+        })();
+        let (width, height) = match persist_result {
+            Ok(dimensions) => dimensions,
+            Err(error) => {
+                cleanup_failed_capture_outputs(&archive_path, &ocr_source_path);
+                return Err(error);
+            }
+        };
 
         let file_size = std::fs::metadata(&archive_path)
             .map(|m| m.len())
@@ -812,6 +894,7 @@ impl ScreenshotService {
         temp_name: &str,
     ) -> Result<RgbaImage> {
         let temp_png = screenshots_dir.join(format!("{temp_name}.png"));
+        let _temp_guard = TemporaryCaptureFile::new(&temp_png);
         let rect = macos_capture_rect(
             screen.display_info.x,
             screen.display_info.y,
@@ -819,14 +902,20 @@ impl ScreenshotService {
             screen.display_info.height,
         );
 
-        let output = Command::new("screencapture")
-            .args(["-x", "-t", "png", "-R", &rect, &temp_png.to_string_lossy()])
-            .output()
-            .map_err(|e| AppError::Screenshot(format!("调用 screencapture 失败: {e}")))?;
+        let output = run_screenshot_command_with_timeout(
+            Command::new("screencapture").args([
+                "-x",
+                "-t",
+                "png",
+                "-R",
+                &rect,
+                &temp_png.to_string_lossy(),
+            ]),
+            "screencapture",
+        )?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let _ = std::fs::remove_file(&temp_png);
             return Err(AppError::Screenshot(format!(
                 "screencapture 截图失败: {}",
                 if stderr.is_empty() {
@@ -840,7 +929,6 @@ impl ScreenshotService {
         let image = image::open(&temp_png)
             .map_err(|e| AppError::Screenshot(format!("读取 screencapture 结果失败: {e}")))?
             .to_rgba8();
-        let _ = std::fs::remove_file(&temp_png);
         Ok(image)
     }
 
@@ -979,28 +1067,36 @@ impl ScreenshotService {
         desktop_environment: LinuxDesktopEnvironment,
     ) -> Result<ScreenshotResult> {
         let temp_png = screenshots_dir.join(format!("{time_str}_temp.png"));
-        let scrot_result = Command::new("scrot")
-            .args(["-o", &temp_png.to_string_lossy()])
-            .output();
+        let _temp_guard = TemporaryCaptureFile::new(&temp_png);
+        let scrot_result = run_screenshot_command_with_timeout(
+            Command::new("scrot").args(["-o", &temp_png.to_string_lossy()]),
+            "scrot",
+        );
 
         let captured = match scrot_result {
             Ok(output) if output.status.success() && temp_png.exists() => true,
             _ => {
-                let import_result = Command::new("import")
-                    .args(["-window", "root", &temp_png.to_string_lossy().to_string()])
-                    .output();
+                let import_result = run_screenshot_command_with_timeout(
+                    Command::new("import").args([
+                        "-window",
+                        "root",
+                        temp_png.to_string_lossy().as_ref(),
+                    ]),
+                    "import",
+                );
 
                 match import_result {
                     Ok(output) if output.status.success() && temp_png.exists() => true,
                     _ => {
-                        let maim_result = Command::new("maim")
-                            .arg(&temp_png.to_string_lossy().to_string())
-                            .output();
+                        let maim_result = run_screenshot_command_with_timeout(
+                            Command::new("maim").arg(temp_png.to_string_lossy().to_string()),
+                            "maim",
+                        );
 
-                        match maim_result {
-                            Ok(output) if output.status.success() && temp_png.exists() => true,
-                            _ => false,
-                        }
+                        matches!(
+                            maim_result,
+                            Ok(output) if output.status.success() && temp_png.exists()
+                        )
                     }
                 }
             }
@@ -1032,6 +1128,7 @@ impl ScreenshotService {
         desktop_environment: LinuxDesktopEnvironment,
     ) -> Result<ScreenshotResult> {
         let temp_png = screenshots_dir.join(format!("{time_str}_temp.png"));
+        let _temp_guard = TemporaryCaptureFile::new(&temp_png);
         let output_path = temp_png.to_string_lossy().to_string();
 
         let candidates = [
@@ -1054,7 +1151,10 @@ impl ScreenshotService {
         let mut captured = false;
 
         for (command_name, args) in candidates {
-            let output = Command::new(command_name).args(&args).output();
+            let output = run_screenshot_command_with_timeout(
+                Command::new(command_name).args(&args),
+                command_name,
+            );
             match output {
                 Ok(result) if result.status.success() && temp_png.exists() => {
                     captured = true;
@@ -1191,10 +1291,11 @@ fn parse_xrandr_active_monitor_rects(output: &str) -> Vec<LinuxCaptureRect> {
 
 #[cfg(target_os = "linux")]
 fn run_xrandr_active_monitors() -> Option<Vec<LinuxCaptureRect>> {
-    let output = Command::new("xrandr")
-        .arg("--listactivemonitors")
-        .output()
-        .ok()?;
+    let output = run_screenshot_command_with_timeout(
+        Command::new("xrandr").arg("--listactivemonitors"),
+        "xrandr",
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1226,8 +1327,8 @@ fn parse_gnome_display_config_positions(output: &str) -> Vec<(i32, i32)> {
 
 #[cfg(target_os = "linux")]
 fn run_gnome_display_config_positions() -> Option<Vec<(i32, i32)>> {
-    let output = Command::new("gdbus")
-        .args([
+    let output = run_screenshot_command_with_timeout(
+        Command::new("gdbus").args([
             "call",
             "--session",
             "--dest",
@@ -1236,9 +1337,10 @@ fn run_gnome_display_config_positions() -> Option<Vec<(i32, i32)>> {
             "/org/gnome/Mutter/DisplayConfig",
             "--method",
             "org.gnome.Mutter.DisplayConfig.GetCurrentState",
-        ])
-        .output()
-        .ok()?;
+        ]),
+        "gdbus DisplayConfig.GetCurrentState",
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1578,6 +1680,45 @@ fn capture_output_paths(
     )
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux", test))]
+struct TemporaryCaptureFile {
+    path: PathBuf,
+    armed: bool,
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux", test))]
+impl TemporaryCaptureFile {
+    fn new(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            armed: true,
+        }
+    }
+
+    #[cfg(any(target_os = "windows", test))]
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux", test))]
+impl Drop for TemporaryCaptureFile {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        if let Err(error) = std::fs::remove_file(&self.path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                log::warn!(
+                    "清理系统截图临时文件 {} 时出错: {error}",
+                    self.path.display()
+                );
+            }
+        }
+    }
+}
+
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 fn move_or_copy_file(from: &Path, to: &Path) -> Result<()> {
     if from == to {
@@ -1609,6 +1750,17 @@ fn ensure_parent_dir(path: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux", test))]
+fn cleanup_failed_capture_outputs(archive_path: &Path, ocr_source_path: &Path) {
+    for path in [archive_path, ocr_source_path] {
+        if let Err(error) = std::fs::remove_file(path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                log::warn!("清理失败截图文件 {} 时出错: {error}", path.display());
+            }
+        }
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux", test))]
@@ -1703,7 +1855,6 @@ mod tests {
         capture_target_point, linux_screenshot_support_for_session, normalize_linux_crop_rect,
         parse_xrandr_active_monitor_rects, should_capture_all_displays, ScreenshotService,
     };
-    use crate::config::{ScreenshotDisplayMode, ScreenshotWidthMode, StorageConfig};
     use crate::linux_session::{LinuxDesktopEnvironment, LinuxDesktopSession};
     use crate::monitor::{ActiveWindow, WindowBounds};
     use base64::Engine as _;
@@ -1711,6 +1862,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use work_review_core::config::{ScreenshotDisplayMode, ScreenshotWidthMode, StorageConfig};
 
     #[test]
     fn 应按窗口中心点选择目标屏幕() {
@@ -1899,6 +2051,70 @@ Monitors: 2
 
         let _ = fs::remove_dir_all(&data_dir);
         let _ = fs::remove_dir_all(super::ocr_temp_root(&data_dir));
+    }
+
+    #[test]
+    fn 截图归档失败时应清理ocr临时图和不完整归档() {
+        let unique_suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let data_dir =
+            std::env::temp_dir().join(format!("work-review-shot-cleanup-test-{unique_suffix}"));
+        fs::create_dir_all(&data_dir).unwrap();
+
+        let invalid_screenshots_dir = data_dir.join("screenshots-file");
+        fs::write(&invalid_screenshots_dir, b"not-a-directory").unwrap();
+        let (archive_path, ocr_temp_path) =
+            super::capture_output_paths(&data_dir, &invalid_screenshots_dir, "101530_456");
+        let service = ScreenshotService::new(&data_dir, &StorageConfig::default(), "device-a");
+        let image =
+            DynamicImage::ImageRgba8(RgbaImage::from_pixel(64, 64, Rgba([24, 48, 96, 255])));
+
+        assert!(service
+            .persist_dynamic_image_capture(image, &invalid_screenshots_dir, "101530_456", 0,)
+            .is_err());
+        assert!(!ocr_temp_path.exists(), "失败后不得遗留 OCR 临时图");
+        assert!(!archive_path.exists(), "失败后不得遗留不完整归档");
+
+        let _ = fs::remove_dir_all(&data_dir);
+        let _ = fs::remove_dir_all(super::ocr_temp_root(&data_dir));
+    }
+
+    #[test]
+    fn 截图服务克隆应共享同一个采集锁() {
+        let service = ScreenshotService::new(Path::new("."), &StorageConfig::default(), "device-a");
+        let cloned = service.clone();
+
+        assert!(std::sync::Arc::ptr_eq(
+            &service.capture_lock,
+            &cloned.capture_lock,
+        ));
+    }
+
+    #[test]
+    fn 临时截图守卫应在失败退出时清理文件且允许成功移交() {
+        let unique_suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir =
+            std::env::temp_dir().join(format!("work-review-temp-guard-test-{unique_suffix}"));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let failed_path = temp_dir.join("failed.png");
+        fs::write(&failed_path, b"partial").unwrap();
+        drop(super::TemporaryCaptureFile::new(&failed_path));
+        assert!(!failed_path.exists(), "失败退出时必须清理临时截图");
+
+        let handed_off_path = temp_dir.join("handed-off.png");
+        fs::write(&handed_off_path, b"complete").unwrap();
+        let mut guard = super::TemporaryCaptureFile::new(&handed_off_path);
+        guard.disarm();
+        drop(guard);
+        assert!(handed_off_path.exists(), "成功移交后不得提前删除临时截图");
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 
     #[test]

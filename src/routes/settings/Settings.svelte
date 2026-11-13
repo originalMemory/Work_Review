@@ -1,10 +1,11 @@
-<script>
+<script lang="ts">
   import { onMount } from 'svelte';
+  import type { ComponentProps } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
-  import { cache } from '../../lib/stores/cache.js';
-  import { locale, t } from '$lib/i18n/index.js';
-  import { formatUserError } from '$lib/utils/errorDisplay.js';
-  import { showToast } from '../../lib/stores/toast.js';
+  import { cache } from '../../lib/stores/cache.ts';
+  import { locale, t } from '$lib/i18n/index.ts';
+  import { formatUserError } from '$lib/utils/errorDisplay.ts';
+  import { showToast } from '../../lib/stores/toast.ts';
 
   import SettingsGeneral from './components/SettingsGeneral.svelte';
   import SettingsAppearance from './components/SettingsAppearance.svelte';
@@ -14,26 +15,126 @@
   import SettingsSystem from './components/SettingsSystem.svelte';
   import SettingsPrivacy from './components/SettingsPrivacy.svelte';
   import SettingsStorage from './components/SettingsStorage.svelte';
-  let config = null;
+
+  type GeneralConfig = ComponentProps<SettingsGeneral>['config'];
+  type AppearanceConfig = ComponentProps<SettingsAppearance>['config'];
+  type AiConfig = ComponentProps<SettingsAI>['config'];
+  type NodeGatewayConfig = ComponentProps<SettingsNodeGateway>['config'];
+  type PrivacyConfig = ComponentProps<SettingsPrivacy>['config'];
+  type StorageConfig = ComponentProps<SettingsStorage>['config'];
+  type AiProvider = NonNullable<ComponentProps<SettingsAI>['providers']>[number];
+  type StorageStats = NonNullable<ComponentProps<SettingsStorage>['storageStats']>;
+
+  interface LegacyModelConfig {
+    provider: string;
+    endpoint: string;
+    api_key: string | null;
+    model: string;
+    vision_model?: string;
+  }
+
+  interface RootSettingsFields {
+    ai_provider: LegacyModelConfig;
+    text_model_profiles: unknown[];
+    daily_report_custom_prompt: string;
+    daily_report_prompt_presets: unknown[];
+    vision_model: LegacyModelConfig;
+    app_category_rules: unknown[];
+    privacy: PrivacyConfig['privacy'] & { sensitive_keywords?: string[] };
+    storage: StorageConfig['storage'] & {
+      metadata_retention_days: number;
+      jpeg_quality: number;
+    };
+  }
+
+  type SettingsConfig = GeneralConfig
+    & AppearanceConfig
+    & AiConfig
+    & NodeGatewayConfig
+    & PrivacyConfig
+    & StorageConfig
+    & RootSettingsFields;
+
+  type NullableCredentialKey =
+    | 'telegram_bot_token'
+    | 'telegram_bot_proxy'
+    | 'feishu_app_id'
+    | 'feishu_app_secret'
+    | 'feishu_verification_token'
+    | 'wecom_corp_id'
+    | 'wecom_token'
+    | 'wecom_encoding_aes_key'
+    | 'wecom_bot_id'
+    | 'wecom_bot_secret'
+    | 'dingtalk_app_secret';
+
+  type DraftPrivacySettings = Partial<PrivacyConfig['privacy']> & {
+    sensitive_keywords?: string[];
+  };
+
+  type DraftSettingsConfig = Omit<
+    SettingsConfig,
+    | NullableCredentialKey
+    | 'ai_provider'
+    | 'text_model'
+    | 'text_model_profiles'
+    | 'daily_report_custom_prompt'
+    | 'daily_report_prompt_presets'
+    | 'node_gateway'
+    | 'vision_model'
+    | 'storage'
+    | 'app_category_rules'
+    | 'privacy'
+    | 'ui_visual_style'
+  > & {
+    [Key in NullableCredentialKey]: string | null;
+  } & {
+    ai_provider: LegacyModelConfig | null;
+    text_model: AiConfig['text_model'] | null;
+    text_model_profiles?: unknown[];
+    daily_report_custom_prompt?: string;
+    daily_report_prompt_presets?: unknown[];
+    node_gateway: (Partial<NodeGatewayConfig['node_gateway']> & { device_name: string | null }) | null;
+    vision_model: LegacyModelConfig | null;
+    storage: (Partial<RootSettingsFields['storage']> & {
+      screenshots_enabled?: boolean;
+      screenshot_display_mode?: string;
+      screenshot_width_mode?: string;
+    }) | null;
+    app_category_rules?: unknown[];
+    privacy: DraftPrivacySettings | null;
+    ui_visual_style: string;
+  };
+
+  type SettingsTabId = 'general' | 'appearance' | 'ai' | 'avatar' | 'privacy' | 'storage' | 'node';
+
+  interface SettingsTab {
+    id: SettingsTabId;
+    labelKey: string;
+    icon: SettingsTabId;
+    beta?: boolean;
+  }
+
+  let config: SettingsConfig | null = null;
   let loading = true;
   let saving = false;
   let dirty = false;
-  let error = null;
+  let error: string | null = null;
   let success = false;
-  let providers = [];
-  let runningApps = [];
-  let recentApps = [];
-  let storageStats = null;
+  let providers: AiProvider[] = [];
+  let runningApps: string[] = [];
+  let recentApps: string[] = [];
+  let storageStats: StorageStats | null = null;
   let dataDir = '';
   let defaultDataDir = '';
   let settingsRuntimePlatform = '';
-  let successTimer = null;
+  let successTimer: ReturnType<typeof setTimeout> | null = null;
   $: currentLocale = $locale;
 
   // 当前激活的标签
-  let activeTab = 'general';
+  let activeTab: SettingsTabId = 'general';
 
-  const tabs = [
+  const tabs: SettingsTab[] = [
     { id: 'general', labelKey: 'settings.tabs.general', icon: 'general' },
     { id: 'appearance', labelKey: 'settings.tabs.appearance', icon: 'appearance' },
     { id: 'ai', labelKey: 'settings.tabs.ai', icon: 'ai' },
@@ -49,16 +150,14 @@
     error = null;
     try {
       const [loadedConfig, loadedProviders, loadedStorageStats, loadedDataDir, loadedDefaultDataDir, loadedRuntimePlatform] = await Promise.all([
-        invoke('get_config'),
-        invoke('get_ai_providers'),
-        invoke('get_storage_stats'),
-        invoke('get_data_dir'),
-        invoke('get_default_data_dir'),
-        invoke('get_runtime_platform'),
+        invoke<DraftSettingsConfig>('get_config'),
+        invoke<AiProvider[]>('get_ai_providers'),
+        invoke<StorageStats>('get_storage_stats'),
+        invoke<string>('get_data_dir'),
+        invoke<string>('get_default_data_dir'),
+        invoke<string>('get_runtime_platform'),
       ]);
 
-      config = loadedConfig;
-      cache.setConfig(config);
       providers = loadedProviders;
       storageStats = loadedStorageStats;
       dataDir = loadedDataDir;
@@ -66,113 +165,123 @@
       settingsRuntimePlatform = loadedRuntimePlatform;
 
       // 确保对象存在
-      if (!config.ai_provider) {
-        config.ai_provider = { provider: 'ollama', endpoint: 'http://localhost:11434', api_key: null, model: 'llava', vision_model: 'llava' };
+      if (!loadedConfig.ai_provider) {
+        loadedConfig.ai_provider = { provider: 'ollama', endpoint: 'http://localhost:11434', api_key: null, model: 'llava', vision_model: 'llava' };
       }
-      if (!config.text_model) {
-        config.text_model = { provider: 'ollama', endpoint: 'http://localhost:11434', api_key: null, model: 'qwen2.5' };
+      if (!loadedConfig.text_model) {
+        loadedConfig.text_model = { provider: 'ollama', endpoint: 'http://localhost:11434', api_key: null, model: 'qwen2.5' };
       }
-      if (!config.text_model_profiles) {
-        config.text_model_profiles = [];
+      if (!loadedConfig.text_model_profiles) {
+        loadedConfig.text_model_profiles = [];
       }
-      if (typeof config.daily_report_custom_prompt !== 'string') {
-        config.daily_report_custom_prompt = '';
+      if (!loadedConfig.text_model_provider_cache) {
+        loadedConfig.text_model_provider_cache = {};
       }
-      if (typeof config.daily_report_export_dir !== 'string' && config.daily_report_export_dir !== null) {
-        config.daily_report_export_dir = null;
+      if (typeof loadedConfig.daily_report_custom_prompt !== 'string') {
+        loadedConfig.daily_report_custom_prompt = '';
       }
-      if (typeof config.daily_report_auto_export !== 'boolean') {
-        config.daily_report_auto_export = false;
+      if (typeof loadedConfig.daily_report_export_dir !== 'string' && loadedConfig.daily_report_export_dir !== null) {
+        loadedConfig.daily_report_export_dir = null;
       }
-      if (!Array.isArray(config.daily_report_prompt_presets)) {
-        config.daily_report_prompt_presets = [];
+      if (typeof loadedConfig.daily_report_auto_export !== 'boolean') {
+        loadedConfig.daily_report_auto_export = false;
       }
-      if (typeof config.localhost_api_enabled !== 'boolean') {
-        config.localhost_api_enabled = false;
+      if (!Array.isArray(loadedConfig.daily_report_prompt_presets)) {
+        loadedConfig.daily_report_prompt_presets = [];
       }
-      if (!Number.isInteger(config.localhost_api_port) || config.localhost_api_port <= 0) {
-        config.localhost_api_port = 47831;
+      if (typeof loadedConfig.localhost_api_enabled !== 'boolean') {
+        loadedConfig.localhost_api_enabled = false;
       }
-      if (typeof config.localhost_api_host !== 'string' && config.localhost_api_host !== null) {
-        config.localhost_api_host = null;
+      if (!Number.isInteger(loadedConfig.localhost_api_port) || loadedConfig.localhost_api_port <= 0) {
+        loadedConfig.localhost_api_port = 47831;
       }
-      if (!['a', 'b', 'c'].includes(config.ui_visual_style)) {
-        config.ui_visual_style = 'c';
+      if (typeof loadedConfig.localhost_api_host !== 'string' && loadedConfig.localhost_api_host !== null) {
+        loadedConfig.localhost_api_host = null;
       }
-      if (typeof config.avatar_proactive_ai_enabled !== 'boolean') {
-        config.avatar_proactive_ai_enabled = false;
+      if (!['a', 'b', 'c'].includes(loadedConfig.ui_visual_style)) {
+        loadedConfig.ui_visual_style = 'c';
       }
-      if (typeof config.telegram_bot_enabled !== 'boolean') {
-        config.telegram_bot_enabled = false;
+      if (typeof loadedConfig.avatar_proactive_ai_enabled !== 'boolean') {
+        loadedConfig.avatar_proactive_ai_enabled = false;
       }
-      if (typeof config.telegram_bot_token !== 'string' && config.telegram_bot_token !== null) {
-        config.telegram_bot_token = null;
+      if (typeof loadedConfig.telegram_bot_enabled !== 'boolean') {
+        loadedConfig.telegram_bot_enabled = false;
       }
-      if (typeof config.telegram_bot_proxy !== 'string' && config.telegram_bot_proxy !== null) {
-        config.telegram_bot_proxy = null;
+      if (typeof loadedConfig.telegram_bot_token !== 'string' && loadedConfig.telegram_bot_token !== null) {
+        loadedConfig.telegram_bot_token = null;
       }
-      if (!Array.isArray(config.node_devices)) {
-        config.node_devices = [];
+      if (typeof loadedConfig.telegram_bot_proxy !== 'string' && loadedConfig.telegram_bot_proxy !== null) {
+        loadedConfig.telegram_bot_proxy = null;
       }
-      if (typeof config.feishu_bot_enabled !== 'boolean') {
-        config.feishu_bot_enabled = false;
+      if (!Array.isArray(loadedConfig.node_devices)) {
+        loadedConfig.node_devices = [];
       }
-      if (typeof config.feishu_app_id !== 'string' && config.feishu_app_id !== null) {
-        config.feishu_app_id = null;
+      if (typeof loadedConfig.feishu_bot_enabled !== 'boolean') {
+        loadedConfig.feishu_bot_enabled = false;
       }
-      if (typeof config.feishu_app_secret !== 'string' && config.feishu_app_secret !== null) {
-        config.feishu_app_secret = null;
+      if (typeof loadedConfig.feishu_app_id !== 'string' && loadedConfig.feishu_app_id !== null) {
+        loadedConfig.feishu_app_id = null;
       }
-      if (typeof config.feishu_verification_token !== 'string' && config.feishu_verification_token !== null) {
-        config.feishu_verification_token = null;
+      if (typeof loadedConfig.feishu_app_secret !== 'string' && loadedConfig.feishu_app_secret !== null) {
+        loadedConfig.feishu_app_secret = null;
       }
-      if (typeof config.wecom_bot_enabled !== 'boolean') {
-        config.wecom_bot_enabled = false;
+      if (typeof loadedConfig.feishu_verification_token !== 'string' && loadedConfig.feishu_verification_token !== null) {
+        loadedConfig.feishu_verification_token = null;
       }
-      if (typeof config.wecom_corp_id !== 'string' && config.wecom_corp_id !== null) {
-        config.wecom_corp_id = null;
+      if (typeof loadedConfig.wecom_bot_enabled !== 'boolean') {
+        loadedConfig.wecom_bot_enabled = false;
       }
-      if (typeof config.wecom_token !== 'string' && config.wecom_token !== null) {
-        config.wecom_token = null;
+      if (typeof loadedConfig.wecom_corp_id !== 'string' && loadedConfig.wecom_corp_id !== null) {
+        loadedConfig.wecom_corp_id = null;
       }
-      if (typeof config.wecom_encoding_aes_key !== 'string' && config.wecom_encoding_aes_key !== null) {
-        config.wecom_encoding_aes_key = null;
+      if (typeof loadedConfig.wecom_token !== 'string' && loadedConfig.wecom_token !== null) {
+        loadedConfig.wecom_token = null;
       }
-      if (typeof config.dingtalk_bot_enabled !== 'boolean') {
-        config.dingtalk_bot_enabled = false;
+      if (typeof loadedConfig.wecom_encoding_aes_key !== 'string' && loadedConfig.wecom_encoding_aes_key !== null) {
+        loadedConfig.wecom_encoding_aes_key = null;
       }
-      if (typeof config.dingtalk_app_secret !== 'string' && config.dingtalk_app_secret !== null) {
-        config.dingtalk_app_secret = null;
+      if (typeof loadedConfig.wecom_bot_id !== 'string' && loadedConfig.wecom_bot_id !== null) {
+        loadedConfig.wecom_bot_id = null;
       }
-      if (!config.node_gateway || typeof config.node_gateway !== 'object') {
-        config.node_gateway = {
+      if (typeof loadedConfig.wecom_bot_secret !== 'string' && loadedConfig.wecom_bot_secret !== null) {
+        loadedConfig.wecom_bot_secret = null;
+      }
+      if (typeof loadedConfig.dingtalk_bot_enabled !== 'boolean') {
+        loadedConfig.dingtalk_bot_enabled = false;
+      }
+      if (typeof loadedConfig.dingtalk_app_secret !== 'string' && loadedConfig.dingtalk_app_secret !== null) {
+        loadedConfig.dingtalk_app_secret = null;
+      }
+      if (!loadedConfig.node_gateway || typeof loadedConfig.node_gateway !== 'object') {
+        loadedConfig.node_gateway = {
           device_name: null,
         };
       }
       if (
-        typeof config.node_gateway.device_name !== 'string' &&
-        config.node_gateway.device_name !== null
+        typeof loadedConfig.node_gateway.device_name !== 'string' &&
+        loadedConfig.node_gateway.device_name !== null
       ) {
-        config.node_gateway.device_name = null;
+        loadedConfig.node_gateway.device_name = null;
       }
-      if (!config.vision_model) {
-        config.vision_model = { provider: 'ollama', endpoint: 'http://localhost:11434', api_key: null, model: 'llava' };
+      if (!loadedConfig.vision_model) {
+        loadedConfig.vision_model = { provider: 'ollama', endpoint: 'http://localhost:11434', api_key: null, model: 'llava' };
       }
-      if (typeof config.lightweight_mode !== 'boolean') {
-        config.lightweight_mode = false;
+      if (typeof loadedConfig.lightweight_mode !== 'boolean') {
+        loadedConfig.lightweight_mode = false;
       }
-      if (typeof config.break_reminder_enabled !== 'boolean') {
-        config.break_reminder_enabled = false;
+      if (typeof loadedConfig.break_reminder_enabled !== 'boolean') {
+        loadedConfig.break_reminder_enabled = false;
       }
-      if (![30, 45, 50, 60, 90, 120].includes(config.break_reminder_interval_minutes)) {
-        config.break_reminder_interval_minutes = 50;
+      if (![30, 45, 50, 60, 90, 120].includes(loadedConfig.break_reminder_interval_minutes)) {
+        loadedConfig.break_reminder_interval_minutes = 50;
       }
-      if (typeof config.auto_start_silent !== 'boolean') {
-        config.auto_start_silent = false;
+      if (typeof loadedConfig.auto_start_silent !== 'boolean') {
+        loadedConfig.auto_start_silent = false;
       }
-      if (!config.storage) {
-        config.storage = {
+      if (!loadedConfig.storage) {
+        loadedConfig.storage = {
           screenshot_retention_days: 7,
+          metadata_cleanup_enabled: false,
           metadata_retention_days: 30,
           storage_limit_mb: 2048,
           jpeg_quality: 85,
@@ -182,20 +291,26 @@
           screenshot_width_mode: 'auto',
         };
       }
-      if (typeof config.storage.screenshots_enabled !== 'boolean') {
-        config.storage.screenshots_enabled = true;
+      if (typeof loadedConfig.storage.metadata_cleanup_enabled !== 'boolean') {
+        loadedConfig.storage.metadata_cleanup_enabled = false;
       }
-      if (!config.storage.screenshot_display_mode) {
-        config.storage.screenshot_display_mode = 'active_window';
+      if (typeof loadedConfig.storage.screenshots_enabled !== 'boolean') {
+        loadedConfig.storage.screenshots_enabled = true;
       }
-      if (!['auto', 'fixed'].includes(config.storage.screenshot_width_mode)) {
-        config.storage.screenshot_width_mode = 'auto';
+      if (!loadedConfig.storage.screenshot_display_mode) {
+        loadedConfig.storage.screenshot_display_mode = 'active_window';
       }
-      if (!config.app_category_rules) config.app_category_rules = [];
-      if (!config.privacy) config.privacy = {};
-      if (!config.privacy.app_rules) config.privacy.app_rules = [];
-      if (!config.privacy.excluded_keywords) config.privacy.excluded_keywords = [];
-      delete config.privacy.sensitive_keywords;
+      if (!loadedConfig.storage.screenshot_width_mode || !['auto', 'fixed'].includes(loadedConfig.storage.screenshot_width_mode)) {
+        loadedConfig.storage.screenshot_width_mode = 'auto';
+      }
+      if (!loadedConfig.app_category_rules) loadedConfig.app_category_rules = [];
+      if (!loadedConfig.privacy) loadedConfig.privacy = {};
+      if (!loadedConfig.privacy.app_rules) loadedConfig.privacy.app_rules = [];
+      if (!loadedConfig.privacy.excluded_keywords) loadedConfig.privacy.excluded_keywords = [];
+      delete loadedConfig.privacy.sensitive_keywords;
+
+      config = loadedConfig as SettingsConfig;
+      cache.setConfig(config);
     } catch (e) {
       error = formatUserError(e, t('common.loadFailedRetry'));
       console.error('加载配置失败:', e);
@@ -208,7 +323,7 @@
   // 加载运行中的应用
   async function loadRunningApps() {
     try {
-      runningApps = await invoke('get_running_apps');
+      runningApps = await invoke<string[]>('get_running_apps');
     } catch (e) {
       console.error('获取运行应用失败:', e);
       runningApps = [];
@@ -218,7 +333,7 @@
   // 加载历史应用列表
   async function loadRecentApps() {
     try {
-      recentApps = await invoke('get_recent_apps');
+      recentApps = await invoke<string[]>('get_recent_apps');
     } catch (e) {
       console.error('获取历史应用失败:', e);
       recentApps = [];
@@ -227,19 +342,21 @@
 
   // 保存配置
   async function saveConfig() {
+    if (!config) return;
+    const currentConfig = config;
     saving = true;
     error = null;
     success = false;
 
     try {
-      delete config.privacy?.sensitive_keywords;
-      await invoke('save_config', { config });
+      delete currentConfig.privacy?.sensitive_keywords;
+      await invoke<void>('save_config', { config: currentConfig });
       success = true;
       dirty = false;
-      cache.setConfig(config);
+      cache.setConfig(currentConfig);
       showToast(t('settings.saveSuccessToast'), 'success');
       
-      clearTimeout(successTimer);
+      if (successTimer !== null) clearTimeout(successTimer);
       successTimer = setTimeout(() => {
         success = false;
         successTimer = null;
@@ -251,16 +368,21 @@
     }
   }
 
-  function handleSettingsChange(event) {
-    dirty = !event.detail?.autosaved;
+  function handleSettingsChange(event: CustomEvent<unknown>) {
+    const detail = event.detail;
+    const autosaved = typeof detail === 'object'
+      && detail !== null
+      && 'autosaved' in detail
+      && detail.autosaved === true;
+    dirty = !autosaved;
   }
 
   // 清理缓存回调
   async function handleClearCache() {
     try {
       const [latestStats, latestDataDir] = await Promise.all([
-        invoke('get_storage_stats'),
-        invoke('get_data_dir'),
+        invoke<StorageStats>('get_storage_stats'),
+        invoke<string>('get_data_dir'),
       ]);
       storageStats = latestStats;
       dataDir = latestDataDir;
@@ -272,8 +394,8 @@
   async function handleDataDirChanged() {
     try {
       const [latestStats, latestDataDir] = await Promise.all([
-        invoke('get_storage_stats'),
-        invoke('get_data_dir'),
+        invoke<StorageStats>('get_storage_stats'),
+        invoke<string>('get_data_dir'),
       ]);
       storageStats = latestStats;
       dataDir = latestDataDir;
@@ -289,7 +411,7 @@
       // 保存中或用户已编辑配置时，不覆盖（避免丢弃未保存的修改）
       if (saving) return;
       if (config && dirty) return;
-      config = state.config;
+      config = state.config as SettingsConfig;
     });
 
     loadConfig();
@@ -298,7 +420,7 @@
 
     return () => {
       unsubscribeCache();
-      clearTimeout(successTimer);
+      if (successTimer !== null) clearTimeout(successTimer);
     };
   });
 </script>
@@ -387,7 +509,7 @@
                 <span>{t(tab.labelKey)}</span>
                 {#if tab.beta}
                   <span class="inline-flex items-center rounded-full border border-amber-200 bg-amber-50 px-1 py-px text-[10px] font-semibold uppercase tracking-[0.06em] text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-200">
-                    Beta
+                    {t('settings.tabs.beta')}
                   </span>
                 {/if}
               </span>
@@ -415,7 +537,7 @@
             bind:config
             {runningApps}
             {recentApps}
-            on:change={() => dirty = true}
+            on:change={handleSettingsChange}
             on:refresh-apps={() => { loadRunningApps(); loadRecentApps(); }}
           />
         {:else if activeTab === 'storage'}

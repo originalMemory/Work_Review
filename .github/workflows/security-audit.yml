@@ -1,49 +1,50 @@
 name: Security Audit
 
-# 依赖漏洞扫描：每周 + 锁文件变更时。处理截屏/OCR/HTTP 上传/AES 的应用必须盯 CVE。
+# 依赖漏洞扫描：每个 PR 和 main push 都运行，也可在 Actions 页手动运行。
+# 依赖公告可能在锁文件不变时发布，因此不能只按 manifest/lockfile 路径触发。
 on:
-  schedule:
-    - cron: '0 3 * * 1' # 每周一 03:00 UTC
   push:
     branches: [main, master]
-    paths:
-      - '**/Cargo.toml'
-      - '**/Cargo.lock'
-      - 'package.json'
-      - 'package-lock.json'
   pull_request:
-    paths:
-      - '**/Cargo.toml'
-      - '**/Cargo.lock'
-      - 'package.json'
-      - 'package-lock.json'
   workflow_dispatch:
 
-# rustsec/audit-check 需要创建 check-run;默认 GITHUB_TOKEN 只读会报
-# "Resource not accessible by integration"。
 permissions:
   contents: read
-  checks: write
 
 jobs:
   cargo-audit:
     name: cargo audit（Rust CVE）
     runs-on: ubuntu-latest
+    # rustsec/audit-check 会创建 check-run，并为未处理的公告创建或更新 Issue。
+    permissions:
+      contents: read
+      checks: write
+      issues: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # 仅降噪 unmaintained 类公告（信息性提示：无安全漏洞、无 patched 版本），
+          # unsound / 漏洞类继续建 Issue 跟踪。三类来源：
+          # 1) gtk-rs GTK3 全家桶（2024-0411..0420）：Tauri 2.x Linux/webkit2gtk
+          #    固有依赖树，所有 Tauri 2 项目都会报，待 GTK4 迁移后自然消除；
+          # 2) 旧构建工具链（2024-0370 proc-macro-error、2024-0436 paste、
+          #    2025-0057 fxhash、2025-0134 rustls-pemfile）；
+          # 3) unic-*（2025-0075/0080/0081/0098/0100，旧 regex 依赖链）。
           # screenshots 0.8 的 Linux-only 代码生成依赖解析依赖自带的
           # Wayland/XCB XML，不接触用户输入；上游尚无可升级版本。
-          ignore: RUSTSEC-2026-0194,RUSTSEC-2026-0195
+          # RUSTSEC-2026-0258（h2 0.3 空 DATA 帧，低危 DoS）：h2 0.3 分支无补丁
+          # （仅 0.4.16+），需整体升级 reqwest 0.11→0.12（hyper 1.x）；本项目为
+          # 桌面客户端、reqwest 只作出站请求，攻击面极小，升级排期后移除。
+          ignore: RUSTSEC-2026-0194,RUSTSEC-2026-0195,RUSTSEC-2024-0370,RUSTSEC-2024-0411,RUSTSEC-2024-0412,RUSTSEC-2024-0413,RUSTSEC-2024-0414,RUSTSEC-2024-0415,RUSTSEC-2024-0416,RUSTSEC-2024-0417,RUSTSEC-2024-0418,RUSTSEC-2024-0419,RUSTSEC-2024-0420,RUSTSEC-2024-0436,RUSTSEC-2025-0057,RUSTSEC-2025-0075,RUSTSEC-2025-0080,RUSTSEC-2025-0081,RUSTSEC-2025-0098,RUSTSEC-2025-0100,RUSTSEC-2025-0134,RUSTSEC-2026-0258
 
   npm-audit:
     name: npm audit（前端依赖）
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm

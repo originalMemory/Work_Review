@@ -1,10 +1,17 @@
-<script>
+<script lang="ts">
   import { onDestroy, onMount } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { open } from '@tauri-apps/plugin-shell';
   import { getVersion } from '@tauri-apps/api/app';
-  import { locale, t } from '$lib/i18n/index.js';
-  import { runUpdateFlow } from '$lib/utils/updater.js';
+  import { locale, t } from '$lib/i18n/index.ts';
+  import { runUpdateFlow } from '$lib/utils/updater.ts';
+
+  interface UpdateSettings {
+    autoCheck: boolean;
+    includePrerelease: boolean;
+    lastCheckTime: number;
+    checkIntervalHours: number;
+  }
 
   const wechatSponsorshipQr = new URL('../../../docs/sponsorship/vx.png', import.meta.url).href;
   const alipaySponsorshipQr = new URL('../../../docs/sponsorship/zfb.png', import.meta.url).href;
@@ -13,10 +20,12 @@
   let appVersion = '';
   let isCheckingUpdate = false;
   let autoCheckUpdate = true;
+  let includePrerelease = false;
+  let isSavingUpdateSettings = false;
   let isSponsorshipOpen = false;
-  let zoomedQr = null;
+  let zoomedQr: string | null = null;
   let updateStatus = '';
-  let updateStatusTimer = null;
+  let updateStatusTimer: ReturnType<typeof setTimeout> | null = null;
   $: currentLocale = $locale;
 
   onMount(async () => {
@@ -29,22 +38,32 @@
     }
 
     try {
-      const settings = await invoke('get_update_settings');
+      const settings = await invoke<UpdateSettings>('get_update_settings');
       autoCheckUpdate = settings?.autoCheck ?? true;
+      includePrerelease = settings?.includePrerelease ?? false;
     } catch (e) {
       console.error('读取更新设置失败:', e);
     }
   });
 
-  async function toggleAutoCheck() {
-    autoCheckUpdate = !autoCheckUpdate;
+  async function toggleUpdateSetting(key: 'autoCheck' | 'includePrerelease') {
+    if (isSavingUpdateSettings || isCheckingUpdate) return;
+    const previous = key === 'autoCheck' ? autoCheckUpdate : includePrerelease;
+    if (key === 'autoCheck') autoCheckUpdate = !previous;
+    else includePrerelease = !previous;
+    isSavingUpdateSettings = true;
     try {
-      const settings = await invoke('get_update_settings');
-      settings.autoCheck = autoCheckUpdate;
+      const settings = await invoke<UpdateSettings>('get_update_settings');
+      settings[key] = !previous;
       await invoke('save_update_settings', { settings });
+      updateStatus = '';
     } catch (e) {
       console.error('保存更新设置失败:', e);
-      autoCheckUpdate = !autoCheckUpdate;
+      if (key === 'autoCheck') autoCheckUpdate = previous;
+      else includePrerelease = previous;
+      updateStatus = t('about.updateSettingsSaveFailed');
+    } finally {
+      isSavingUpdateSettings = false;
     }
   }
 
@@ -69,12 +88,16 @@
   }
 
   async function checkForUpdates() {
-    if (isCheckingUpdate) return;
-
+    if (isCheckingUpdate || isSavingUpdateSettings) return;
+    if (updateStatusTimer !== null) {
+      clearTimeout(updateStatusTimer);
+      updateStatusTimer = null;
+    }
     isCheckingUpdate = true;
     updateStatus = t('about.checkingUpdates');
 
     await runUpdateFlow({
+      confirmBeforeDownload: true,
       onStatusChange: (status) => {
         updateStatus = status;
       },
@@ -82,7 +105,7 @@
 
     isCheckingUpdate = false;
     if (updateStatus) {
-      clearTimeout(updateStatusTimer);
+      if (updateStatusTimer !== null) clearTimeout(updateStatusTimer);
       updateStatusTimer = setTimeout(() => {
         updateStatus = '';
         updateStatusTimer = null;
@@ -91,11 +114,12 @@
   }
 
   onDestroy(() => {
-    clearTimeout(updateStatusTimer);
+    if (updateStatusTimer !== null) clearTimeout(updateStatusTimer);
   });
 
-  function handleWindowKeydown(event) {
-    if (event.key === 'Escape' && isSponsorshipOpen) {
+  function handleWindowKeydown(event: KeyboardEvent): void {
+    if (event.key !== 'Escape') return;
+    if (isSponsorshipOpen) {
       closeSponsorshipModal();
     }
   }
@@ -124,7 +148,7 @@
     <section class="page-card about-brand-card">
       <div class="about-brand-identity flex flex-col items-center">
         <div class="about-brand-mark">
-          <img src="/icons/256x256.png" alt="Work Review" class="h-16 w-16 rounded-[18px] object-cover" />
+          <img src="/icons/256x256.png" alt="Work Review" class="h-16 w-16 rounded-lg object-cover" />
         </div>
 
         <div class="about-brand-copy">
@@ -157,50 +181,33 @@
         </button>
       </div>
 
-      <div class="about-update-grid mt-7 grid grid-cols-1 pt-5 sm:grid-cols-3">
-        <div class="about-update-unit flex min-h-20 flex-col items-center justify-center gap-2 px-4 py-3">
-          <span class="text-xs font-medium text-slate-400 dark:text-[#7d8590]">{t('about.currentVersionTag')}</span>
-          <strong class="text-sm font-semibold text-slate-700 dark:text-[#c9d1d9]">v{appVersion}</strong>
-        </div>
-
-        <div class="about-update-unit flex min-h-20 flex-col items-center justify-center gap-2 px-4 py-3">
-          <span class="text-xs font-medium text-slate-400 dark:text-[#7d8590]">{t('about.autoCheckUpdate')}</span>
-          <button
-            type="button"
-            role="switch"
-            aria-checked={autoCheckUpdate}
-            aria-label={t('about.autoCheckUpdate')}
-            title={t('about.autoCheckUpdate')}
-            on:click={toggleAutoCheck}
-            class="relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors duration-200 {autoCheckUpdate ? 'bg-blue-500' : 'bg-slate-300 dark:bg-[#484f58]'}"
-          >
-            <span class="pointer-events-none inline-block h-4 w-4 rounded-full bg-white shadow-sm transition-transform duration-200 dark:shadow-none {autoCheckUpdate ? 'translate-x-[18px]' : 'translate-x-[2px]'}"></span>
-          </button>
-        </div>
-
-        <div class="about-update-unit flex min-h-20 flex-col items-center justify-center gap-2 px-4 py-3">
-          <span class="text-xs font-medium text-slate-400 dark:text-[#7d8590]">{t('about.updateStatus')}</span>
-          <button
-            type="button"
-            on:click={checkForUpdates}
-            disabled={isCheckingUpdate}
-            class="page-control-btn min-h-9 px-3 disabled:opacity-50"
-          >
-            {#if isCheckingUpdate}
-              <svg class="h-3.5 w-3.5 shrink-0 animate-spin" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
-              <span class="leading-none">{t('about.checkingUpdates')}</span>
-            {:else}
-              <svg class="h-3.5 w-3.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
-              <span class="leading-none">{t('about.checkUpdates')}</span>
-            {/if}
-          </button>
-        </div>
+      <div class="about-update-controls">
+        <label class="about-auto-check">
+          <input type="checkbox" checked={autoCheckUpdate} disabled={isSavingUpdateSettings || isCheckingUpdate} on:change={() => toggleUpdateSetting('autoCheck')} />
+          <span>{t('about.autoCheckUpdate')}</span>
+        </label>
+        <label class="about-auto-check" title={t('about.includePrereleaseHint')}>
+          <input type="checkbox" checked={includePrerelease} disabled={isSavingUpdateSettings || isCheckingUpdate} on:change={() => toggleUpdateSetting('includePrerelease')} />
+          <span>{t('about.includePrerelease')}</span>
+        </label>
+        <button
+          type="button"
+          on:click={checkForUpdates}
+          disabled={isCheckingUpdate || isSavingUpdateSettings}
+          aria-busy={isCheckingUpdate}
+          class="page-control-btn min-h-9 px-3 disabled:opacity-50"
+        >
+          {#if isCheckingUpdate}
+            <svg class="h-3.5 w-3.5 shrink-0 animate-spin" fill="none" viewBox="0 0 24 24" aria-hidden="true"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+            <span class="leading-none">{t('about.checkingUpdates')}</span>
+          {:else}
+            <svg class="h-3.5 w-3.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
+            <span class="leading-none">{t('about.checkUpdates')}</span>
+          {/if}
+        </button>
       </div>
-
       {#if updateStatus}
-        <div class="about-update-feedback mt-4 text-center" role="status" aria-live="polite">
-          <p class="text-sm text-slate-500 dark:text-[#7d8590]">{updateStatus}</p>
-        </div>
+        <p class="about-update-feedback" role="status" aria-live="polite">{updateStatus}</p>
       {/if}
     </section>
 
@@ -246,7 +253,7 @@
     ></button>
 
     <div
-      class="relative z-10 w-full max-w-3xl rounded-[28px] border border-slate-200/80 bg-white p-6 text-left shadow-2xl shadow-slate-950/20 dark:border-[#30363d]/70 dark:bg-[#161b22] sm:p-7"
+      class="relative z-10 w-full max-w-3xl rounded-xl border border-slate-200/80 bg-white p-6 text-left shadow-2xl shadow-slate-950/20 dark:border-[#30363d]/70 dark:bg-[#161b22] sm:p-7"
       role="dialog"
       aria-modal="true"
       aria-labelledby="sponsorship-dialog-title"
@@ -268,7 +275,7 @@
         <button
           type="button"
           on:click={closeSponsorshipModal}
-          class="absolute right-0 top-0 inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl border border-slate-200 bg-white text-slate-500 transition hover:bg-slate-50 hover:text-slate-700 dark:border-[#30363d] dark:bg-[#21262d] dark:text-[#7d8590] dark:hover:bg-[#30363d] dark:hover:text-[#c9d1d9]"
+          class="absolute right-0 top-0 inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-500 transition hover:bg-slate-50 hover:text-slate-700 dark:border-[#30363d] dark:bg-[#21262d] dark:text-[#7d8590] dark:hover:bg-[#30363d] dark:hover:text-[#c9d1d9]"
           aria-label={t('about.closeSupportDialog')}
         >
           <svg class="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -278,9 +285,9 @@
       </div>
 
       <div class="mt-6 grid gap-4 grid-cols-3">
-        <div class="rounded-[28px] border border-slate-200/80 bg-slate-50/80 p-4 dark:border-[#30363d]/80 dark:bg-[#21262d]/50">
+        <div class="rounded-lg border border-slate-200/80 bg-slate-50/80 p-4 dark:border-[#30363d]/80 dark:bg-[#21262d]/50">
           <div class="flex items-center justify-center gap-2">
-            <div class="flex h-10 w-10 items-center justify-center rounded-2xl bg-emerald-100 text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-300">
+            <div class="flex h-10 w-10 items-center justify-center rounded-lg bg-emerald-100 text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-300">
               <svg class="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M7.5 7.5h9v9h-9z" />
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M4.5 12h3m9 0h3M12 4.5v3m0 9v3" />
@@ -288,16 +295,16 @@
             </div>
             <h4 class="text-base font-semibold text-slate-900 dark:text-[#e6edf3]">{t('about.wechat')}</h4>
           </div>
-          <div class="mt-4 flex items-center justify-center rounded-[24px] bg-white p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.8)] dark:bg-[#0d1117] dark:shadow-none">
-            <button type="button" class="aspect-square w-40 cursor-zoom-in rounded-2xl transition-transform hover:scale-[1.02]" on:click={() => zoomedQr = wechatSponsorshipQr}>
-              <img src={wechatSponsorshipQr} alt={t('about.wechatQrAlt')} class="h-full w-full rounded-2xl object-cover" />
+          <div class="mt-4 flex items-center justify-center rounded-lg bg-white p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.8)] dark:bg-[#0d1117] dark:shadow-none">
+            <button type="button" class="aspect-square w-40 cursor-zoom-in rounded-lg transition-transform hover:scale-[1.02]" on:click={() => zoomedQr = wechatSponsorshipQr}>
+              <img src={wechatSponsorshipQr} alt={t('about.wechatQrAlt')} class="h-full w-full rounded-lg object-cover" />
             </button>
           </div>
         </div>
 
-        <div class="rounded-[28px] border border-slate-200/80 bg-slate-50/80 p-4 dark:border-[#30363d]/80 dark:bg-[#21262d]/50">
+        <div class="rounded-lg border border-slate-200/80 bg-slate-50/80 p-4 dark:border-[#30363d]/80 dark:bg-[#21262d]/50">
           <div class="flex items-center justify-center gap-2">
-            <div class="flex h-10 w-10 items-center justify-center rounded-2xl bg-sky-100 text-sky-700 dark:bg-sky-950/50 dark:text-sky-300">
+            <div class="flex h-10 w-10 items-center justify-center rounded-lg bg-sky-100 text-sky-700 dark:bg-sky-950/50 dark:text-sky-300">
               <svg class="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M4.5 8.25h15M6.75 4.5h10.5A2.25 2.25 0 0 1 19.5 6.75v10.5a2.25 2.25 0 0 1-2.25 2.25H6.75A2.25 2.25 0 0 1 4.5 17.25V6.75A2.25 2.25 0 0 1 6.75 4.5Z" />
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M8.25 13.5h7.5" />
@@ -305,16 +312,16 @@
             </div>
             <h4 class="text-base font-semibold text-slate-900 dark:text-[#e6edf3]">{t('about.alipay')}</h4>
           </div>
-          <div class="mt-4 flex items-center justify-center rounded-[24px] bg-white p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.8)] dark:bg-[#0d1117] dark:shadow-none">
-            <button type="button" class="aspect-square w-40 cursor-zoom-in rounded-2xl transition-transform hover:scale-[1.02]" on:click={() => zoomedQr = alipaySponsorshipQr}>
-              <img src={alipaySponsorshipQr} alt={t('about.alipayQrAlt')} class="h-full w-full rounded-2xl object-cover" />
+          <div class="mt-4 flex items-center justify-center rounded-lg bg-white p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.8)] dark:bg-[#0d1117] dark:shadow-none">
+            <button type="button" class="aspect-square w-40 cursor-zoom-in rounded-lg transition-transform hover:scale-[1.02]" on:click={() => zoomedQr = alipaySponsorshipQr}>
+              <img src={alipaySponsorshipQr} alt={t('about.alipayQrAlt')} class="h-full w-full rounded-lg object-cover" />
             </button>
           </div>
         </div>
 
-        <div class="rounded-[28px] border border-slate-200/80 bg-slate-50/80 p-4 dark:border-[#30363d]/80 dark:bg-[#21262d]/50">
+        <div class="rounded-lg border border-slate-200/80 bg-slate-50/80 p-4 dark:border-[#30363d]/80 dark:bg-[#21262d]/50">
           <div class="flex items-center justify-center gap-2">
-            <div class="flex h-10 w-10 items-center justify-center rounded-2xl bg-amber-100 text-amber-700 dark:bg-amber-950/50 dark:text-amber-300">
+            <div class="flex h-10 w-10 items-center justify-center rounded-lg bg-amber-100 text-amber-700 dark:bg-amber-950/50 dark:text-amber-300">
               <svg class="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M15.75 6.75a3.75 3.75 0 1 1-7.5 0 3.75 3.75 0 0 1 7.5 0Z" />
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M12 10.5v6.75" />
@@ -323,9 +330,9 @@
             </div>
             <h4 class="text-base font-semibold text-slate-900 dark:text-[#e6edf3]">Buy Me a Coffee</h4>
           </div>
-          <div class="mt-4 flex items-center justify-center rounded-[24px] bg-white p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.8)] dark:bg-[#0d1117] dark:shadow-none">
-            <button type="button" class="aspect-square w-40 cursor-zoom-in rounded-2xl transition-transform hover:scale-[1.02]" on:click={() => zoomedQr = bmcQr}>
-              <img src={bmcQr} alt="Buy Me a Coffee QR code" class="h-full w-full rounded-2xl object-cover" />
+          <div class="mt-4 flex items-center justify-center rounded-lg bg-white p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.8)] dark:bg-[#0d1117] dark:shadow-none">
+            <button type="button" class="aspect-square w-40 cursor-zoom-in rounded-lg transition-transform hover:scale-[1.02]" on:click={() => zoomedQr = bmcQr}>
+              <img src={bmcQr} alt="Buy Me a Coffee QR code" class="h-full w-full rounded-lg object-cover" />
             </button>
           </div>
         </div>
@@ -342,7 +349,7 @@
           aria-label={t('about.closeSupportDialog')}
           on:click={() => zoomedQr = null}
         ></button>
-        <img src={zoomedQr} alt="" class="relative z-10 max-h-[75vh] max-w-[75vw] rounded-3xl shadow-2xl" />
+        <img src={zoomedQr} alt="" class="relative z-10 max-h-[75vh] max-w-[75vw] rounded-xl shadow-2xl" />
       </div>
     {/if}
   </div>

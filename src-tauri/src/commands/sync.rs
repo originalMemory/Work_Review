@@ -1,11 +1,11 @@
-use crate::config::SyncScreenshotsMode;
-use crate::database::SyncDailyReport;
-use crate::error::AppError;
 use crate::sync::{DeviceInfo, SyncRunResult, SyncService};
 use crate::AppState;
 use serde::Serialize;
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, State};
+use work_review_core::config::SyncScreenshotsMode;
+use work_review_core::database::SyncDailyReport;
+use work_review_core::error::AppError;
 
 #[derive(Serialize)]
 pub struct SyncStatusInfo {

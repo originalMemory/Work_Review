@@ -83,11 +83,9 @@ pub fn fix_wayland_env_if_sudo() {
                     fixed += 1;
                 }
             }
-            "XDG_SESSION_TYPE" => {
-                if std::env::var("WAYLAND_DISPLAY").is_ok() {
-                    std::env::set_var("XDG_SESSION_TYPE", "wayland");
-                    fixed += 1;
-                }
+            "XDG_SESSION_TYPE" if std::env::var("WAYLAND_DISPLAY").is_ok() => {
+                std::env::set_var("XDG_SESSION_TYPE", "wayland");
+                fixed += 1;
             }
             _ => {}
         }
@@ -188,14 +186,6 @@ impl LinuxDesktopSession {
             Self::Unknown => "unknown",
         }
     }
-
-    pub fn supports_active_window_tracking(self) -> bool {
-        matches!(self, Self::X11)
-    }
-
-    pub fn supports_screenshot_capture(self) -> bool {
-        matches!(self, Self::X11 | Self::Wayland)
-    }
 }
 
 impl LinuxDesktopEnvironment {
@@ -285,7 +275,7 @@ pub fn current_linux_desktop_environment() -> LinuxDesktopEnvironment {
 
 #[cfg(test)]
 mod tests {
-    use super::{detect_linux_desktop_environment, LinuxDesktopEnvironment, LinuxDesktopSession};
+    use super::{detect_linux_desktop_environment, LinuxDesktopEnvironment};
 
     #[test]
     fn xdg_current_desktop应优先识别_gnome() {
@@ -303,11 +293,5 @@ mod tests {
     fn 未命中桌面环境时应回退_unknown() {
         let detected = detect_linux_desktop_environment(Some(""), Some("custom-session"));
         assert_eq!(detected, LinuxDesktopEnvironment::Unknown);
-    }
-
-    #[test]
-    fn x11会话仍应支持活动窗口追踪() {
-        assert!(LinuxDesktopSession::X11.supports_active_window_tracking());
-        assert!(!LinuxDesktopSession::Wayland.supports_active_window_tracking());
     }
 }

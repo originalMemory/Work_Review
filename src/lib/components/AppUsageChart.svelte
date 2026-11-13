@@ -1,17 +1,32 @@
-<script>
+<script lang="ts">
   import { onDestroy } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
-  import { formatDurationLocalized, locale, t } from '$lib/i18n/index.js';
-  import { appIconStore, getIconCacheKey, preloadAppIcons } from '../stores/iconCache.js';
-  import { resolveAppIconSrc } from '../utils/appVisuals.js';
+  import { formatDurationLocalized, locale, t } from '$lib/i18n/index.ts';
+  import {
+    appIconStore,
+    getIconCacheKey,
+    preloadAppIcons,
+    type AppIconCacheState,
+    type AppIconInvoke,
+  } from '../stores/iconCache.ts';
+  import { resolveAppIconSrc } from '../utils/appVisuals.ts';
 
-  export let data = [];
-  export let mode = 'row';
+  interface AppUsageItem {
+    app_name: string;
+    executable_path?: string | null;
+    duration: number;
+    count?: number | null;
+  }
+
+  type AppUsageMode = 'row' | 'column';
+
+  export let data: AppUsageItem[] = [];
+  export let mode: AppUsageMode = 'row';
   export let embedded = false;
 
   // 订阅全局图标缓存
-  let appIcons = {};
-  const unsubIcons = appIconStore.subscribe(v => appIcons = v);
+  let appIcons: AppIconCacheState = {};
+  const unsubIcons = appIconStore.subscribe((value) => appIcons = value);
   onDestroy(() => unsubIcons());
 
   // 展开/收起状态
@@ -20,7 +35,7 @@
   $: currentLocale = $locale;
 
   // 格式化时长
-  function formatDuration(seconds) {
+  function formatDuration(seconds: number): string {
     currentLocale;
     return formatDurationLocalized(seconds, { compact: true });
   }
@@ -31,6 +46,10 @@
     '#ec4899', '#06b6d4', '#84cc16', '#f97316', '#6366f1',
   ];
 
+  const invokeAppIcon: AppIconInvoke = (command, args) => (
+    invoke<string>(command, { ...args })
+  );
+
   // 数据变化时预加载图标
   $: if (data) {
     preloadAppIcons(
@@ -38,7 +57,7 @@
         appName: a.app_name,
         executablePath: a.executable_path,
       })),
-      invoke
+      invokeAppIcon
     );
   }
 
@@ -48,10 +67,10 @@
   $: maxDuration = displayApps.length > 0 ? Math.max(1, ...displayApps.map(a => a.duration || 0)) : 1;
   $: columnShellClass = embedded
     ? 'app-usage-chart__columns app-usage-chart__columns-embedded'
-    : 'app-usage-chart__columns rounded-2xl border border-slate-100 bg-white/90 p-4 dark:border-[#30363d]/60 dark:bg-[#21262d]/70';
+    : 'app-usage-chart__columns rounded-lg border border-slate-100 bg-white/90 p-4 dark:border-[#30363d]/60 dark:bg-[#21262d]/70';
   $: plotClass = embedded
-    ? 'app-usage-chart__plot relative rounded-[22px] bg-slate-50/90 px-3 pb-3 pt-4 dark:bg-[#161b22]/40'
-    : 'app-usage-chart__plot relative rounded-2xl bg-slate-50 px-3 pb-3 pt-4 dark:bg-[#161b22]/40';
+    ? 'app-usage-chart__plot relative rounded-lg bg-slate-50/90 px-3 pb-3 pt-4 dark:bg-[#161b22]/40'
+    : 'app-usage-chart__plot relative rounded-lg bg-slate-50 px-3 pb-3 pt-4 dark:bg-[#161b22]/40';
 </script>
 
 <div class="space-y-2" data-locale={currentLocale}>
@@ -74,9 +93,9 @@
               <div class="mb-2 text-center text-[11px] font-medium whitespace-nowrap tabular-nums text-slate-500 dark:text-[#7d8590]">
                 {formatDuration(app.duration)}
               </div>
-              <div class="mx-auto flex h-32 w-12 items-end rounded-2xl bg-slate-100 p-1 dark:bg-[#30363d]/50">
+              <div class="mx-auto flex h-32 w-12 items-end rounded-lg bg-slate-100 p-1 dark:bg-[#30363d]/50">
                 <div
-                  class="app-usage-chart__bar w-full rounded-2xl transition-all duration-500"
+                  class="app-usage-chart__bar w-full rounded-md transition-all duration-500"
                   style="height: {Math.max((app.duration / maxDuration) * 100, 6)}%; background-color: {colors[i % colors.length]}; opacity: 0.88"
                 ></div>
               </div>

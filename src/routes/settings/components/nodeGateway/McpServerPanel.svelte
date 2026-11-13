@@ -1,21 +1,30 @@
-<script>
-  import { t } from '$lib/i18n/index.js';
+<script lang="ts">
+  import { t } from '$lib/i18n/index.ts';
   import { createEventDispatcher } from 'svelte';
 
-  export let config;
+  interface McpServerConfig {
+    mcp_server_enabled: boolean;
+  }
+
+  interface ToastDetail {
+    message: string;
+    type: 'success' | 'error';
+  }
+
+  export let config: McpServerConfig;
   export let saving = false;
   export let mcpDbPath = '';
   export let mcpConfigPath = '';
   export let mcpConfigJson = '';
 
-  const dispatch = createEventDispatcher();
+  const dispatch = createEventDispatcher<{ save: null; toast: ToastDetail }>();
 
   function toggle() {
     config.mcp_server_enabled = !config.mcp_server_enabled;
     dispatch('save');
   }
 
-  async function copyPath(text, labelKey) {
+  async function copyPath(text: string, labelKey: string): Promise<void> {
     try {
       await navigator.clipboard.writeText(text);
       dispatch('toast', { message: t('nodeGatewayPage.mcpServerPathCopied', { label: t(`nodeGatewayPage.${labelKey}`) }), type: 'success' });
@@ -34,7 +43,7 @@
   }
 </script>
 
-<div class="rounded-2xl border border-slate-200/80 bg-slate-50/90 p-4 space-y-4 dark:border-[#30363d]/80 dark:bg-[#21262d]/40">
+<div class="settings-subsection space-y-4">
   <div class="flex items-center justify-between gap-3">
     <div class="flex items-center gap-2">
       <div class="flex h-7 w-7 items-center justify-center rounded-lg bg-emerald-100 dark:bg-emerald-900/30">

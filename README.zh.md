@@ -216,11 +216,19 @@ Work Review 的核心始终是**本地记录**。AI 的作用是让记录更容�
 | macOS (Apple Silicon / Intel) | `.dmg` |
 | Windows | `.exe` / 便携版 `.zip` |
 | Linux x86_64 (X11 / Wayland) | `.deb` / `.rpm` / `.AppImage` |
-| Linux ARM64 (aarch64) | `.deb` |
+| Linux ARM64 (aarch64) | `.deb` / `.rpm` / `.AppImage` |
 
 **macOS：** 截图需「屏幕录制」权限，桌宠联动需「辅助功能 + 输入监控」。首次提示"已损坏"时：`sudo xattr -rd com.apple.quarantine "/Applications/Work Review.app"`
 
 **Windows：** 依赖 Microsoft Edge WebView2 Runtime。
+
+**Windows 便携模式（`v1.1.4-rc.2` 起提供，#182）：**
+- 便携 ZIP 包含空 `Data` 目录。EXE 同级存在 `Data` 时，数据库、配置、截图和更新设置固定存放于其中，优先于本机自定义目录，不新增设置开关；没有该目录时沿用原有行为。
+- 不自动导入旧数据。已有用户请先备份、完全退出程序，再将完整数据目录复制到 `Data`；移动时一起携带 EXE 和 `Data`。目录不可读写会明确报错，不悄悄回退。
+- 更新需下载便携 ZIP，退出后替换 EXE 并保留原 `Data`，不运行安装版更新器。便携模式不能切换到外部数据目录；退出并备份、移走 `Data` 后可恢复本机原有目录。
+- WebView2 缓存、自启动注册和用户选择的外部导出路径仍由系统管理；`Data` 可能含 API Key，请勿公开分享。
+
+**可通过 [v1.1.4-rc.2 测试版](https://github.com/wm94i/Work-Review/releases/tag/v1.1.4-rc.2) 试用；`v1.1.4-rc.1` 及更早版本不包含这项支持。**
 
 > **Windows 11 智能应用控制**：若系统提示「智能应用控制阻止了程序启动」，是因为本应用使用自签名证书（非 EV 商业证书）。可在「Windows 安全中心 → 应用和浏览器控制 → 智能应用控制」中将其关闭后运行。详见 [#139](https://github.com/wm94i/Work-Review/issues/139)。
 
@@ -240,6 +248,8 @@ sudo zypper install xprintidle tesseract-ocr xdotool xorg-x11-tools gnome-screen
 ```
 
 </details>
+
+AppImage 并非适用于任意 Linux 发行版的万能包。GLIBC 兼容性门禁只检查每个 Linux 发布包内的主程序 ELF，不代表扫描包内所有库或插件。当前允许的 GLIBC 版本上限为 2.35。每次构建的实际要求以发布工作流中的 GLIBC 检测输出为准。
 
 Ubuntu 24.04 / 24.10 Wayland (GNOME 46–47) 用户如遇截图闪屏/快门声问题，可使用一键安装脚本自动修复：
 
@@ -280,7 +290,7 @@ GDK_BACKEND=x11 ./Work_Review
 <details>
 <summary>Bot 联动（Telegram / 飞书 / 钉钉 / 企业微信）</summary>
 
-通过本地 API + 多设备注册，从 Telegram / 飞书 / 钉钉 / 企业微信远程查询记录与生成日报。支持命令：`/devices`、`/report`、`/generate` 等。仅限个人和本人多设备联动使用。
+通过本地 API + 多设备注册，从 Telegram / 飞书 / 钉钉 / 企业微信远程查询记录与生成日报。支持命令：`/devices`、`/report`、`/generate` 等。企业微信优先使用智能机器人长连接（Bot ID + Secret，无需公网）；同一机器人同时只能保持一条长连接。仅限个人和本人多设备联动使用。
 
 </details>
 
@@ -322,6 +332,9 @@ Authorization: Bearer <token>
 | GET | `/v1/hourly-app-breakdown/{date}` | 按小时应用分布 |
 | GET | `/v1/weekly-review` | 周报（`?date_from=&date_to=&limit=`） |
 | GET | `/v1/storage/stats` | 存储统计 |
+| POST | `/v1/screenshots/capture` | 立即截取当前活动界面并返回 JPEG Base64（需已启用截图） |
+
+截图响应包含 `capturedAt`、`width`、`height`、`mimeType`、`imageBase64` 和相对于数据目录的 `relativePath`。该接口会绕过定时截图间隔，但不会绕过截图隐私开关，也不会自动上传图像。
 
 ### 示例
 
@@ -372,7 +385,7 @@ npm run tauri:dev    # 开发
 npm run tauri:build  # 构建
 ```
 
-要求：Node.js 18+ / Rust stable / Tauri 2 CLI · 技术栈：Tauri 2 + Rust + Svelte 4 + SQLite
+要求：Node.js 22+ / Rust stable / Tauri 2 CLI · 技术栈：Tauri 2 + Rust + Svelte 4 + SQLite
 
 ---
 
@@ -415,8 +428,8 @@ npm run tauri:build  # 构建
 
 <a href="https://www.star-history.com/#wm94i/Work-Review&Date">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=wm94i/Work-Review&type=Date&theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=wm94i/Work-Review&type=Date" />
-    <img alt="Star History" src="https://api.star-history.com/svg?repos=wm94i/Work-Review&type=Date" width="720" />
+    <source media="(prefers-color-scheme: dark)" srcset="docs/star-history-dark.svg" />
+    <source media="(prefers-color-scheme: light)" srcset="docs/star-history.svg" />
+    <img alt="Star History" src="docs/star-history.svg" width="720" />
   </picture>
 </a>

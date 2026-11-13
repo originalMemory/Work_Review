@@ -1,5 +1,6 @@
 use crate::error::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
@@ -125,19 +126,19 @@ impl AiProvider {
     pub fn default_model(&self) -> &'static str {
         match self {
             AiProvider::Ollama => "qwen3",
-            AiProvider::OpenAI => "gpt-5.4",
-            AiProvider::Gemini => "gemini-3-flash",
-            AiProvider::Claude => "claude-sonnet-4-6",
+            AiProvider::OpenAI => "gpt-6-luna",
+            AiProvider::Gemini => "gemini-3.8-flash",
+            AiProvider::Claude => "claude-sonnet-5-5",
             AiProvider::SiliconFlow => "Qwen/Qwen3-8B",
             AiProvider::DeepSeek => "deepseek-chat",
             AiProvider::Qwen => "qwen-flash",
-            AiProvider::Zhipu => "glm-5-turbo",
-            AiProvider::Moonshot => "moonshot-v1-8k",
-            AiProvider::Doubao => "doubao-lite-4k",
-            AiProvider::MiniMax => "MiniMax-M2.5",
+            AiProvider::Zhipu => "glm-5.3-flash",
+            AiProvider::Moonshot => "kimi-k2.6",
+            AiProvider::Doubao => "doubao-seed-evolving",
+            AiProvider::MiniMax => "MiniMax-M3",
             AiProvider::OpenRouter => "openrouter/auto",
-            AiProvider::Groq => "llama-3.3-70b-versatile",
-            AiProvider::XAI => "grok-2-latest",
+            AiProvider::Groq => "openai/gpt-oss-120b",
+            AiProvider::XAI => "grok-4.7",
             AiProvider::Mistral => "mistral-small-latest",
             AiProvider::LmStudio => "local-model",
             AiProvider::Custom => "",
@@ -191,6 +192,15 @@ pub struct ModelConfig {
     pub api_key: Option<String>,
     /// 模型名称
     pub model: String,
+    /// 思考模式：None=跟随服务端，Some(true/false)=显式开关
+    #[serde(default)]
+    pub enable_thinking: Option<bool>,
+    /// 思考 token 预算；0 或空表示不发送
+    #[serde(default)]
+    pub thinking_budget: Option<u32>,
+    /// 最大输出 token；0 或空表示使用链路默认值
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
 }
 
 impl ModelConfig {
@@ -202,6 +212,9 @@ impl ModelConfig {
             endpoint: AiProvider::Ollama.default_endpoint().to_string(),
             api_key: None,
             model: String::new(), // 默认为空，用户需手动填写
+            enable_thinking: None,
+            thinking_budget: None,
+            max_output_tokens: None,
         }
     }
 
@@ -212,6 +225,9 @@ impl ModelConfig {
             endpoint: AiProvider::Ollama.default_endpoint().to_string(),
             api_key: None,
             model: "llava".to_string(),
+            enable_thinking: None,
+            thinking_budget: None,
+            max_output_tokens: None,
         }
     }
 }
@@ -445,16 +461,30 @@ impl PrivacyConfig {
             .any(|k| title_lower.contains(&k.to_lowercase()))
     }
 
-    /// 从 URL 中提取域名
+    /// 从完整 URL 或裸域名（可带端口）提取小写主机名，保留 www 和子域。
+    /// 无法解析或没有主机时返回空字符串，供调用者跳过匹配或分类。
     pub fn extract_domain(url: &str) -> String {
-        let without_protocol = url
-            .trim_start_matches("https://")
-            .trim_start_matches("http://");
-        without_protocol
-            .split('/')
-            .next()
-            .unwrap_or("")
-            .to_lowercase()
+        let url = url.trim();
+        let has_scheme = url
+            .split_once("://")
+            .is_some_and(|(scheme, _)| !scheme.contains(['/', '?', '#']));
+        let parsed = if has_scheme {
+            reqwest::Url::parse(url)
+        } else {
+            // 裸域名不接受相对路径或用户信息，避免被补全为另一个主机。
+            let authority = url.split(['/', '?', '#']).next().unwrap_or("");
+            if url.starts_with(['/', '\\']) || authority.contains('@') {
+                return String::new();
+            }
+            reqwest::Url::parse(&format!("https://{url}"))
+        };
+        parsed
+            .ok()
+            .and_then(|url| {
+                url.host_str()
+                    .map(|host| host.trim_end_matches('.').to_lowercase())
+            })
+            .unwrap_or_default()
     }
 
     /// 后缀匹配域名：domain == pattern 或 domain 以 .pattern 结尾
@@ -544,8 +574,11 @@ pub enum ScreenshotWidthMode {
 pub struct StorageConfig {
     /// 截图保留天数（超过后删除截图文件）
     pub screenshot_retention_days: u32,
-    /// 元数据保留天数（超过后删除数据库记录）
+    /// 元数据保留天数，0 表示永久保留；仅在显式开启自动清理后生效。
     pub metadata_retention_days: u32,
+    /// 旧版本未执行元数据清理，升级后默认关闭，避免按旧默认天数误删历史。
+    #[serde(default)]
+    pub metadata_cleanup_enabled: bool,
     /// 存储空间上限（MB），超过后自动清理最旧的数据
     pub storage_limit_mb: u32,
     /// JPEG 质量 (1-100)
@@ -571,10 +604,11 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             screenshot_retention_days: 7, // 默认保留7天截图
-            metadata_retention_days: 30,  // 默认保留30天元数据
-            storage_limit_mb: 2048,       // 默认2GB上限
-            jpeg_quality: 85,             // 85%质量，更清晰
-            max_image_width: 1280,        // 最大宽度1280px
+            metadata_retention_days: 30,  // 启用自动清理后的默认保留天数
+            metadata_cleanup_enabled: false,
+            storage_limit_mb: 2048, // 默认2GB上限
+            jpeg_quality: 85,       // 85%质量，更清晰
+            max_image_width: 1280,  // 最大宽度1280px
             screenshots_enabled: true,
             screenshot_display_mode: ScreenshotDisplayMode::ActiveWindow,
             screenshot_width_mode: ScreenshotWidthMode::Auto,
@@ -640,6 +674,9 @@ pub struct RemoteStorageConfig {
     pub s3: S3Config,
     #[serde(default)]
     pub webdav: WebDavConfig,
+    /// 将常用应用配置同步到 WebDAV（最后写入获胜）。本机端口、窗口位置等不覆盖。
+    #[serde(default)]
+    pub sync_app_config: bool,
 }
 
 /// 跨设备同步时的截图传输策略。
@@ -1013,9 +1050,18 @@ pub struct AppConfig {
     /// 文本模型配置
     #[serde(default = "ModelConfig::default_text")]
     pub text_model: ModelConfig,
+    /// 助手整次请求绝对超时（秒）
+    #[serde(default = "default_assistant_timeout_secs")]
+    pub assistant_timeout_secs: u64,
+    /// 日报生成外层超时（秒）
+    #[serde(default = "default_report_generation_timeout_secs")]
+    pub report_generation_timeout_secs: u64,
     /// 可保存的文本模型档案
     #[serde(default)]
     pub text_model_profiles: Vec<TextModelProfile>,
+    /// 各服务商的模型配置快照（key 为 provider id；切换服务商时保留各家的地址/模型/Key，随配置一起保存）
+    #[serde(default)]
+    pub text_model_provider_cache: HashMap<String, ModelConfig>,
     /// 视觉模型配置
     #[serde(default = "ModelConfig::default_vision")]
     pub vision_model: ModelConfig,
@@ -1055,6 +1101,9 @@ pub struct AppConfig {
     /// 空闲检测豁免应用；名称与活动记录中的 app_name 精确匹配
     #[serde(default)]
     pub idle_exempt_app_names: Vec<String>,
+    /// 最近一次成功参与 WebDAV 配置同步的时间戳（毫秒）。0 表示从未同步。
+    #[serde(default)]
+    pub config_synced_at: u64,
     /// 日报附加提示词
     #[serde(default)]
     pub daily_report_custom_prompt: String,
@@ -1136,6 +1185,12 @@ pub struct AppConfig {
     /// 企业微信 EncodingAESKey
     #[serde(default)]
     pub wecom_encoding_aes_key: Option<String>,
+    /// 企业微信智能机器人 Bot ID（长连接）
+    #[serde(default)]
+    pub wecom_bot_id: Option<String>,
+    /// 企业微信智能机器人 Secret（长连接）
+    #[serde(default)]
+    pub wecom_bot_secret: Option<String>,
     /// 是否启用钉钉 Bot
     #[serde(default)]
     pub dingtalk_bot_enabled: bool,
@@ -1167,6 +1222,9 @@ pub struct AppConfig {
     /// 界面风格: a=Quiet Pro, b=当前柔和层次, c=Compact Data
     #[serde(default = "default_ui_visual_style")]
     pub ui_visual_style: String,
+    /// 日报编辑字体；空字符串使用界面字体，未安装的字体由前端回退。
+    #[serde(default)]
+    pub report_editor_font: String,
     /// 上班开始时间（0-23）
     #[serde(default = "default_work_start")]
     pub work_start_hour: u8,
@@ -1226,6 +1284,9 @@ pub struct AppConfig {
     /// 上次记忆合成日期（防同天重复）
     #[serde(default)]
     pub memory_last_synthesis_date: Option<String>,
+    /// 助手显式长期记忆开关。默认关闭，关闭不会删除已保存的记忆。
+    #[serde(default)]
+    pub assistant_memory_enabled: bool,
     /// 助手联网能力总开关（隐私默认关：开启后问题可能发给搜索服务商/目标网站）
     #[serde(default)]
     pub assistant_web_access_enabled: bool,
@@ -1359,6 +1420,21 @@ fn default_avatar_persona() -> String {
 fn default_ui_visual_style() -> String {
     "c".to_string()
 }
+pub fn default_assistant_timeout_secs() -> u64 {
+    120
+}
+pub fn default_report_generation_timeout_secs() -> u64 {
+    300
+}
+fn normalize_assistant_timeout_secs(value: u64) -> u64 {
+    value.clamp(30, 900)
+}
+fn normalize_report_generation_timeout_secs(value: u64) -> u64 {
+    value.clamp(60, 1800)
+}
+fn normalize_positive_token(value: Option<u32>) -> Option<u32> {
+    value.filter(|n| *n > 0)
+}
 
 impl Default for AppConfig {
     fn default() -> Self {
@@ -1368,7 +1444,10 @@ impl Default for AppConfig {
             idle_threshold_minutes: default_idle_threshold_minutes(),
             ai_mode: AiMode::Local,
             text_model: ModelConfig::default_text(),
+            assistant_timeout_secs: default_assistant_timeout_secs(),
+            report_generation_timeout_secs: default_report_generation_timeout_secs(),
             text_model_profiles: Vec::new(),
+            text_model_provider_cache: HashMap::new(),
             vision_model: ModelConfig::default_vision(),
             privacy: PrivacyConfig::default(),
             app_category_rules: Vec::new(),
@@ -1382,6 +1461,7 @@ impl Default for AppConfig {
             sync: SyncConfig::default(),
             ui_selected_device_id: None,
             idle_exempt_app_names: Vec::new(),
+            config_synced_at: 0,
             daily_report_custom_prompt: String::new(),
             daily_report_prompt_presets: Vec::new(),
             daily_report_system_prompt_override: None,
@@ -1409,6 +1489,8 @@ impl Default for AppConfig {
             wecom_corp_id: None,
             wecom_token: None,
             wecom_encoding_aes_key: None,
+            wecom_bot_id: None,
+            wecom_bot_secret: None,
             dingtalk_bot_enabled: false,
             dingtalk_app_secret: None,
             mcp_server_enabled: false,
@@ -1420,6 +1502,7 @@ impl Default for AppConfig {
             last_app_version: None,
             theme: "system".to_string(),
             ui_visual_style: default_ui_visual_style(),
+            report_editor_font: String::new(),
             work_start_hour: 9,
             work_end_hour: 18,
             work_start_minute: 0,
@@ -1445,7 +1528,7 @@ impl Default for AppConfig {
             ollama_host: "http://localhost:11434".to_string(),
             ollama_model: "llava".to_string(),
             openai_api_key: None,
-            openai_model: "gpt-5.4".to_string(),
+            openai_model: "gpt-6-luna".to_string(),
             hide_dock_icon: false,
             lightweight_mode: false,
             break_reminder_enabled: false,
@@ -1454,6 +1537,7 @@ impl Default for AppConfig {
             goal_notifications: false,
             memory_enabled: false,
             memory_last_synthesis_date: None,
+            assistant_memory_enabled: false,
             assistant_web_access_enabled: false,
             assistant_search_provider: default_assistant_search_provider(),
             assistant_search_api_key: None,
@@ -1482,6 +1566,59 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
+    /// 应用远端同步快照，保留本机专属字段（端口、窗口位置、自启、导出目录等）。
+    pub fn apply_synced_remote(&mut self, remote: AppConfig) {
+        let localhost_api_enabled = self.localhost_api_enabled;
+        let localhost_api_host = self.localhost_api_host.clone();
+        let localhost_api_port = self.localhost_api_port;
+        let auto_start = self.auto_start;
+        let auto_start_silent = self.auto_start_silent;
+        let macos_screen_capture_permission_prompted =
+            self.macos_screen_capture_permission_prompted;
+        let last_app_version = self.last_app_version.clone();
+        let daily_report_export_dir = self.daily_report_export_dir.clone();
+        let node_gateway = self.node_gateway.clone();
+        let avatar_x = self.avatar_x;
+        let avatar_y = self.avatar_y;
+        let telegram_bot_bind_code = self.telegram_bot_bind_code.clone();
+        let telegram_bot_bind_code_expires_at = self.telegram_bot_bind_code_expires_at;
+        let background_image = self.background_image.clone();
+        let metadata_retention = (
+            self.storage.metadata_cleanup_enabled,
+            self.storage.metadata_retention_days,
+        );
+
+        let sync = self.sync.clone();
+        let ui_selected_device_id = self.ui_selected_device_id.clone();
+        let idle_exempt_app_names = self.idle_exempt_app_names.clone();
+
+        *self = remote;
+
+        self.sync = sync;
+        self.ui_selected_device_id = ui_selected_device_id;
+        self.idle_exempt_app_names = idle_exempt_app_names;
+
+        self.localhost_api_enabled = localhost_api_enabled;
+        self.localhost_api_host = localhost_api_host;
+        self.localhost_api_port = localhost_api_port;
+        self.auto_start = auto_start;
+        self.auto_start_silent = auto_start_silent;
+        self.macos_screen_capture_permission_prompted = macos_screen_capture_permission_prompted;
+        self.last_app_version = last_app_version;
+        self.daily_report_export_dir = daily_report_export_dir;
+        self.node_gateway = node_gateway;
+        self.avatar_x = avatar_x;
+        self.avatar_y = avatar_y;
+        self.telegram_bot_bind_code = telegram_bot_bind_code;
+        self.telegram_bot_bind_code_expires_at = telegram_bot_bind_code_expires_at;
+        self.background_image = background_image;
+        // 自动删除授权与期限属于本机，远端同步不得开启或缩短本机保留策略。
+        (
+            self.storage.metadata_cleanup_enabled,
+            self.storage.metadata_retention_days,
+        ) = metadata_retention;
+    }
+
     /// 规范化配置，兼容旧字段并补齐助手可用的文本模型档案
     pub fn normalize(&mut self) {
         self.migrate_legacy_config();
@@ -1512,12 +1649,25 @@ impl AppConfig {
         self.break_reminder_interval_minutes =
             normalize_break_reminder_interval_minutes(self.break_reminder_interval_minutes);
         self.standard_work_hours = self.standard_work_hours.clamp(1.0, 24.0);
+        self.assistant_timeout_secs = normalize_assistant_timeout_secs(self.assistant_timeout_secs);
+        self.report_generation_timeout_secs =
+            normalize_report_generation_timeout_secs(self.report_generation_timeout_secs);
+        self.text_model.thinking_budget = normalize_positive_token(self.text_model.thinking_budget);
+        self.text_model.max_output_tokens =
+            normalize_positive_token(self.text_model.max_output_tokens);
+        if self.text_model.enable_thinking == Some(true)
+            && self.text_model.thinking_budget == Some(0)
+        {
+            self.text_model.thinking_budget = None;
+        }
         self.daily_report_custom_prompt = self.daily_report_custom_prompt.trim().to_string();
         normalize_prompt_presets(&mut self.daily_report_prompt_presets);
         self.daily_report_export_dir =
             normalize_optional_string(self.daily_report_export_dir.take());
         self.localhost_api_port = normalize_localhost_api_port(self.localhost_api_port);
         self.localhost_api_host = normalize_optional_string(self.localhost_api_host.take());
+        self.wecom_bot_id = normalize_optional_string(self.wecom_bot_id.take());
+        self.wecom_bot_secret = normalize_optional_string(self.wecom_bot_secret.take());
         self.telegram_bot_bind_code = normalize_optional_string(self.telegram_bot_bind_code.take())
             .map(|code| code.to_ascii_uppercase());
         if self.telegram_bot_bind_code.is_none() {
@@ -1698,6 +1848,9 @@ impl AppConfig {
                 endpoint: self.ai_provider.endpoint.clone(),
                 api_key: self.ai_provider.api_key.clone(),
                 model: self.ai_provider.model.clone(),
+                enable_thinking: None,
+                thinking_budget: None,
+                max_output_tokens: None,
             };
         }
 
@@ -1708,6 +1861,9 @@ impl AppConfig {
                     endpoint: self.ai_provider.endpoint.clone(),
                     api_key: self.ai_provider.api_key.clone(),
                     model: vision_model.clone(),
+                    enable_thinking: None,
+                    thinking_budget: None,
+                    max_output_tokens: None,
                 };
             }
         }
@@ -1810,6 +1966,9 @@ fn same_model_config(left: &ModelConfig, right: &ModelConfig) -> bool {
         && left.model.trim() == right.model.trim()
         && left.api_key.as_deref().unwrap_or("").trim()
             == right.api_key.as_deref().unwrap_or("").trim()
+        && left.enable_thinking == right.enable_thinking
+        && left.thinking_budget == right.thinking_budget
+        && left.max_output_tokens == right.max_output_tokens
 }
 
 fn default_profile_name(model_config: &ModelConfig) -> String {
@@ -2175,11 +2334,79 @@ mod tests {
     use std::io::{self, Write};
     use std::path::PathBuf;
 
+    #[test]
+    fn privacy_extract_domain_normalizes_hosts() {
+        for (input, expected) in [
+            ("https://example.com/path", "example.com"),
+            ("https://example.com:8443/path", "example.com"),
+            (
+                " HTTPS://Sub.Example.COM:8443?query=1#fragment ",
+                "sub.example.com",
+            ),
+            ("example.com", "example.com"),
+            ("Example.COM:8443/path?query=1#fragment", "example.com"),
+            ("example.com?query=1", "example.com"),
+            ("example.com#fragment", "example.com"),
+            (
+                "example.com?next=https://other.com&email=a@b.com",
+                "example.com",
+            ),
+            ("https://WWW.Example.com:8443", "www.example.com"),
+            ("https://Sub.Example.com.:8443/path", "sub.example.com"),
+            ("http://localhost:5173/app", "localhost"),
+            ("127.0.0.1:8080", "127.0.0.1"),
+            ("https://[::1]:8443/path", "[::1]"),
+            ("", ""),
+            ("   ", ""),
+            ("not a host", ""),
+            ("https://", ""),
+            ("https://example.com:invalid/path", ""),
+            ("example.com:99999", ""),
+            ("/example.com/path", ""),
+            ("mailto:user@example.com", ""),
+            ("about:blank", ""),
+            ("file:///tmp/example.com", ""),
+        ] {
+            assert_eq!(
+                super::PrivacyConfig::extract_domain(input),
+                expected,
+                "{input:?}"
+            );
+        }
+    }
+
     fn unique_temp_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "work-review-config-{name}-{}",
             uuid::Uuid::new_v4()
         ))
+    }
+
+    #[test]
+    fn 元数据自动清理须兼容旧配置且不得经远端同步开启() {
+        let mut legacy = serde_json::to_value(AppConfig::default()).unwrap();
+        legacy["storage"]
+            .as_object_mut()
+            .unwrap()
+            .remove("metadata_cleanup_enabled");
+        let mut local: AppConfig = serde_json::from_value(legacy).unwrap();
+        assert!(!local.storage.metadata_cleanup_enabled);
+        assert_eq!(local.storage.metadata_retention_days, 30);
+        let mut remote = AppConfig::default();
+        remote.storage.metadata_cleanup_enabled = true;
+        remote.storage.metadata_retention_days = 1;
+        local.apply_synced_remote(remote);
+        assert!(!local.storage.metadata_cleanup_enabled);
+        assert_eq!(local.storage.metadata_retention_days, 30);
+        local.storage.metadata_cleanup_enabled = true;
+        local.storage.metadata_retention_days = 90;
+        let restored: AppConfig =
+            serde_json::from_value(serde_json::to_value(&local).unwrap()).unwrap();
+        assert!(restored.storage.metadata_cleanup_enabled);
+        assert_eq!(restored.storage.metadata_retention_days, 90);
+        local.apply_synced_remote(AppConfig::default());
+        assert!(local.storage.metadata_cleanup_enabled);
+        assert_eq!(local.storage.metadata_retention_days, 90);
     }
 
     #[test]
@@ -2191,6 +2418,120 @@ mod tests {
         assert_eq!(result.status, ConfigLoadStatus::Missing);
         assert!(!result.status.requires_fail_safe());
         assert!(result.status.allows_automatic_save());
+    }
+
+    #[test]
+    fn 服务商缓存字段应兼容旧配置文件并完整往返() {
+        // 模拟旧版配置文件：序列化默认配置后移除新字段再反序列化
+        let mut legacy = serde_json::to_value(AppConfig::default()).unwrap();
+        assert!(legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("text_model_provider_cache")
+            .is_some());
+        let old: AppConfig = serde_json::from_value(legacy).expect("旧配置缺少缓存字段时应可解析");
+        assert!(old.text_model_provider_cache.is_empty());
+
+        // 各家服务商的配置（含 API Key）应无损往返
+        let mut config = AppConfig::default();
+        config.text_model_provider_cache.insert(
+            "deepseek".to_string(),
+            super::ModelConfig {
+                provider: AiProvider::DeepSeek,
+                endpoint: "https://api.deepseek.com".to_string(),
+                api_key: Some("sk-test".to_string()),
+                model: "deepseek-chat".to_string(),
+                ..super::ModelConfig::default_text()
+            },
+        );
+        let round: AppConfig =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert_eq!(
+            round
+                .text_model_provider_cache
+                .get("deepseek")
+                .and_then(|m| m.api_key.as_deref()),
+            Some("sk-test")
+        );
+    }
+
+    #[test]
+    fn 应用远端同步快照时应保留本机端口与窗口位置() {
+        let mut local = AppConfig::default();
+        local.localhost_api_port = 12345;
+        local.avatar_x = Some(40);
+        local.locale = "zh-CN".to_string();
+        let mut remote = AppConfig::default();
+        remote.localhost_api_port = 47831;
+        remote.avatar_x = Some(9);
+        remote.locale = "en".to_string();
+        remote.assistant_timeout_secs = 180;
+        local.apply_synced_remote(remote);
+        assert_eq!(local.localhost_api_port, 12345);
+        assert_eq!(local.avatar_x, Some(40));
+        assert_eq!(local.locale, "en");
+        assert_eq!(local.assistant_timeout_secs, 180);
+    }
+
+    #[test]
+    fn 旧配置缺少超时与思考字段时应使用默认值() {
+        let mut legacy = serde_json::to_value(AppConfig::default()).unwrap();
+        let object = legacy.as_object_mut().unwrap();
+        assert!(object.remove("assistant_timeout_secs").is_some());
+        assert!(object.remove("report_generation_timeout_secs").is_some());
+        let text_model = object
+            .get_mut("text_model")
+            .unwrap()
+            .as_object_mut()
+            .unwrap();
+        text_model.remove("enable_thinking");
+        text_model.remove("thinking_budget");
+        text_model.remove("max_output_tokens");
+        let old: AppConfig =
+            serde_json::from_value(legacy).expect("旧配置缺少超时与思考字段时应可解析");
+        assert_eq!(old.assistant_timeout_secs, 120);
+        assert_eq!(old.report_generation_timeout_secs, 300);
+        assert_eq!(old.text_model.enable_thinking, None);
+        assert_eq!(old.text_model.thinking_budget, None);
+        assert_eq!(old.text_model.max_output_tokens, None);
+    }
+
+    #[test]
+    fn 超时与思考预算应规范化到合法范围() {
+        let mut config = AppConfig::default();
+        config.assistant_timeout_secs = 1;
+        config.report_generation_timeout_secs = 10_000;
+        config.text_model.thinking_budget = Some(0);
+        config.text_model.max_output_tokens = Some(0);
+        config.normalize();
+        assert_eq!(config.assistant_timeout_secs, 30);
+        assert_eq!(config.report_generation_timeout_secs, 1800);
+        assert_eq!(config.text_model.thinking_budget, None);
+        assert_eq!(config.text_model.max_output_tokens, None);
+    }
+
+    #[test]
+    fn 旧配置缺少企微长连接字段时应可解析() {
+        let mut legacy = serde_json::to_value(AppConfig::default()).unwrap();
+        let object = legacy.as_object_mut().unwrap();
+        assert!(object.remove("wecom_bot_id").is_some());
+        assert!(object.remove("wecom_bot_secret").is_some());
+        let old: AppConfig =
+            serde_json::from_value(legacy).expect("旧配置缺少企微长连接字段时应可解析");
+        assert_eq!(old.wecom_bot_id, None);
+        assert_eq!(old.wecom_bot_secret, None);
+    }
+
+    #[test]
+    fn 配置规范化应清理企微长连接空白凭证() {
+        let mut config = AppConfig {
+            wecom_bot_id: Some("  bot-id  ".to_string()),
+            wecom_bot_secret: Some("   ".to_string()),
+            ..AppConfig::default()
+        };
+        config.normalize();
+        assert_eq!(config.wecom_bot_id.as_deref(), Some("bot-id"));
+        assert_eq!(config.wecom_bot_secret, None);
     }
 
     #[test]
@@ -2641,6 +2982,19 @@ mod tests {
     }
 
     #[test]
+    fn 日报编辑字体兼容旧配置且保存后保留选择() {
+        let mut json = serde_json::to_value(AppConfig::default()).unwrap();
+        assert_eq!(json["report_editor_font"], "");
+        json.as_object_mut().unwrap().remove("report_editor_font");
+        let mut config: AppConfig = serde_json::from_value(json).unwrap();
+        assert!(config.report_editor_font.is_empty());
+        config.report_editor_font = "Microsoft YaHei".into();
+        let saved = serde_json::to_string(&config).unwrap();
+        let loaded: AppConfig = serde_json::from_str(&saved).unwrap();
+        assert_eq!(loaded.report_editor_font, "Microsoft YaHei");
+    }
+
+    #[test]
     fn 桌宠默认位置应为空以便首次按锚点吸附() {
         let config = AppConfig::default();
 
@@ -2653,6 +3007,13 @@ mod tests {
         let config = AppConfig::default();
 
         assert!(!config.lightweight_mode);
+    }
+
+    #[test]
+    fn 助手长期记忆默认应关闭() {
+        let config = AppConfig::default();
+
+        assert!(!config.assistant_memory_enabled);
     }
 
     #[test]
@@ -2709,7 +3070,7 @@ mod tests {
             AiProvider::MiniMax.default_endpoint(),
             "https://api.minimaxi.com/v1"
         );
-        assert_eq!(AiProvider::MiniMax.default_model(), "MiniMax-M2.5");
+        assert_eq!(AiProvider::MiniMax.default_model(), "MiniMax-M3");
     }
 
     #[test]
@@ -2916,5 +3277,18 @@ mod tests {
 
         assert_eq!(config.node_gateway.device_name, None);
         assert_eq!(config.node_gateway.device_name, None);
+    }
+    #[test]
+    fn 远端配置不得覆盖本机同步身份游标与空闲豁免() {
+        let mut local = AppConfig::default();
+        local.sync.device_id = "device-a".to_string();
+        local.sync.activity_push_cursor = 123;
+        local.ui_selected_device_id = Some("device-b".to_string());
+        local.idle_exempt_app_names = vec!["IINA".to_string()];
+        local.apply_synced_remote(AppConfig::default());
+        assert_eq!(local.sync.device_id, "device-a");
+        assert_eq!(local.sync.activity_push_cursor, 123);
+        assert_eq!(local.ui_selected_device_id.as_deref(), Some("device-b"));
+        assert_eq!(local.idle_exempt_app_names, vec!["IINA"]);
     }
 }

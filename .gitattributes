@@ -1,0 +1,31 @@
+# 强制源码与配置文件使用 LF 换行。
+# 历史背景：rustPlatformCompatibility / releaseWorkflow 等测试用跨行正则
+# 匹配 Rust/CI 源码，Windows runner 默认 core.autocrlf 会把文本文件转成 CRLF，
+# 导致正则失配、Release workflow 的 Windows job 一直失败。
+# 统一 LF 后，本地与各平台 CI 的文件内容完全一致。
+
+*.ts text eol=lf
+*.tsx text eol=lf
+*.js text eol=lf
+*.mjs text eol=lf
+*.rs text eol=lf
+*.svelte text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.json text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+*.sh text eol=lf
+
+# 二进制资源：禁止 git 做任何换行或内容转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.icns binary
+*.svg binary
+*.flac binary
+*.plist binary

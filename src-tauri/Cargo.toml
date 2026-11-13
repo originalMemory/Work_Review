@@ -1,6 +1,6 @@
 [package]
 name = "work-review"
-version = "1.1.0"
+version = "1.1.4-rc.2"
 description = "个人工作回顾与AI日报助手"
 authors = ["WorkReview Team"]
 edition = "2021"
@@ -25,7 +25,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # 数据库
-rusqlite = { version = "0.30", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 base64 = "0.21"
 
 # HTTP 客户端
@@ -54,7 +54,8 @@ image = "0.25.9"
 tauri-plugin-dialog = "2"
 tauri-plugin-shell = "2"
 tauri-plugin-fs = "2"
-tauri-plugin-updater = "2.10.0"
+tauri-plugin-updater = { version = "2.10.0", default-features = false, features = ["rustls-tls"] }
+semver = "1.0"
 tauri-plugin-process = "2.3.1"
 auto-launch = "0.6.0"
 
@@ -66,14 +67,16 @@ hex = "0.4"
 # 常量时间比较（防签名时序侧信道）
 subtle = "2.5"
 
-# 企业微信 AES 加解密
+# 企业微信 AES 加解密 / 智能机器人长连接
 aes = "0.8"
 cbc = "0.1"
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 
 # 平台特定依赖 - Windows
 [target.'cfg(windows)'.dependencies]
 windows-capture = "1.5"
-winapi = { version = "0.3", features = ["winuser", "processthreadsapi", "tlhelp32", "psapi", "handleapi", "winnt", "winbase", "sysinfoapi", "wingdi", "libloaderapi", "shellapi", "commctrl", "commoncontrols"] }
+winapi = { version = "0.3", features = ["winuser", "processthreadsapi", "tlhelp32", "psapi", "handleapi", "winnt", "winbase", "sysinfoapi", "wingdi", "libloaderapi", "shellapi", "commctrl", "commoncontrols", "powerbase", "powersetting", "dwmapi"] }
 uiautomation = "0.24"
 
 # 平台特定依赖 - macOS

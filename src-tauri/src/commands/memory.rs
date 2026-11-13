@@ -1,10 +1,12 @@
 //! Auto-extracted from the historical `commands.rs`. Behavior unchanged.
 
-use crate::error::AppError;
-use crate::work_intelligence::{generate_weekly_review as build_weekly_review, WeeklyReviewResult};
 use crate::AppState;
 use std::sync::{Arc, Mutex};
 use tauri::State;
+use work_review_core::error::AppError;
+use work_review_core::work_intelligence::{
+    generate_weekly_review as build_weekly_review, WeeklyReviewResult,
+};
 
 use super::shared::load_filtered_activities_in_range;
 

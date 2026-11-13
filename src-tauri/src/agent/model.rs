@@ -1,21 +1,21 @@
-//! Stage 2: Model 层 — Agent 的"嘴巴"
+//! Agent 模型适配层
 //!
 //! 职责：把统一的消息格式翻译成各家 API 的请求格式，
 //!       把各家 API 的响应翻译回统一格式。
-//!
-//! 对应 Python: 02_model.py 里的 Message/ToolCall/LlmResponse/Provider
 
-use crate::config::{AiProvider, ModelConfig};
-use crate::error::AppError;
+use super::deadline::Deadline;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use work_review_core::config::{AiProvider, ModelConfig};
+use work_review_core::error::AppError;
+use work_review_core::generation_params;
 
-/// 非流式共享 HTTP 客户端（整体 60s / 连接 10s 超时）。
+/// 非流式共享 HTTP 客户端（连接 10s；完整请求受调用方绝对 deadline 限制）。
 /// 进程内复用连接池，避免每次模型调用都重建客户端与 TLS 连接。
 static CHAT_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-/// 流式共享 HTTP 客户端：只限连接超时，读取由逐块 idle + 总时长双护栏控制。
+/// 流式共享 HTTP 客户端：连接 10s；请求 deadline + 逐块 idle 双护栏。
 static STREAM_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 fn chat_client() -> Result<&'static reqwest::Client, AppError> {
@@ -23,7 +23,6 @@ fn chat_client() -> Result<&'static reqwest::Client, AppError> {
         return Ok(client);
     }
     let built = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
         .connect_timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| AppError::Unknown(e.to_string()))?;
@@ -41,16 +40,40 @@ fn stream_client() -> Result<&'static reqwest::Client, AppError> {
     Ok(STREAM_CLIENT.get_or_init(|| built))
 }
 
+async fn send_until(
+    request: reqwest::RequestBuilder,
+    deadline: Deadline,
+) -> Result<reqwest::Response, AppError> {
+    if deadline.is_expired() {
+        return Err(AppError::Analysis("助手请求已超时".to_string()));
+    }
+    // reqwest 请求级 timeout 从连接持续到响应体读完，不止响应头。
+    // 每次发送（含重试/回退）只用同一绝对 deadline 的剩余时间，覆盖 json/text/error body。
+    let request = request.timeout(deadline.remaining());
+    tokio::time::timeout(deadline.remaining(), request.send())
+        .await
+        .map_err(|_| AppError::Analysis("等待模型响应头超时".to_string()))?
+        .map_err(|e| AppError::Unknown(e.to_string()))
+}
+
 /// 非流式请求发送：命中 429/5xx 时等待 2 秒重试一次（流式路径不重试）。
-async fn send_with_retry(request: reqwest::RequestBuilder) -> Result<reqwest::Response, AppError> {
+/// 重试等待与第二次发送都消费同一 deadline。
+async fn send_with_retry(
+    request: reqwest::RequestBuilder,
+    deadline: Deadline,
+) -> Result<reqwest::Response, AppError> {
     let retry = request.try_clone();
-    let response = request.send().await?;
+    let response = send_until(request, deadline).await?;
     let status = response.status();
     if status.as_u16() == 429 || status.is_server_error() {
         if let Some(retry_request) = retry {
-            log::warn!("模型请求返回 {status}，2 秒后重试一次");
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            return Ok(retry_request.send().await?);
+            let wait = deadline.cap(Duration::from_secs(2));
+            if wait.is_zero() {
+                return Ok(response);
+            }
+            log::warn!("模型请求返回 {status}，{wait:?} 后重试一次");
+            tokio::time::sleep(wait).await;
+            return send_until(retry_request, deadline).await;
         }
     }
     Ok(response)
@@ -59,7 +82,6 @@ async fn send_with_retry(request: reqwest::RequestBuilder) -> Result<reqwest::Re
 // ══════════════════════════════════════════════════════════
 // 第一部分：统一的消息格式
 // ══════════════════════════════════════════════════════════
-// 对应 Python: class Message / ToolCall / LlmResponse
 
 /// LLM 想调用的工具
 #[derive(Debug, Clone)]
@@ -83,6 +105,8 @@ pub struct LlmResponse {
     pub content: Option<String>,
     pub tool_calls: Option<Vec<ToolCall>>,
     pub stop_reason: StopReason,
+    /// Claude 原始内容块：保留思考签名和块顺序，供工具结果回传。
+    pub claude_content_blocks: Option<Vec<Value>>,
 }
 
 /// 统一的消息格式 — Agent 内部只用这个
@@ -98,6 +122,9 @@ pub struct Message {
     /// 工具名称（仅 tool role 消息使用，Gemini 需要）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// 仅 Claude 请求使用，不序列化到其他提供商或持久化聊天记录。
+    #[serde(skip)]
+    pub claude_content_blocks: Option<Vec<Value>>,
 }
 
 impl Message {
@@ -108,6 +135,7 @@ impl Message {
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            claude_content_blocks: None,
         }
     }
 
@@ -118,6 +146,7 @@ impl Message {
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            claude_content_blocks: None,
         }
     }
 
@@ -141,7 +170,25 @@ impl Message {
             tool_calls: Some(Value::Array(tool_calls_json)),
             tool_call_id: None,
             name: None,
+            claude_content_blocks: None,
         }
+    }
+
+    pub fn assistant_tool_response(response: &LlmResponse) -> Self {
+        let mut message =
+            Self::assistant_with_tool_calls(response.tool_calls.as_deref().unwrap_or_default());
+        message.claude_content_blocks = response.claude_content_blocks.clone();
+        message
+    }
+
+    fn to_provider_value(&self, provider: AiProvider) -> Value {
+        let mut value = serde_json::to_value(self).unwrap_or_default();
+        if provider == AiProvider::Claude {
+            if let Some(blocks) = &self.claude_content_blocks {
+                value["claude_content_blocks"] = json!(blocks);
+            }
+        }
+        value
     }
 
     pub fn tool_result_named(tool_call_id: &str, content: &str, name: Option<&str>) -> Self {
@@ -151,6 +198,7 @@ impl Message {
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
             name: name.map(|n| n.to_string()),
+            claude_content_blocks: None,
         }
     }
 }
@@ -164,13 +212,12 @@ impl Message {
 /// 这是你现有的 `generate_text_answer_with_model` 的升级版：
 /// - 旧版：只能发 system + user，收纯文字
 /// - 新版：支持发 messages + tools，收文字或 tool_calls
-///
-/// 对应 Python: provider.chat(messages, tools) -> LlmResponse
 pub async fn chat_with_tools(
     model_config: &ModelConfig,
     system_prompt: &str,
     messages: &[Message],
     tools: &[Value],
+    deadline: Deadline,
 ) -> Result<LlmResponse, AppError> {
     let client = chat_client()?;
 
@@ -180,15 +227,21 @@ pub async fn chat_with_tools(
         "content": system_prompt
     })];
     for msg in messages {
-        full_messages.push(serde_json::to_value(msg).unwrap_or_default());
+        full_messages.push(msg.to_provider_value(model_config.provider));
     }
 
     // 根据提供商分发
     match model_config.provider {
-        AiProvider::Ollama => chat_ollama(client, model_config, &full_messages, tools).await,
-        AiProvider::Claude => chat_claude(client, model_config, &full_messages, tools).await,
-        AiProvider::Gemini => chat_gemini(client, model_config, &full_messages, tools).await,
-        _ => chat_openai_compatible(client, model_config, &full_messages, tools).await,
+        AiProvider::Ollama => {
+            chat_ollama(client, model_config, &full_messages, tools, deadline).await
+        }
+        AiProvider::Claude => {
+            chat_claude(client, model_config, &full_messages, tools, deadline).await
+        }
+        AiProvider::Gemini => {
+            chat_gemini(client, model_config, &full_messages, tools, deadline).await
+        }
+        _ => chat_openai_compatible(client, model_config, &full_messages, tools, deadline).await,
     }
 }
 
@@ -204,6 +257,7 @@ async fn chat_openai_compatible(
     model_config: &ModelConfig,
     messages: &[Value],
     tools: &[Value],
+    deadline: Deadline,
 ) -> Result<LlmResponse, AppError> {
     let endpoint = model_config.endpoint.trim().trim_end_matches('/');
     let url = if endpoint.ends_with("/chat/completions") {
@@ -215,9 +269,9 @@ async fn chat_openai_compatible(
     let mut body = json!({
         "model": model_config.model,
         "messages": messages,
-        "max_tokens": 1600,
         "temperature": 0.2
     });
+    generation_params::apply_openai_compatible(&mut body, model_config, false);
 
     // 只有提供了工具定义时才加 tools 参数
     if !tools.is_empty() {
@@ -231,7 +285,7 @@ async fn chat_openai_compatible(
         }
     }
 
-    let response = send_with_retry(request).await?;
+    let response = send_with_retry(request, deadline).await?;
     if !response.status().is_success() {
         let error_text = response.text().await.unwrap_or_default();
         return Err(AppError::Analysis(format!("LLM 调用失败: {error_text}")));
@@ -247,6 +301,7 @@ async fn chat_ollama(
     model_config: &ModelConfig,
     messages: &[Value],
     tools: &[Value],
+    deadline: Deadline,
 ) -> Result<LlmResponse, AppError> {
     let ollama_base = model_config.endpoint.trim().trim_end_matches('/');
     let url = if ollama_base.ends_with("/api/chat") {
@@ -265,8 +320,9 @@ async fn chat_ollama(
     if !tools.is_empty() {
         body["tools"] = json!(tools);
     }
+    generation_params::apply_ollama(&mut body, model_config);
 
-    let response = send_with_retry(client.post(&url).json(&body)).await?;
+    let response = send_with_retry(client.post(&url).json(&body), deadline).await?;
     if !response.status().is_success() {
         return Err(AppError::Analysis(format!(
             "Ollama 调用失败: {}",
@@ -291,6 +347,10 @@ fn build_claude_request_parts(
         .filter(|m| m["role"].as_str() != Some("system"))
         .map(|m| {
             match m["role"].as_str() {
+                // 原样回传 Claude 内容块，不能重建或丢弃已签名的思考块。
+                Some("assistant") if m["claude_content_blocks"].is_array() => {
+                    json!({"role": "assistant", "content": m["claude_content_blocks"]})
+                }
                 // assistant + tool_calls → Claude content blocks with tool_use
                 Some("assistant") if m["tool_calls"].is_array() => {
                     let mut content_blocks: Vec<Value> = vec![];
@@ -360,6 +420,7 @@ async fn chat_claude(
     model_config: &ModelConfig,
     messages: &[Value],
     tools: &[Value],
+    deadline: Deadline,
 ) -> Result<LlmResponse, AppError> {
     let api_key = model_config
         .api_key
@@ -378,13 +439,13 @@ async fn chat_claude(
 
     let mut body = json!({
         "model": model_config.model,
-        "max_tokens": 1600,
         "system": system_content,
         "messages": claude_messages,
     });
     if !claude_tools.is_empty() {
         body["tools"] = json!(claude_tools);
     }
+    generation_params::apply_claude(&mut body, model_config, !claude_tools.is_empty());
 
     let response = send_with_retry(
         client
@@ -393,6 +454,7 @@ async fn chat_claude(
             .header("content-type", "application/json")
             .header("x-api-key", api_key)
             .json(&body),
+        deadline,
     )
     .await?;
 
@@ -507,6 +569,7 @@ async fn chat_gemini(
     model_config: &ModelConfig,
     messages: &[Value],
     tools: &[Value],
+    deadline: Deadline,
 ) -> Result<LlmResponse, AppError> {
     let endpoint = model_config.endpoint.trim().trim_end_matches('/');
     let api_key = model_config
@@ -515,13 +578,21 @@ async fn chat_gemini(
         .ok_or_else(|| AppError::Analysis("Gemini 需要 API Key，请在设置中配置".to_string()))?;
     let url = format!("{endpoint}/models/{}:generateContent", model_config.model);
 
-    let body = build_gemini_request_body(messages, tools);
+    let mut body = build_gemini_request_body(messages, tools);
+    let mut generation_config = body
+        .get("generationConfig")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    generation_params::apply_gemini(&mut generation_config, model_config);
+    body["generationConfig"] = Value::Object(generation_config);
 
     let response = send_with_retry(
         client
             .post(&url)
             .header("x-goog-api-key", api_key)
             .json(&body),
+        deadline,
     )
     .await?;
     if !response.status().is_success() {
@@ -583,17 +654,24 @@ fn parse_openai_response(result: &Value) -> Result<LlmResponse, AppError> {
         }
     };
 
-    let content = msg["content"].as_str().map(|s| s.to_string());
+    // 思考型模型的思维链在 reasoning_content；思考耗尽 max_tokens 时 content 为空，
+    // 兜底取思维链，保证助手始终有内容可展示。
+    let content = msg["content"]
+        .as_str()
+        .map(|s| s.to_string())
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| msg["reasoning_content"].as_str().map(|s| s.to_string()));
 
     Ok(LlmResponse {
         content,
         tool_calls,
         stop_reason,
+        claude_content_blocks: None,
     })
 }
 
 /// 解析 Claude 格式的响应
-fn parse_claude_response(result: &Value) -> Result<LlmResponse, AppError> {
+pub(crate) fn parse_claude_response(result: &Value) -> Result<LlmResponse, AppError> {
     let content_blocks = result["content"].as_array();
 
     let mut text_content = String::new();
@@ -644,6 +722,7 @@ fn parse_claude_response(result: &Value) -> Result<LlmResponse, AppError> {
             Some(tool_calls)
         },
         stop_reason,
+        claude_content_blocks: content_blocks.cloned(),
     })
 }
 
@@ -687,6 +766,7 @@ fn parse_gemini_response(result: &Value) -> Result<LlmResponse, AppError> {
             Some(tool_calls)
         },
         stop_reason,
+        claude_content_blocks: None,
     })
 }
 
@@ -698,8 +778,8 @@ fn parse_gemini_response(result: &Value) -> Result<LlmResponse, AppError> {
 //   + 一个 HTTP 驱动（chunk 循环 + 行缓冲 + 喂装配器 + 文本增量回调）。
 // - 入口 chat_with_tools_streaming 与 chat_with_tools 同参，多一个 on_text 回调；
 //   流式路径任何失败都回退到既有非流式实现，保证不比旧行为差。
-// - 超时策略：流式不用整体 60s 超时（长答案会被掐断），改为逐块空闲 30s
-//   + 总时长 120s 双护栏。
+// - 超时策略：请求全过程共用调用方传入的绝对 deadline；流式读取额外限制
+//   逐块空闲最多 30s，不因重试或回退重置总预算。
 
 /// 文本增量回调。executor 层把增量批量合并成 StreamEvent::Token 推给前端。
 pub type OnTextDelta<'a> = &'a mut (dyn FnMut(&str) + Send);
@@ -714,8 +794,9 @@ pub async fn chat_with_tools_streaming(
     messages: &[Message],
     tools: &[Value],
     on_text: OnTextDelta<'_>,
+    deadline: Deadline,
 ) -> Result<LlmResponse, AppError> {
-    // 流式客户端：只限制连接超时，读取超时由逐块 idle 超时控制。
+    // 流式客户端复用连接池；发送时设置剩余 deadline，读取另有逐块 idle 超时。
     let client = stream_client()?;
 
     let mut full_messages = vec![json!({
@@ -723,22 +804,53 @@ pub async fn chat_with_tools_streaming(
         "content": system_prompt
     })];
     for msg in messages {
-        full_messages.push(serde_json::to_value(msg).unwrap_or_default());
+        full_messages.push(msg.to_provider_value(model_config.provider));
     }
 
     let streamed = match model_config.provider {
         AiProvider::Ollama => {
-            chat_ollama_streaming(client, model_config, &full_messages, tools, on_text).await
+            chat_ollama_streaming(
+                client,
+                model_config,
+                &full_messages,
+                tools,
+                on_text,
+                deadline,
+            )
+            .await
         }
         AiProvider::Claude => {
-            chat_claude_streaming(client, model_config, &full_messages, tools, on_text).await
+            chat_claude_streaming(
+                client,
+                model_config,
+                &full_messages,
+                tools,
+                on_text,
+                deadline,
+            )
+            .await
         }
         AiProvider::Gemini => {
-            chat_gemini_streaming(client, model_config, &full_messages, tools, on_text).await
+            chat_gemini_streaming(
+                client,
+                model_config,
+                &full_messages,
+                tools,
+                on_text,
+                deadline,
+            )
+            .await
         }
         _ => {
-            chat_openai_compatible_streaming(client, model_config, &full_messages, tools, on_text)
-                .await
+            chat_openai_compatible_streaming(
+                client,
+                model_config,
+                &full_messages,
+                tools,
+                on_text,
+                deadline,
+            )
+            .await
         }
     };
 
@@ -746,7 +858,7 @@ pub async fn chat_with_tools_streaming(
         Ok(response) => Ok(response),
         Err(e) => {
             log::warn!("流式调用失败，回退非流式: {e}");
-            chat_with_tools(model_config, system_prompt, messages, tools).await
+            chat_with_tools(model_config, system_prompt, messages, tools, deadline).await
         }
     }
 }
@@ -783,17 +895,21 @@ fn sse_data_payload(line: &str) -> Option<&str> {
 /// `on_line` 返回 true 表示流已到终态（如 OpenAI 的 [DONE]），提前结束。
 async fn drive_stream(
     response: reqwest::Response,
+    deadline: Deadline,
     mut on_line: impl FnMut(&str) -> bool,
 ) -> Result<(), AppError> {
     let mut response = response;
     let mut line_buf = LineBuffer::new();
-    let started = Instant::now();
 
     loop {
-        if started.elapsed() > Duration::from_secs(120) {
+        if deadline.is_expired() {
             return Err(AppError::Analysis("流式响应总时长超限".to_string()));
         }
-        let chunk = tokio::time::timeout(Duration::from_secs(30), response.chunk())
+        let idle = deadline.cap(Duration::from_secs(30));
+        if idle.is_zero() {
+            return Err(AppError::Analysis("流式响应总时长超限".to_string()));
+        }
+        let chunk = tokio::time::timeout(idle, response.chunk())
             .await
             .map_err(|_| AppError::Analysis("流式响应空闲超时".to_string()))?
             .map_err(|e| AppError::Analysis(format!("流式读取失败: {e}")))?;
@@ -870,7 +986,12 @@ impl OpenAiStreamAssembler {
                 }
             }
         }
-        let text = delta["content"].as_str()?;
+        // 思考型模型（DeepSeek V4/R1、Qwen3 等）的思维链增量走 reasoning_content，
+        // 与 content 同级；正文帧缺失/为空时输出思考增量，避免助手全程无输出。
+        let text = delta["content"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .or_else(|| delta["reasoning_content"].as_str())?;
         if text.is_empty() {
             return None;
         }
@@ -920,6 +1041,7 @@ impl OpenAiStreamAssembler {
             },
             tool_calls,
             stop_reason,
+            claude_content_blocks: None,
         }
     }
 }
@@ -930,6 +1052,7 @@ async fn chat_openai_compatible_streaming(
     messages: &[Value],
     tools: &[Value],
     on_text: OnTextDelta<'_>,
+    deadline: Deadline,
 ) -> Result<LlmResponse, AppError> {
     let endpoint = model_config.endpoint.trim().trim_end_matches('/');
     let url = if endpoint.ends_with("/chat/completions") {
@@ -941,10 +1064,10 @@ async fn chat_openai_compatible_streaming(
     let mut body = json!({
         "model": model_config.model,
         "messages": messages,
-        "max_tokens": 1600,
         "temperature": 0.2,
         "stream": true
     });
+    generation_params::apply_openai_compatible(&mut body, model_config, true);
     if !tools.is_empty() {
         body["tools"] = json!(tools);
     }
@@ -956,10 +1079,10 @@ async fn chat_openai_compatible_streaming(
         }
     }
 
-    let response = ensure_stream_status(request.send().await?, "LLM").await?;
+    let response = ensure_stream_status(send_until(request, deadline).await?, "LLM").await?;
 
     let mut assembler = OpenAiStreamAssembler::default();
-    drive_stream(response, |line| {
+    drive_stream(response, deadline, |line| {
         let Some(payload) = sse_data_payload(line) else {
             return false;
         };
@@ -1048,6 +1171,7 @@ impl OllamaStreamAssembler {
                 None
             },
             stop_reason,
+            claude_content_blocks: None,
         }
     }
 }
@@ -1058,6 +1182,7 @@ async fn chat_ollama_streaming(
     messages: &[Value],
     tools: &[Value],
     on_text: OnTextDelta<'_>,
+    deadline: Deadline,
 ) -> Result<LlmResponse, AppError> {
     let ollama_base = model_config.endpoint.trim().trim_end_matches('/');
     let url = if ollama_base.ends_with("/api/chat") {
@@ -1074,12 +1199,16 @@ async fn chat_ollama_streaming(
     if !tools.is_empty() {
         body["tools"] = json!(tools);
     }
+    generation_params::apply_ollama(&mut body, model_config);
 
-    let response =
-        ensure_stream_status(client.post(&url).json(&body).send().await?, "Ollama").await?;
+    let response = ensure_stream_status(
+        send_until(client.post(&url).json(&body), deadline).await?,
+        "Ollama",
+    )
+    .await?;
 
     let mut assembler = OllamaStreamAssembler::default();
-    drive_stream(response, |line| {
+    drive_stream(response, deadline, |line| {
         if let Ok(value) = serde_json::from_str::<Value>(line) {
             if let Some(delta) = assembler.ingest(&value) {
                 on_text(&delta);
@@ -1104,6 +1233,8 @@ struct ClaudeStreamAssembler {
     stop_reason: Option<String>,
     /// content block index → (tool_use id, name, partial_json 累积)
     tools: std::collections::BTreeMap<u64, (String, String, String)>,
+    /// 保留全部内容块和原始顺序，思考文本与签名分片独立累积。
+    content_blocks: std::collections::BTreeMap<u64, Value>,
 }
 
 impl ClaudeStreamAssembler {
@@ -1111,8 +1242,9 @@ impl ClaudeStreamAssembler {
         match payload["type"].as_str() {
             Some("content_block_start") => {
                 let block = &payload["content_block"];
+                let index = payload["index"].as_u64().unwrap_or(0);
+                self.content_blocks.insert(index, block.clone());
                 if block["type"].as_str() == Some("tool_use") {
-                    let index = payload["index"].as_u64().unwrap_or(0);
                     self.tools.insert(
                         index,
                         (
@@ -1126,6 +1258,7 @@ impl ClaudeStreamAssembler {
             }
             Some("content_block_delta") => {
                 let delta = &payload["delta"];
+                let index = payload["index"].as_u64().unwrap_or(0);
                 match delta["type"].as_str() {
                     Some("text_delta") => {
                         let text = delta["text"].as_str()?;
@@ -1133,10 +1266,32 @@ impl ClaudeStreamAssembler {
                             return None;
                         }
                         self.text.push_str(text);
+                        if let Some(block) = self.content_blocks.get_mut(&index) {
+                            if let Some(Value::String(full_text)) = block.get_mut("text") {
+                                full_text.push_str(text);
+                            } else {
+                                block["text"] = json!(text);
+                            }
+                        }
                         Some(text.to_string())
                     }
+                    Some("thinking_delta") | Some("signature_delta") => {
+                        let field = if delta["type"] == "thinking_delta" {
+                            "thinking"
+                        } else {
+                            "signature"
+                        };
+                        if let Some(block) = self.content_blocks.get_mut(&index) {
+                            let text = delta[field].as_str().unwrap_or("");
+                            if let Some(Value::String(value)) = block.get_mut(field) {
+                                value.push_str(text);
+                            } else {
+                                block[field] = json!(text);
+                            }
+                        }
+                        None
+                    }
                     Some("input_json_delta") => {
-                        let index = payload["index"].as_u64().unwrap_or(0);
                         if let Some(slot) = self.tools.get_mut(&index) {
                             slot.2
                                 .push_str(delta["partial_json"].as_str().unwrap_or(""));
@@ -1156,21 +1311,34 @@ impl ClaudeStreamAssembler {
         }
     }
 
-    fn finish(self) -> LlmResponse {
+    fn finish(mut self) -> LlmResponse {
+        // 工具参数以 JSON 分片传送；解析完成后补回原始工具块。
+        for (index, (_, _, args)) in &self.tools {
+            if !args.trim().is_empty() {
+                if let Some(block) = self.content_blocks.get_mut(index) {
+                    block["input"] = serde_json::from_str(args).unwrap_or(json!({}));
+                }
+            }
+        }
         let tool_calls: Vec<ToolCall> = self
             .tools
-            .into_values()
-            .filter(|(_, name, _)| !name.is_empty())
-            .map(|(id, name, args)| ToolCall {
+            .into_iter()
+            .filter(|(_, (_, name, _))| !name.is_empty())
+            .map(|(index, (id, name, args))| ToolCall {
                 id,
                 name,
                 arguments: if args.trim().is_empty() {
-                    json!({})
+                    self.content_blocks
+                        .get(&index)
+                        .and_then(|block| block.get("input"))
+                        .cloned()
+                        .unwrap_or(json!({}))
                 } else {
                     serde_json::from_str(&args).unwrap_or(json!({}))
                 },
             })
             .collect();
+        let claude_content_blocks = Some(self.content_blocks.into_values().collect());
         let tool_calls = if tool_calls.is_empty() {
             None
         } else {
@@ -1197,6 +1365,7 @@ impl ClaudeStreamAssembler {
             },
             tool_calls,
             stop_reason,
+            claude_content_blocks,
         }
     }
 }
@@ -1207,6 +1376,7 @@ async fn chat_claude_streaming(
     messages: &[Value],
     tools: &[Value],
     on_text: OnTextDelta<'_>,
+    deadline: Deadline,
 ) -> Result<LlmResponse, AppError> {
     let api_key = model_config
         .api_key
@@ -1225,7 +1395,6 @@ async fn chat_claude_streaming(
 
     let mut body = json!({
         "model": model_config.model,
-        "max_tokens": 1600,
         "system": system_content,
         "messages": claude_messages,
         "stream": true
@@ -1233,22 +1402,25 @@ async fn chat_claude_streaming(
     if !claude_tools.is_empty() {
         body["tools"] = json!(claude_tools);
     }
+    generation_params::apply_claude(&mut body, model_config, !claude_tools.is_empty());
 
     let response = ensure_stream_status(
-        client
-            .post(&url)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .header("x-api-key", api_key)
-            .json(&body)
-            .send()
-            .await?,
+        send_until(
+            client
+                .post(&url)
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .header("x-api-key", api_key)
+                .json(&body),
+            deadline,
+        )
+        .await?,
         "Claude",
     )
     .await?;
 
     let mut assembler = ClaudeStreamAssembler::default();
-    drive_stream(response, |line| {
+    drive_stream(response, deadline, |line| {
         let Some(payload) = sse_data_payload(line) else {
             return false;
         };
@@ -1333,6 +1505,7 @@ impl GeminiStreamAssembler {
             },
             tool_calls: if has_tools { Some(tool_calls) } else { None },
             stop_reason,
+            claude_content_blocks: None,
         }
     }
 }
@@ -1343,6 +1516,7 @@ async fn chat_gemini_streaming(
     messages: &[Value],
     tools: &[Value],
     on_text: OnTextDelta<'_>,
+    deadline: Deadline,
 ) -> Result<LlmResponse, AppError> {
     let endpoint = model_config.endpoint.trim().trim_end_matches('/');
     let api_key = model_config
@@ -1354,21 +1528,30 @@ async fn chat_gemini_streaming(
         model_config.model
     );
 
-    let body = build_gemini_request_body(messages, tools);
+    let mut body = build_gemini_request_body(messages, tools);
+    let mut generation_config = body
+        .get("generationConfig")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    generation_params::apply_gemini(&mut generation_config, model_config);
+    body["generationConfig"] = Value::Object(generation_config);
 
     let response = ensure_stream_status(
-        client
-            .post(&url)
-            .header("x-goog-api-key", api_key)
-            .json(&body)
-            .send()
-            .await?,
+        send_until(
+            client
+                .post(&url)
+                .header("x-goog-api-key", api_key)
+                .json(&body),
+            deadline,
+        )
+        .await?,
         "Gemini",
     )
     .await?;
 
     let mut assembler = GeminiStreamAssembler::default();
-    drive_stream(response, |line| {
+    drive_stream(response, deadline, |line| {
         let Some(payload) = sse_data_payload(line) else {
             return false;
         };
@@ -1391,6 +1574,100 @@ async fn chat_gemini_streaming(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn read_test_headers(socket: &mut tokio::net::TcpStream) {
+        let mut headers = Vec::new();
+        while !headers.ends_with(b"\r\n\r\n") {
+            headers.push(socket.read_u8().await.unwrap());
+            assert!(headers.len() <= 8192, "本地测试请求头过大");
+        }
+    }
+
+    /// 只绑定回环地址；响应头及部分 body 发完后保持连接，不结束响应体。
+    async fn stalled_body_server(
+        status: &'static str,
+        retry_first: bool,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            if retry_first {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                read_test_headers(&mut socket).await;
+                socket
+                    .write_all(b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_test_headers(&mut socket).await;
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{{"
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            std::future::pending::<()>().await;
+            drop(socket);
+        });
+        (endpoint, server)
+    }
+
+    #[tokio::test]
+    async fn 响应头之后的json和错误body读取不得超过截止() {
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        for case in ["json", "text", "stream_error"] {
+            let status = if case == "json" {
+                "200 OK"
+            } else {
+                "400 Bad Request"
+            };
+            let (endpoint, server) = stalled_body_server(status, false).await;
+            let deadline = Deadline::after(Duration::from_millis(150));
+            let response = send_until(client.get(&endpoint), deadline)
+                .await
+                .expect("本地服务应立即返回响应头");
+            let result = tokio::time::timeout(Duration::from_secs(1), async {
+                match case {
+                    "json" => {
+                        let error = response.json::<Value>().await.unwrap_err();
+                        assert!(error.is_timeout(), "JSON 应受请求 deadline 限制: {error}");
+                    }
+                    "text" => {
+                        let error = response.text().await.unwrap_err();
+                        assert!(
+                            error.is_timeout(),
+                            "错误文本应受请求 deadline 限制: {error}"
+                        );
+                    }
+                    _ => assert!(ensure_stream_status(response, "local").await.is_err()),
+                }
+            })
+            .await;
+            server.abort();
+            result.expect("响应头后的 body 卡住不能绕过 deadline");
+            assert!(deadline.is_expired(), "不应在 body 未完成时提前返回");
+        }
+    }
+
+    #[tokio::test]
+    async fn 重试后的响应体仍应消费原截止预算() {
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let (endpoint, server) = stalled_body_server("200 OK", true).await;
+        // 2 秒重试等待后只剩 400ms；第二次请求不得重新获得完整预算。
+        let deadline = Deadline::after(Duration::from_millis(2400));
+        let result = tokio::time::timeout(Duration::from_millis(3000), async {
+            let response = send_with_retry(client.get(&endpoint), deadline)
+                .await
+                .unwrap();
+            assert!(response.status().is_success(), "应已进入第二次请求");
+            let error = response.json::<Value>().await.unwrap_err();
+            assert!(error.is_timeout(), "重试后的 body 应按原截止超时: {error}");
+        })
+        .await;
+        server.abort();
+        result.expect("重试后的响应体不能重新获得完整预算");
+        assert!(deadline.is_expired());
+    }
 
     #[test]
     fn test_message_user() {
@@ -1399,6 +1676,68 @@ mod tests {
         assert_eq!(msg.content.as_deref(), Some("你好"));
         assert!(msg.tool_calls.is_none());
         assert!(msg.tool_call_id.is_none());
+    }
+
+    #[test]
+    fn 非流式解析应在正文为空时兜底思维链() {
+        // 思考型模型耗尽额度：content 为空、思维链在 reasoning_content
+        let response = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": "用户在询问工作情况，我需要查询记录…"
+                },
+                "finish_reason": "length"
+            }]
+        });
+
+        let parsed = parse_openai_response(&response).unwrap();
+        assert_eq!(
+            parsed.content.as_deref(),
+            Some("用户在询问工作情况，我需要查询记录…")
+        );
+        assert_eq!(parsed.stop_reason, StopReason::MaxTokens);
+
+        // 正文非空时不受 reasoning_content 影响
+        let normal = json!({
+            "choices": [{
+                "message": { "role": "assistant", "content": "正文回答", "reasoning_content": "思考" },
+                "finish_reason": "stop"
+            }]
+        });
+        let parsed = parse_openai_response(&normal).unwrap();
+        assert_eq!(parsed.content.as_deref(), Some("正文回答"));
+    }
+
+    #[test]
+    fn 流式装配器应输出思维链增量() {
+        let mut assembler = OpenAiStreamAssembler::default();
+
+        // 思考阶段：delta 只有 reasoning_content
+        let thinking_frame = json!({
+            "choices": [{ "delta": { "reasoning_content": "先查数据库…" }, "finish_reason": null }]
+        });
+        assert_eq!(
+            assembler.ingest(&thinking_frame),
+            Some("先查数据库…".to_string())
+        );
+
+        // 正文阶段：delta 有 content
+        let answer_frame = json!({
+            "choices": [{ "delta": { "content": "今日工作总结如下" }, "finish_reason": null }]
+        });
+        assert_eq!(
+            assembler.ingest(&answer_frame),
+            Some("今日工作总结如下".to_string())
+        );
+
+        // 全程只有思维链（额度耗尽）时，finish 结果仍应包含思考文本
+        let finished = assembler.finish();
+        assert!(finished
+            .content
+            .as_deref()
+            .is_some_and(|s| s.contains("先查数据库…")));
     }
 
     #[test]
@@ -1620,6 +1959,113 @@ mod tests {
         let resp = asm.finish();
         assert_eq!(resp.stop_reason, StopReason::Stop);
         assert_eq!(resp.content.as_deref(), Some("结论："));
+    }
+
+    #[test]
+    fn claude工具往返应原样保留思考签名和全部内容块() {
+        let blocks = json!([
+            {"type":"thinking","thinking":"","signature":"原始签名"},
+            {"type":"text","text":"先查询"},
+            {"type":"redacted_thinking","data":"加密数据"},
+            {"type":"text","text":"记录"},
+            {"type":"tool_use","id":"toolu_1","name":"aggregate_stats","input":{"date_from":"2026-09-01"}}
+        ]);
+        let response =
+            parse_claude_response(&json!({"content": blocks, "stop_reason":"tool_use"})).unwrap();
+        assert_eq!(response.content.as_deref(), Some("先查询记录"));
+        let message = Message::assistant_tool_response(&response);
+        let tool_result = Message::tool_result_named("toolu_1", "已查询", None);
+        let (messages, _, _) = build_claude_request_parts(
+            &[
+                message.to_provider_value(AiProvider::Claude),
+                tool_result.to_provider_value(AiProvider::Claude),
+            ],
+            &[],
+        );
+        assert_eq!(messages[0]["content"], blocks);
+        assert_eq!(messages[1]["content"][0]["tool_use_id"], "toolu_1");
+        for provider in [AiProvider::OpenAI, AiProvider::Ollama, AiProvider::Gemini] {
+            let value = message.to_provider_value(provider);
+            assert!(value.get("claude_content_blocks").is_none());
+            assert_eq!(value["tool_calls"][0]["id"], "toolu_1");
+        }
+        assert!(serde_json::to_value(&message)
+            .unwrap()
+            .get("claude_content_blocks")
+            .is_none());
+    }
+
+    #[test]
+    fn claude流式工具往返应拼接思考和签名分片并保留块顺序() {
+        let blocks = json!([
+            {"type":"thinking","thinking":"推理内容","signature":"签名完整"},
+            {"type":"text","text":"先查记录"},
+            {"type":"tool_use","id":"toolu_1","name":"aggregate_stats","input":{"date_from":"2026-09-01"}},
+            {"type":"text","text":"再回答"}
+        ]);
+        let mut asm = ClaudeStreamAssembler::default();
+        for (index, block) in blocks.as_array().unwrap().iter().enumerate() {
+            let mut start = block.clone();
+            match block["type"].as_str().unwrap() {
+                "thinking" => {
+                    start["thinking"] = json!("");
+                    start["signature"] = json!("");
+                }
+                "text" => start["text"] = json!(""),
+                "tool_use" => start["input"] = json!({}),
+                _ => {}
+            }
+            asm.ingest(&json!({"type":"content_block_start","index":index,"content_block":start}));
+        }
+        for (kind, field, parts) in [
+            ("thinking_delta", "thinking", ["推理", "内容"]),
+            ("signature_delta", "signature", ["签名", "完整"]),
+        ] {
+            for part in parts {
+                let mut delta = json!({"type":kind});
+                delta[field] = json!(part);
+                assert!(asm
+                    .ingest(&json!({"type":"content_block_delta","index":0,"delta":delta}))
+                    .is_none());
+            }
+        }
+        for (index, text) in [(1, "先查"), (1, "记录"), (3, "再回答")] {
+            assert_eq!(asm.ingest(&json!({"type":"content_block_delta","index":index,"delta":{"type":"text_delta","text":text}})).as_deref(), Some(text));
+        }
+        for part in ["{\"date_from\":", "\"2026-09-01\"}"] {
+            asm.ingest(&json!({"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":part}}));
+        }
+        asm.ingest(&json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}));
+        let response = asm.finish();
+        assert_eq!(response.content.as_deref(), Some("先查记录再回答"));
+        assert_eq!(
+            response.claude_content_blocks.as_ref().unwrap(),
+            blocks.as_array().unwrap()
+        );
+        assert_eq!(
+            response.tool_calls.as_ref().unwrap()[0].arguments,
+            blocks[2]["input"]
+        );
+        let message = Message::assistant_tool_response(&response);
+        let (messages, _, _) =
+            build_claude_request_parts(&[message.to_provider_value(AiProvider::Claude)], &[]);
+        assert_eq!(messages[0]["content"], blocks);
+    }
+
+    #[test]
+    fn claude流式起始块已有工具参数时不应丢失() {
+        let mut asm = ClaudeStreamAssembler::default();
+        asm.ingest(&json!({"type":"content_block_start","index":0,
+            "content_block":{"type":"tool_use","id":"toolu_1","name":"aggregate_stats","input":{"date_from":"2026-09-01"}}}));
+        let response = asm.finish();
+        assert_eq!(
+            response.tool_calls.as_ref().unwrap()[0].arguments["date_from"],
+            "2026-09-01"
+        );
+        assert_eq!(
+            response.claude_content_blocks.unwrap()[0]["input"]["date_from"],
+            "2026-09-01"
+        );
     }
 
     #[test]

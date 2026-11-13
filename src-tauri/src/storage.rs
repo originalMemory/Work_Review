@@ -1,8 +1,9 @@
-use crate::config::StorageConfig;
-use crate::error::Result;
 use chrono::{Duration, Local, NaiveDate};
 use std::fs;
 use std::path::{Path, PathBuf};
+use work_review_core::config::StorageConfig;
+use work_review_core::database::Database;
+use work_review_core::error::{AppError, Result};
 
 /// 递归遍历目录（替代 walkdir）
 fn walk_dir_recursive(dir: &Path) -> Vec<PathBuf> {
@@ -76,9 +77,12 @@ impl StorageManager {
     }
 
     /// 执行清理任务
-    pub fn cleanup(&self) -> Result<CleanupResult> {
+    pub fn cleanup(&self, database: &Database) -> Result<CleanupResult> {
+        // 元数据清理须由用户显式开启；先完成数据库事务，失败时不继续删文件。
+        self.cleanup_old_metadata(database)?;
+
         // 1. 清理过期的截图文件
-        let mut screenshots_deleted = self.cleanup_old_screenshots()?;
+        let mut screenshots_deleted = self.cleanup_old_screenshots(database)?;
 
         // 2. 清理过期的 OCR 日志文件
         let ocr_logs_deleted = self.cleanup_old_ocr_logs()?;
@@ -88,7 +92,7 @@ impl StorageManager {
 
         // 如果超过限制，继续删除最旧的数据
         if current_size > (self.config.storage_limit_mb as u64 * 1024 * 1024) {
-            screenshots_deleted += self.cleanup_oldest_until_under_limit()?;
+            screenshots_deleted += self.cleanup_oldest_until_under_limit(database)?;
         }
 
         // 清理完成后重新统计占用，确保日志与返回结果反映清理后的实际大小
@@ -104,8 +108,26 @@ impl StorageManager {
         })
     }
 
+    fn cleanup_old_metadata(&self, database: &Database) -> Result<usize> {
+        if !self.config.metadata_cleanup_enabled || self.config.metadata_retention_days == 0 {
+            return Ok(0);
+        }
+        let cutoff = Local::now()
+            .date_naive()
+            .checked_sub_days(chrono::Days::new(u64::from(
+                self.config.metadata_retention_days,
+            )))
+            .ok_or_else(|| AppError::Config("元数据保留天数超出有效范围".to_string()))?;
+        let deleted =
+            database.delete_activities_before_date(&cutoff.format("%Y-%m-%d").to_string())?;
+        if deleted > 0 {
+            log::info!("已清理 {cutoff} 之前的 {deleted} 条活动元数据及关联摘要");
+        }
+        Ok(deleted)
+    }
+
     /// 清理过期截图
-    fn cleanup_old_screenshots(&self) -> Result<u32> {
+    fn cleanup_old_screenshots(&self, database: &Database) -> Result<u32> {
         // 0 表示"永久保留"——直接跳过基于时间的清理（存储上限那条另算）
         if self.config.screenshot_retention_days == 0 {
             return Ok(0);
@@ -122,6 +144,12 @@ impl StorageManager {
 
         for (date, path) in screenshot_date_dirs(&screenshots_dir)? {
             if date < cutoff_date {
+                database.clear_screenshot_paths_in_directory(
+                    &path
+                        .strip_prefix(&self.data_dir)
+                        .expect("截图目录位于数据目录内")
+                        .to_string_lossy(),
+                )?;
                 match fs::remove_dir_all(&path) {
                     Ok(_) => {
                         deleted_count += 1;
@@ -179,7 +207,7 @@ impl StorageManager {
     }
 
     /// 当存储超限时，删除最旧的数据直到低于限制
-    fn cleanup_oldest_until_under_limit(&self) -> Result<u32> {
+    fn cleanup_oldest_until_under_limit(&self, database: &Database) -> Result<u32> {
         let screenshots_dir = self.data_dir.join("screenshots");
         if !screenshots_dir.exists() {
             return Ok(0);
@@ -208,6 +236,15 @@ impl StorageManager {
                 .map(|m| m.len())
                 .sum();
 
+            if let Err(error) = database.clear_screenshot_paths_in_directory(
+                &path
+                    .strip_prefix(&self.data_dir)
+                    .expect("截图目录位于数据目录内")
+                    .to_string_lossy(),
+            ) {
+                log::warn!("清理截图元数据失败 {date}: {error}");
+                continue;
+            }
             match fs::remove_dir_all(&path) {
                 Ok(_) => {
                     deleted_count += 1;
@@ -287,7 +324,130 @@ pub struct StorageStats {
 
 #[cfg(test)]
 mod tests {
-    use super::screenshot_date_dirs;
+    use super::*;
+    use chrono::TimeZone;
+    use work_review_core::database::Activity;
+
+    #[test]
+    fn 删除截图目录时应先清空本地路径并保留远程地址() {
+        let dir = std::env::temp_dir().join(format!(
+            "work-review-screenshot-cleanup-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let old_date = Local::now().date_naive() - Duration::days(2);
+        let relative_path = format!("screenshots/{old_date}/shot.jpg");
+        let screenshot_path = dir.join(&relative_path);
+        std::fs::create_dir_all(screenshot_path.parent().unwrap()).unwrap();
+        std::fs::write(&screenshot_path, b"shot").unwrap();
+
+        let db = Database::new(&dir.join("test.db")).unwrap();
+        let activity_id = db
+            .insert_activity(&Activity {
+                id: None,
+                timestamp: old_date
+                    .and_hms_opt(12, 0, 0)
+                    .unwrap()
+                    .and_utc()
+                    .timestamp(),
+                app_name: "Editor".into(),
+                window_title: "old shot".into(),
+                screenshot_path: relative_path.clone(),
+                ocr_text: None,
+                category: "development".into(),
+                duration: 30,
+                browser_url: None,
+                executable_path: None,
+                semantic_category: None,
+                semantic_confidence: None,
+                screenshot_url: Some("https://cdn.example.com/shot.jpg".into()),
+            })
+            .unwrap();
+
+        let config = StorageConfig {
+            screenshot_retention_days: 1,
+            ..StorageConfig::default()
+        };
+        StorageManager::new(&dir, config).cleanup(&db).unwrap();
+
+        let activity = db.get_activity_by_id(activity_id).unwrap().unwrap();
+        assert!(activity.screenshot_path.is_empty());
+        assert_eq!(
+            activity.screenshot_url.as_deref(),
+            Some("https://cdn.example.com/shot.jpg")
+        );
+        assert!(!screenshot_path.exists());
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn 元数据清理须显式开启且保留边界日期与永久保留数据() {
+        let dir =
+            std::env::temp_dir().join(format!("work-review-retention-{}", uuid::Uuid::new_v4()));
+        let db = Database::new(&dir.join("test.db")).unwrap();
+        let cutoff = Local::now().date_naive() - Duration::days(30);
+        let boundary = Local
+            .from_local_datetime(&cutoff.and_hms_opt(0, 0, 0).unwrap())
+            .earliest()
+            .unwrap()
+            .timestamp();
+        let insert = |timestamp| {
+            db.insert_activity(&Activity {
+                id: None,
+                timestamp,
+                app_name: "Editor".into(),
+                window_title: "Private project".into(),
+                screenshot_path: String::new(),
+                ocr_text: Some("Private OCR".into()),
+                category: "development".into(),
+                duration: 1,
+                browser_url: Some("https://example.org".into()),
+                executable_path: None,
+                semantic_category: None,
+                semantic_confidence: None,
+                screenshot_url: None,
+            })
+            .unwrap()
+        };
+        let old_id = insert(boundary - 1);
+        let boundary_id = insert(boundary);
+        let recent_id = insert(Local::now().timestamp());
+        let mut config = StorageConfig::default();
+        let mut manager = StorageManager::new(&dir, config.clone());
+
+        manager.cleanup(&db).unwrap();
+        assert!(
+            db.get_activity_by_id(old_id).unwrap().is_some(),
+            "升级后默认不得自动删除历史"
+        );
+        config.metadata_cleanup_enabled = true;
+        config.metadata_retention_days = 0;
+        manager.update_config(config.clone());
+        manager.cleanup(&db).unwrap();
+        assert!(
+            db.get_activity_by_id(old_id).unwrap().is_some(),
+            "0 表示永久保留"
+        );
+
+        config.metadata_retention_days = u32::MAX;
+        manager.update_config(config.clone());
+        assert!(
+            manager.cleanup(&db).is_err(),
+            "非法保留天数应安全失败，不得误删或panic"
+        );
+        assert!(db.get_activity_by_id(old_id).unwrap().is_some());
+
+        config.metadata_retention_days = 30;
+        manager.update_config(config);
+        manager.cleanup(&db).unwrap();
+        assert!(db.get_activity_by_id(old_id).unwrap().is_none());
+        assert!(db.get_activity_by_id(boundary_id).unwrap().is_some());
+        assert!(db.get_activity_by_id(recent_id).unwrap().is_some());
+        manager.cleanup(&db).unwrap();
+        assert!(db.get_activity_by_id(recent_id).unwrap().is_some());
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn screenshot_date_dirs_supports_legacy_and_device_layouts() {

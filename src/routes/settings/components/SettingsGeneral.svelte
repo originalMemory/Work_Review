@@ -1,26 +1,55 @@
-<script>
+<script lang="ts">
   import { createEventDispatcher, onMount } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
-  import { formatDurationLocalized, locale, t } from '$lib/i18n/index.js';
+  import { formatDurationLocalized, locale, t } from '$lib/i18n/index.ts';
   import CollapsibleSection from '../../../lib/components/CollapsibleSection.svelte';
 
-  export let config;
+  interface WorkTimeSegment {
+    start_hour: number;
+    start_minute: number;
+    end_hour: number;
+    end_minute: number;
+  }
 
-  const dispatch = createEventDispatcher();
+  interface GeneralConfig {
+    auto_start: boolean;
+    auto_start_silent: boolean;
+    hide_dock_icon: boolean;
+    lightweight_mode: boolean;
+    work_time_enabled: boolean;
+    work_time_segments?: WorkTimeSegment[] | null;
+    work_start_hour: number;
+    work_start_minute: number;
+    work_end_hour: number;
+    work_end_minute: number;
+    standard_work_hours?: number | null;
+    idle_threshold_minutes: number;
+    idle_exempt_app_names: string[];
+    daily_work_goal_minutes: number | null;
+    goal_notifications: boolean;
+    memory_enabled: boolean;
+    daily_report_auto_generate_time: string | null;
+  }
+
+  type TimePart = number | string | null | undefined;
+
+  export let config: GeneralConfig;
+
+  const dispatch = createEventDispatcher<{ change: GeneralConfig }>();
   $: currentLocale = $locale;
   let workHours = '—';
   let autoStartEnabled = false;
-  let recordedAppNames = [];
+  let recordedAppNames: string[] = [];
   let addIdleExemptSelection = '';
   const MAX_WORK_SEGMENTS = 8;
 
   onMount(async () => {
     try {
-      autoStartEnabled = await invoke('is_autostart_enabled');
+      autoStartEnabled = await invoke<boolean>('is_autostart_enabled');
       if (config.auto_start !== autoStartEnabled) {
         config.auto_start = autoStartEnabled;
         try {
-          await invoke('save_config', { config });
+          await invoke<void>('save_config', { config });
         } catch (e) {
           console.error('对齐注册表自启状态时写盘失败:', e);
         }
@@ -30,7 +59,7 @@
       console.error('查询自启动状态失败:', e);
     }
     try {
-      recordedAppNames = await invoke('get_recorded_app_names');
+      recordedAppNames = await invoke<string[]>('get_recorded_app_names');
     } catch (e) {
       console.error('加载已记录应用列表失败:', e);
       recordedAppNames = [];
@@ -42,7 +71,7 @@
     .filter((name) => !idleExemptList.includes(name))
     .sort((left, right) => left.localeCompare(right));
 
-  function removeIdleExempt(name) {
+  function removeIdleExempt(name: string) {
     config.idle_exempt_app_names = idleExemptList.filter((item) => item !== name);
     handleChange();
   }
@@ -54,28 +83,28 @@
     handleChange();
   }
 
-  function normalizeHour(value) {
-    const parsed = Number.parseInt(value, 10);
+  function normalizeHour(value: TimePart): number {
+    const parsed = Number.parseInt(String(value ?? ''), 10);
     if (!Number.isFinite(parsed)) return 0;
     return Math.min(Math.max(parsed, 0), 23);
   }
 
-  function normalizeMinute(value) {
-    const parsed = Number.parseInt(value, 10);
+  function normalizeMinute(value: TimePart): number {
+    const parsed = Number.parseInt(String(value ?? ''), 10);
     if (!Number.isFinite(parsed)) return 0;
     return Math.min(Math.max(parsed, 0), 59);
   }
 
-  function parseTimeInput(value) {
+  function parseTimeInput(value: string | null | undefined): [number, number] {
     const [hour = '0', minute = '0'] = String(value ?? '').split(':');
     return [normalizeHour(hour), normalizeMinute(minute)];
   }
 
-  function segmentToTimeValue(hour, minute) {
+  function segmentToTimeValue(hour: TimePart, minute: TimePart): string {
     return `${String(normalizeHour(hour)).padStart(2, '0')}:${String(normalizeMinute(minute)).padStart(2, '0')}`;
   }
 
-  function normalizeSegment(segment) {
+  function normalizeSegment(segment?: Partial<WorkTimeSegment> | null): WorkTimeSegment {
     return {
       start_hour: normalizeHour(segment?.start_hour),
       start_minute: normalizeMinute(segment?.start_minute),
@@ -84,7 +113,7 @@
     };
   }
 
-  function normalizeWorkSegments(segments) {
+  function normalizeWorkSegments(segments?: WorkTimeSegment[] | null): WorkTimeSegment[] {
     if (Array.isArray(segments) && segments.length > 0) {
       return segments.slice(0, MAX_WORK_SEGMENTS).map(normalizeSegment);
     }
@@ -98,7 +127,7 @@
     ];
   }
 
-  function syncLegacyWorkRange(segments) {
+  function syncLegacyWorkRange(segments: WorkTimeSegment[]): void {
     if (!segments.length) return;
     const first = segments[0];
     const last = segments[segments.length - 1];
@@ -108,8 +137,8 @@
     config.work_end_minute = last.end_minute;
   }
 
-  function totalWorkSegmentMinutes(segments) {
-    const ranges = [];
+  function totalWorkSegmentMinutes(segments: WorkTimeSegment[]): number {
+    const ranges: [number, number][] = [];
     for (const segment of segments) {
       const start = segment.start_hour * 60 + segment.start_minute;
       const end = segment.end_hour * 60 + segment.end_minute;
@@ -123,7 +152,7 @@
     ranges.sort((left, right) => left[0] - right[0] || left[1] - right[1]);
 
     let total = 0;
-    let current = null;
+    let current: [number, number] | null = null;
     for (const range of ranges) {
       if (!current || range[0] > current[1]) {
         if (current) total += current[1] - current[0];
@@ -144,7 +173,7 @@
     workHours = diffSeconds === 0 ? formatDurationLocalized(0) : formatDurationLocalized(diffSeconds);
   }
 
-  function updateSegment(index, type, value) {
+  function updateSegment(index: number, type: 'start' | 'end', value: string) {
     const segments = normalizeWorkSegments(config.work_time_segments);
     const target = { ...segments[index] };
     const [hour, minute] = parseTimeInput(value);
@@ -182,7 +211,7 @@
     dispatch('change', config);
   }
 
-  function removeWorkSegment(index) {
+  function removeWorkSegment(index: number) {
     const segments = normalizeWorkSegments(config.work_time_segments);
     if (segments.length <= 1) return;
     segments.splice(index, 1);
@@ -199,18 +228,18 @@
     const targetState = !autoStartEnabled;
     try {
       if (targetState) {
-        await invoke('enable_autostart', { silent: !!config.auto_start_silent });
+        await invoke<void>('enable_autostart', { silent: !!config.auto_start_silent });
       } else {
-        await invoke('disable_autostart');
+        await invoke<void>('disable_autostart');
       }
     } catch (e) {
       console.warn(`切换系统自启失败/警告 (目标状态: ${targetState}):`, e);
     }
     try {
-      autoStartEnabled = await invoke('is_autostart_enabled');
+      autoStartEnabled = await invoke<boolean>('is_autostart_enabled');
       config.auto_start = autoStartEnabled;
       try {
-        await invoke('save_config', { config });
+        await invoke<void>('save_config', { config });
       } catch (e) {
         console.error('保存开机自启状态失败:', e);
       }
@@ -223,7 +252,7 @@
   async function toggleDockIcon() {
     config.hide_dock_icon = !config.hide_dock_icon;
     try {
-      await invoke('set_dock_visibility', { visible: !config.hide_dock_icon });
+      await invoke<void>('set_dock_visibility', { visible: !config.hide_dock_icon });
     } catch (e) {
       console.error('设置 Dock 图标失败:', e);
     }
@@ -235,16 +264,16 @@
     dispatch('change', config);
   }
 
-  async function updateAutoStartLaunchMode(silentMode) {
+  async function updateAutoStartLaunchMode(silentMode: boolean) {
     config.auto_start_silent = silentMode;
     try {
-      await invoke('save_config', { config });
+      await invoke<void>('save_config', { config });
     } catch (e) {
       console.error('保存启动模式失败:', e);
     }
     if (autoStartEnabled) {
       try {
-        await invoke('enable_autostart', { silent: silentMode });
+        await invoke<void>('enable_autostart', { silent: silentMode });
       } catch (e) {
         console.error('更新自启动参数失败:', e);
       }
@@ -294,7 +323,7 @@
                 type="time"
                 aria-label={`${t('settingsGeneral.segmentLabel', { index: index + 1 })} ${t('settingsGeneral.from')}`}
                 value={segmentToTimeValue(segment.start_hour, segment.start_minute)}
-                on:change={(e) => updateSegment(index, 'start', e.target.value)}
+                on:change={(e) => updateSegment(index, 'start', e.currentTarget.value)}
                 class="w-24 bg-transparent text-sm font-mono text-slate-900 dark:text-[#e6edf3] focus:outline-none"
               />
             </div>
@@ -307,7 +336,7 @@
                 type="time"
                 aria-label={`${t('settingsGeneral.segmentLabel', { index: index + 1 })} ${t('settingsGeneral.to')}`}
                 value={segmentToTimeValue(segment.end_hour, segment.end_minute)}
-                on:change={(e) => updateSegment(index, 'end', e.target.value)}
+                on:change={(e) => updateSegment(index, 'end', e.currentTarget.value)}
                 class="w-24 bg-transparent text-sm font-mono text-slate-900 dark:text-[#e6edf3] focus:outline-none"
               />
             </div>
@@ -353,13 +382,13 @@
               on:change={(e) => {
                 // 非法值不再静默忽略(此前输入 30 会保留旧值但输入框仍显示 30):
                 // 数字越界就 clamp 到 1~24,非数字回退当前值,并把结果回写到输入框
-                const val = parseFloat(e.target.value);
+                const val = parseFloat(e.currentTarget.value);
                 if (isNaN(val)) {
-                  e.target.value = config.standard_work_hours ?? 8;
+                  e.currentTarget.value = String(config.standard_work_hours ?? 8);
                   return;
                 }
                 const clamped = Math.min(24, Math.max(1, val));
-                e.target.value = clamped;
+                e.currentTarget.value = String(clamped);
                 if (config.standard_work_hours !== clamped) {
                   config.standard_work_hours = clamped;
                   handleChange();
@@ -459,7 +488,7 @@
             step="0.5"
             value={config.daily_work_goal_minutes ? config.daily_work_goal_minutes / 60 : 0}
             on:change={(e) => {
-              const hours = parseFloat(e.target.value);
+              const hours = parseFloat(e.currentTarget.value);
               config.daily_work_goal_minutes = (!isNaN(hours) && hours > 0) ? Math.round(hours * 60) : null;
               handleChange();
             }}
@@ -493,7 +522,7 @@
             aria-label={t('settingsGeneral.reportAutoGenerateTime')}
             value={config.daily_report_auto_generate_time ?? ''}
             on:change={(e) => {
-              config.daily_report_auto_generate_time = e.target.value || null;
+              config.daily_report_auto_generate_time = e.currentTarget.value || null;
               dispatch('change', config);
             }}
             class="w-20 bg-transparent text-sm font-mono text-slate-900 dark:text-[#e6edf3] focus:outline-none"

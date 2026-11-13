@@ -1,39 +1,113 @@
-<script>
+<script lang="ts">
   import { afterUpdate, onDestroy, onMount, tick } from 'svelte';
+  import { get } from 'svelte/store';
   import { fly } from 'svelte/transition';
   import { invoke, Channel } from '@tauri-apps/api/core';
   import { marked } from 'marked';
   import DOMPurify from 'dompurify';
-  import { assistantStore, BASIC_ASSISTANT_MODEL_ID } from '../../lib/stores/assistant.js';
-  import { buildHistoryPayload } from './historyPayload.js';
-  import { MODEL_PROVIDER_DISPLAY_NAMES, resolveModelOptionLabel } from './modelPresentation.js';
-  import { selectStarterPrompts } from './starterPromptPresentation.js';
-  import { createRequestEventGate } from './requestEventGate.js';
-  import { reduceStreamEvent } from './streamEvent.js';
-  import { formatDurationLocalized, locale, t, tm, translateCategoryLabel } from '$lib/i18n/index.js';
-  import { formatUserError } from '$lib/utils/errorDisplay.js';
-  import { trapFocus } from '$lib/utils/focusTrap.js';
+  import {
+    assistantStore,
+    BASIC_ASSISTANT_MODEL_ID,
+    type AssistantMessage,
+    type AssistantMessageInput,
+    type AssistantState,
+    type AssistantStep,
+  } from '../../lib/stores/assistant.ts';
+  import { buildHistoryPayload } from './historyPayload.ts';
+  import { MODEL_PROVIDER_DISPLAY_NAMES, resolveModelOptionLabel } from './modelPresentation.ts';
+  import { selectStarterPrompts } from './starterPromptPresentation.ts';
+  import {
+    createRequestEventGate,
+    type RequestEventGate,
+  } from './requestEventGate.ts';
+  import { reduceStreamEvent } from './streamEvent.ts';
+  import { formatDurationLocalized, locale, t, tm, translateCategoryLabel } from '$lib/i18n/index.ts';
+  import { formatUserError } from '$lib/utils/errorDisplay.ts';
+  import { cache } from '../../lib/stores/cache.ts';
+  import { trapFocus } from '$lib/utils/focusTrap.ts';
 
   marked.use({
     gfm: true,
     breaks: true,
   });
 
+  interface ModelConfig {
+    provider: string;
+    endpoint: string;
+    api_key?: string | null;
+    model: string;
+    [key: string]: unknown;
+  }
+
+  interface ModelProfile {
+    id: string;
+    name: string;
+    model_config: ModelConfig;
+  }
+
+  interface AssistantConfig {
+    text_model_profiles?: ModelProfile[];
+  }
+
+  interface AssistantConversation {
+    id: number;
+    title: string;
+    createdAt?: number;
+    updatedAt?: number;
+    messageCount?: number;
+  }
+
+  interface StoredAssistantMessage {
+    id: number;
+    conversationId: number;
+    role: 'user' | 'assistant';
+    content: string;
+    toolDigest: string | null;
+    modelName: string | null;
+    createdAt: number;
+  }
+
+  interface TodayStats {
+    app_usage: Array<{ app_name: string }>;
+    category_usage: Array<{ category: string }>;
+    work_time_duration: number;
+  }
+
+  interface AssistantAnswer {
+    answer: string;
+    references: AssistantMessage['references'];
+    usedAi: boolean;
+    modelName: string | null;
+    toolLabels: string[];
+  }
+
+  type ToolSummaryState = 'pending' | 'running' | 'failed' | 'done';
+  type ProviderLabels = Readonly<Record<string, Partial<Record<string, string>>>>;
+
+  const providerDisplayNames: ProviderLabels = MODEL_PROVIDER_DISPLAY_NAMES;
+
   let input = '';
-  let error = null;
-  let chatBody;
-  let composer;
-  let bottomAnchor;
-  let assistantState = {};
-  let unsubscribeAssistant = () => {};
+  let error: string | null = null;
+  let chatBody: HTMLDivElement | null = null;
+  let composer: HTMLTextAreaElement | null = null;
+  let bottomAnchor: HTMLDivElement | null = null;
+  let assistantState: AssistantState = {
+    messages: [],
+    selectedModelId: BASIC_ASSISTANT_MODEL_ID,
+    hasUserSelectedModel: false,
+    sending: false,
+    sendingRequestId: null,
+    conversationId: null,
+  };
+  let unsubscribeAssistant: () => void = () => {};
   let destroyed = false;
-  let activeSendingRequestId = null;
+  let activeSendingRequestId: string | null = null;
   let stickToBottom = true;
   $: sending = assistantState.sending ?? false;
   $: messages = assistantState.messages ?? [];
   $: currentLocale = $locale;
-  let starterPrompts = [];
-  let dynamicPrompts = [];
+  let starterPrompts: string[] = [];
+  let dynamicPrompts: string[] = [];
   let starterPromptLocale = '';
   let starterPromptRequestId = 0;
 
@@ -49,24 +123,22 @@
   }
 
   // 模型选择器
-  let modelProfiles = [];
+  let modelProfiles: ModelProfile[] = [];
   let selectedModelId = BASIC_ASSISTANT_MODEL_ID;
-  let modelSelectEl;
+  let modelSelectEl: HTMLSelectElement | null = null;
   let modelSelectWidth = 'auto';
-  let modelMeasureEl;
+  let modelMeasureEl: HTMLSpanElement | null = null;
   let currentModelLabel = '';
   $: currentModelLabel = resolveModelOptionLabel(selectedModelId, modelProfiles, currentLocale, t);
 
-  const providerDisplayNames = MODEL_PROVIDER_DISPLAY_NAMES;
-
-  function localizedProviderName(providerId) {
+  function localizedProviderName(providerId: string): string {
     return providerDisplayNames[providerId]?.[currentLocale]
       || providerDisplayNames[providerId]?.en
       || providerId
       || '';
   }
 
-  function displayModelProfileName(profile) {
+  function displayModelProfileName(profile: ModelProfile | null | undefined): string {
     if (!profile) return '';
     // 优先用 profile.name（后端 default_profile_name 已拼好完整显示名，或用户自定义名）。
     // 避免再次拼接 provider · model_id，那样会与后端重复且暴露裸 API id（如 Qwen/Qwen3-8B）。
@@ -98,7 +170,10 @@
   }
 
   // Re-measure when selection / profile list / locale changes
-  $: measureModelSelectWidth(currentModelLabel);
+  $: {
+    currentModelLabel;
+    measureModelSelectWidth();
+  }
 
   onMount(async () => {
     unsubscribeAssistant = assistantStore.subscribe((state) => {
@@ -127,7 +202,7 @@
 
     // 加载模型档案
     try {
-      const config = await invoke('get_config');
+      const config = await invoke<AssistantConfig>('get_config');
       modelProfiles = config.text_model_profiles || [];
       if (
         selectedModelId !== BASIC_ASSISTANT_MODEL_ID &&
@@ -176,8 +251,8 @@
     unsubscribeAssistant();
   });
 
-  function sourceLabel(sourceType) {
-    const labels = {
+  function sourceLabel(sourceType: string): string {
+    const labels: Record<string, string> = {
       activity: t('ask.referenceTypes.activity'),
       hourly_summary: t('ask.referenceTypes.hourly_summary'),
       daily_report: t('ask.referenceTypes.daily_report'),
@@ -192,20 +267,20 @@
     '主要意图', '主要工作', '待跟进事项', '代表性 Session',
     '相关记录依据',
   ]);
-  const renderedMarkdownCache = new Map();
+  const renderedMarkdownCache = new Map<string, string>();
   // Streaming render throttle: reuse last HTML within STREAM_RENDER_INTERVAL_MS,
   // so we don't run marked.parse on every token.
   const STREAM_RENDER_INTERVAL_MS = 250;
-  const streamRenderState = new Map(); // messageIndex -> { html, at }
+  const streamRenderState = new Map<number, { html: string; at: number }>();
 
-  function normalizeAssistantContent(content) {
+  function normalizeAssistantContent(content: string | null | undefined): string {
     const text = (content || '').replace(/\r\n/g, '\n').trim();
     if (!text) return '';
 
     const lines = text.split('\n');
 
     // ——— 第 1 步：去掉模板自引用句 ———
-    const filtered = [];
+    const filtered: string[] = [];
     let inCodeBlock = false;
     for (const line of lines) {
       const t = line.trim();
@@ -220,7 +295,7 @@
     }
 
     // ——— 第 2 步：逐行补全 markdown 格式（兼容已有部分格式的内容）———
-    const result = [];
+    const result: string[] = [];
     inCodeBlock = false;
 
     for (let i = 0; i < filtered.length; i++) {
@@ -283,20 +358,21 @@
     return result.join('\n');
   }
 
-  function renderMarkdown(content) {
+  function renderMarkdown(content: string | null | undefined): string {
     const normalized = normalizeAssistantContent(content);
     if (!normalized) return '';
 
     const cached = renderedMarkdownCache.get(normalized);
     if (cached) return cached;
 
-    const html = DOMPurify.sanitize(marked.parse(normalized));
+    const parsed = marked.parse(normalized);
+    const html = typeof parsed === 'string' ? DOMPurify.sanitize(parsed) : '';
     renderedMarkdownCache.set(normalized, html);
 
     // 控制缓存上限，避免长会话内存持续增长
     if (renderedMarkdownCache.size > 120) {
       const oldestKey = renderedMarkdownCache.keys().next().value;
-      renderedMarkdownCache.delete(oldestKey);
+      if (oldestKey !== undefined) renderedMarkdownCache.delete(oldestKey);
     }
 
     return html;
@@ -304,7 +380,7 @@
 
   // 流式渲染：节流，STREAM_RENDER_INTERVAL_MS 内复用上次 HTML，避免每个 token 都跑 marked.parse。
   // key 用消息在数组中的下标，收尾时由 renderMarkdown 接管（命中缓存，无额外开销）。
-  function renderStreamingMarkdown(content, key) {
+  function renderStreamingMarkdown(content: string | null | undefined, key: number): string {
     const now = Date.now();
     const state = streamRenderState.get(key);
     if (state && now - state.at < STREAM_RENDER_INTERVAL_MS) {
@@ -321,7 +397,7 @@
     composer.style.height = `${Math.min(composer.scrollHeight, 220)}px`;
   }
 
-  function isNearBottom(threshold = 120) {
+  function isNearBottom(threshold = 120): boolean {
     if (!chatBody) return true;
     return chatBody.scrollHeight - chatBody.scrollTop - chatBody.clientHeight <= threshold;
   }
@@ -330,10 +406,10 @@
     stickToBottom = isNearBottom();
   }
 
-  async function scrollToBottom(behavior = 'smooth', attempts = 1) {
+  async function scrollToBottom(behavior: ScrollBehavior = 'smooth', attempts = 1): Promise<void> {
     await tick();
     for (let attempt = 0; attempt < attempts; attempt += 1) {
-      await new Promise((resolve) => requestAnimationFrame(resolve));
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
       if (bottomAnchor?.scrollIntoView) {
         bottomAnchor.scrollIntoView({ block: 'end', behavior });
       } else if (chatBody) {
@@ -342,13 +418,20 @@
     }
   }
 
+  // 仅延续用户已有的底部跟随状态，避免展开旧消息时打断阅读位置。
+  function handleExpandScroll(event: Event): void {
+    const details = event.currentTarget as HTMLDetailsElement;
+    if (!details.open || !stickToBottom) return;
+    void scrollToBottom('auto', 3);
+  }
+
   // 流式更新时自动滚动：仅在用户位于底部附近时才滚（主流 chat 体验）
   function autoScrollOnStream() {
     if (destroyed || !stickToBottom) return;
     void scrollToBottom('auto', 1);
   }
 
-  function getSelectedModelConfig() {
+  function getSelectedModelConfig(): ModelConfig | null {
     if (selectedModelId === BASIC_ASSISTANT_MODEL_ID) {
       return null;
     }
@@ -356,7 +439,7 @@
     return profile ? profile.model_config : null;
   }
 
-  function handleModelChange(event) {
+  function handleModelChange(event: Event & { currentTarget: HTMLSelectElement }) {
     selectedModelId = event.currentTarget.value;
     assistantStore.setSelectedModelId(selectedModelId);
     dynamicPrompts = [];
@@ -377,7 +460,7 @@
   }
 
   // ══════════ P3：会话持久化 ══════════
-  let conversations = [];
+  let conversations: AssistantConversation[] = [];
   let showConversationList = false;
   $: conversationId = assistantState.conversationId ?? null;
 
@@ -387,7 +470,7 @@
   }
 
   /** 迁移期把未翻译的 key 存进过标题的历史数据，显示时兜底翻译。 */
-  function displayConversationTitle(title) {
+  function displayConversationTitle(title: string): string {
     return title === 'ask.importedConversation' ? t('ask.importedConversation') : title;
   }
 
@@ -396,7 +479,7 @@
     ? displayConversationTitle(currentConversation.title)
     : t('ask.newConversationSubtitle');
 
-  function toolSummaryText(message) {
+  function toolSummaryText(message: AssistantMessage): string {
     const steps = message.steps || [];
     const pending = steps.find((step) => step.confirmStatus === 'pending');
     if (pending) return t('ask.toolsNeedsConfirmation');
@@ -410,7 +493,7 @@
     return t('ask.toolsCompleted', { count: steps.length });
   }
 
-  function toolSummaryState(message) {
+  function toolSummaryState(message: AssistantMessage): ToolSummaryState {
     const steps = message.steps || [];
     if (steps.some((step) => step.confirmStatus === 'pending')) return 'pending';
     if (steps.some((step) => step.status === 'running')) return 'running';
@@ -418,7 +501,7 @@
     return 'done';
   }
 
-  function shouldExpandToolSummary(message) {
+  function shouldExpandToolSummary(message: AssistantMessage): boolean {
     return (message.steps || []).some(
       (step) => step.confirmStatus === 'pending' || step.status === 'running'
     );
@@ -426,26 +509,30 @@
 
   async function loadConversations() {
     try {
-      conversations = await invoke('list_assistant_conversations', { limit: 30 });
+      conversations = await invoke<AssistantConversation[]>('list_assistant_conversations', { limit: 30 });
     } catch (e) {
       console.warn('加载助手会话列表失败:', e);
       conversations = [];
     }
   }
 
-  function storedMessageToUiMessage(row) {
-    let steps = [];
+  function storedMessageToUiMessage(row: StoredAssistantMessage): AssistantMessageInput {
+    let steps: AssistantStep[] = [];
     if (row.toolDigest) {
       try {
-        const parsed = JSON.parse(row.toolDigest);
+        const parsed: unknown = JSON.parse(row.toolDigest);
         if (Array.isArray(parsed)) {
-          steps = parsed.map((s) => ({
-            tool: s.tool,
-            label: s.label || s.tool,
+          steps = parsed
+            .filter((value): value is Record<string, unknown> => typeof value === 'object' && value !== null)
+            .map((value) => ({
+            tool: typeof value.tool === 'string' ? value.tool : '',
+            label: typeof value.label === 'string'
+              ? value.label
+              : typeof value.tool === 'string' ? value.tool : '',
             status: 'done',
-            ok: s.ok,
-            hits: s.hits,
-            digest: s.digest,
+            ok: typeof value.ok === 'boolean' ? value.ok : undefined,
+            hits: typeof value.hits === 'number' ? value.hits : undefined,
+            digest: typeof value.digest === 'string' ? value.digest : undefined,
             references: [],
           }));
         }
@@ -464,11 +551,11 @@
     };
   }
 
-  async function switchConversation(id) {
+  async function switchConversation(id: number) {
     if (sending) return;
     showConversationList = false;
     try {
-      const rows = await invoke('get_assistant_messages', { conversationId: id });
+      const rows = await invoke<StoredAssistantMessage[]>('get_assistant_messages', { conversationId: id });
       assistantStore.setConversation(id, rows.map(storedMessageToUiMessage));
       error = null;
       await tick();
@@ -478,7 +565,7 @@
     }
   }
 
-  async function deleteConversation(id) {
+  async function deleteConversation(id: number) {
     if (sending) return;
     try {
       await invoke('delete_assistant_conversation', { conversationId: id });
@@ -492,11 +579,11 @@
   }
 
   /** 确保当前对话已落库；返回会话 id（失败时返回 null，不阻塞聊天）。 */
-  async function ensureConversation(firstQuestion) {
+  async function ensureConversation(firstQuestion: string): Promise<number | null> {
     if (conversationId != null) return conversationId;
     try {
       const title = String(firstQuestion || '').slice(0, 24) || t('ask.newConversation');
-      const id = await invoke('create_assistant_conversation', { title });
+      const id = await invoke<number>('create_assistant_conversation', { title });
       assistantStore.setConversationId(id);
       loadConversations();
       return id;
@@ -507,7 +594,11 @@
   }
 
   /** 每轮完成后把 user + assistant 消息写入 SQLite。 */
-  async function persistRound(convId, question, assistantMessage) {
+  async function persistRound(
+    convId: number | null,
+    question: string,
+    assistantMessage: AssistantMessage | undefined,
+  ): Promise<void> {
     if (convId == null || !assistantMessage) return;
     try {
       await invoke('append_assistant_message', {
@@ -540,7 +631,7 @@
         (m) => (m.role === 'user' || m.role === 'assistant') && !m.streaming && m.content
       );
       if (!legacy.length) return;
-      const id = await invoke('create_assistant_conversation', {
+      const id = await invoke<number>('create_assistant_conversation', {
         title: t('ask.importedConversation'),
       });
       for (const m of legacy) {
@@ -560,7 +651,7 @@
   }
 
   // ══════════ P2：行动确认 / P0：停止 ══════════
-  async function respondConfirm(messageId, step, approved) {
+  async function respondConfirm(messageId: string, step: AssistantStep, approved: boolean) {
     if (!step?.confirmId || step.confirmStatus !== 'pending') return;
     try {
       await invoke('confirm_assistant_action', {
@@ -581,20 +672,29 @@
   }
 
   async function stopCurrentRequest() {
-    if (!activeSendingRequestId) return;
+    const requestId = activeSendingRequestId ?? get(assistantStore).sendingRequestId;
+    if (!requestId) return;
     try {
-      await invoke('cancel_assistant_request', { requestId: activeSendingRequestId });
+      await invoke('cancel_assistant_request', { requestId });
     } catch (e) {
       console.warn('发送停止信号失败:', e);
     }
   }
 
-  const ASK_TIMEOUT_MS = 120_000;
+  function assistantTimeoutMs(): number {
+    const raw = Number((get(cache).config as { assistant_timeout_secs?: number } | null)?.assistant_timeout_secs);
+    const secs = Number.isFinite(raw) ? raw : 120;
+    // 前端略宽于后端绝对截止，给收束/取消留出回包时间。
+    return Math.min(Math.max(secs, 30), 900) * 1000 + 2000;
+  }
 
-  function withTimeout(promise, ms) {
-    let timer;
-    const timeout = new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error(t('ask.timeoutError'))), ms);
+  function withTimeout<T>(promise: Promise<T>, ms: number, onTimeout?: () => void): Promise<T> {
+    let timer: ReturnType<typeof setTimeout>;
+    const timeout = new Promise<T>((_, reject) => {
+      timer = setTimeout(() => {
+        onTimeout?.();
+        reject(new Error(t('ask.timeoutError')));
+      }, ms);
     });
     return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
   }
@@ -644,18 +744,19 @@
     await scrollToBottom('auto', 2);
 
     let streamSettled = false;
-    let requestGate = null;
+    let requestGate: RequestEventGate<unknown> | null = null;
     try {
-      const channel = new Channel();
-      requestGate = createRequestEventGate({
+      const channel = new Channel<unknown>();
+      const gate = createRequestEventGate({
         isDestroyed: () => destroyed,
         onEvent: (event) => handleStreamEvent(assistantMessageId, event),
       });
+      requestGate = gate;
       channel.onmessage = (event) => {
-        if (requestGate.handle(event)) streamSettled = true;
+        if (gate.handle(event)) streamSettled = true;
       };
       const answer = await withTimeout(
-        invoke('chat_work_assistant', {
+        invoke<AssistantAnswer>('chat_work_assistant', {
           question: trimmed,
           history,
           modelConfig: getSelectedModelConfig(),
@@ -663,7 +764,10 @@
           requestId: assistantMessageId,
           onEvent: channel,
         }),
-        ASK_TIMEOUT_MS
+        assistantTimeoutMs(),
+        () => {
+          void stopCurrentRequest();
+        }
       );
 
       // 事件优先：已收到 done/error 则保留事件内容；否则用 await 返回值兜底。
@@ -683,20 +787,21 @@
         modelName: answer?.modelName ?? m.modelName,
       }));
 
-      // P3：本轮完成 → 持久化（从 store 取终态消息）
-      const finalMessage = (assistantState.messages || []).find(
+      // 切页后组件已解除订阅，必须从 store 读取最新终态，不能使用局部快照。
+      const finalMessage = (get(assistantStore).messages || []).find(
         (m) => m.id === assistantMessageId
       );
       persistRound(convId, trimmed, finalMessage);
     } catch (e) {
       requestGate?.close();
+      const displayError = formatUserError(e, t('common.loadFailedRetry'));
       if (!destroyed) {
-        error = formatUserError(e, t('common.loadFailedRetry'));
+        error = displayError;
       }
       // 只把错误写入本次占位消息，迟到的旧事件不会影响后续请求。
       assistantStore.updateMessageById(assistantMessageId, (m) => ({
         ...m,
-        content: m.content || `${t('ask.requestFailed')}: ${e}`,
+        content: m.content || `${t('ask.requestFailed')}: ${displayError}`,
         streaming: false,
         failed: true,
       }));
@@ -714,7 +819,7 @@
   }
 
   // 处理后端流式事件，返回 true 表示终态（done/error）。
-  function handleStreamEvent(messageId, event) {
+  function handleStreamEvent(messageId: string, event: unknown): boolean {
     let terminal = false;
     assistantStore.updateMessageById(messageId, (message) => {
       const result = reduceStreamEvent(message, event, t('ask.requestFailed'));
@@ -722,16 +827,19 @@
       return result.message;
     });
 
-    if (event?.type === 'stepStart' || event?.type === 'stepResult' || event?.type === 'token') {
+    const eventType = typeof event === 'object' && event !== null && 'type' in event
+      ? Reflect.get(event, 'type')
+      : undefined;
+    if (eventType === 'stepStart' || eventType === 'stepResult' || eventType === 'token') {
       autoScrollOnStream();
-    } else if (event?.type === 'done' && !destroyed) {
+    } else if (eventType === 'done' && !destroyed) {
       // done：用户在底部时强制滚一次（确保完整内容可见）
       void scrollToBottom('auto', 2);
     }
     return terminal;
   }
 
-  function handleComposerKeydown(event) {
+  function handleComposerKeydown(event: KeyboardEvent) {
     // 中文等输入法确认候选词时会触发 Enter，组合输入期间不得提交。
     if (event.isComposing || event.keyCode === 229) return;
     if (event.key === 'Enter' && !event.shiftKey) {
@@ -744,7 +852,7 @@
     starterPromptRequestId += 1;
   }
 
-  function refreshStarterPrompts(extraPrompts = dynamicPrompts) {
+  function refreshStarterPrompts(extraPrompts: string[] = dynamicPrompts) {
     const localPrompts = tm('ask.starterPrompts') || [];
     starterPrompts = selectStarterPrompts({
       localPrompts,
@@ -771,7 +879,7 @@
       return;
     }
     try {
-      const stats = await invoke('get_today_stats');
+      const stats = await invoke<TodayStats>('get_today_stats');
       if (requestId !== starterPromptRequestId || destroyed) return;
 
       const recentApps = (stats?.app_usage || []).slice(0, 3).map((a) => a.app_name).join(t('common.listSeparator'));
@@ -785,16 +893,16 @@
         topCategory: topCategory || t('common.none'),
       });
 
-      const result = await invoke('generate_text_with_model', {
+      const result = await invoke<string>('generate_text_with_model', {
         modelConfig: profile.model_config,
         systemPrompt,
         prompt: userPrompt,
       });
 
       if (requestId !== starterPromptRequestId || destroyed) return;
-      const parsed = JSON.parse(result);
+      const parsed: unknown = JSON.parse(result);
       dynamicPrompts = Array.isArray(parsed)
-        ? parsed.filter((prompt) => typeof prompt === 'string' && prompt.trim())
+        ? parsed.filter((prompt): prompt is string => typeof prompt === 'string' && Boolean(prompt.trim()))
         : [];
       refreshStarterPrompts(dynamicPrompts);
     } catch (e) {
@@ -921,6 +1029,7 @@
                       class="ask-tool-summary group/tool"
                       data-state={toolSummaryState(message)}
                       open={shouldExpandToolSummary(message) || undefined}
+                      on:toggle={handleExpandScroll}
                     >
                       <summary>
                         <span class="ask-tool-status-dot" aria-hidden="true"></span>
@@ -1007,7 +1116,7 @@
                   </div>
 
                   {#if message.references?.length}
-                    <details class="ask-reference-trail">
+                    <details class="ask-reference-trail" on:toggle={handleExpandScroll}>
                       <summary aria-label={t('ask.referenceTrail', { count: message.references.length })}>
                         <span>{t('ask.referenceTrail', { count: message.references.length })}</span>
                         <span class="ask-reference-line" aria-hidden="true"></span>
@@ -1078,16 +1187,14 @@
           <div class="ask-composer-controls">
             <details class="ask-context-menu">
               <summary aria-label={t('ask.recordContext')} title={t('ask.recordContext')}>
-                <span class="ask-context-live" aria-hidden="true"></span>
-                <span>{t('ask.recordContext')}</span>
-                <svg class="h-3 w-3 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="m6 9 6 6 6-6" />
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
+                  <circle cx="12" cy="12" r="9" stroke-width="1.8" />
+                  <path d="M12 10.8v5.2M12 7.5h.01" stroke-width="2" stroke-linecap="round" />
                 </svg>
               </summary>
-              <div class="ask-context-popover">
-                <div>
-                  <span>{t('ask.contextScope')}</span>
-                </div>
+              <div class="ask-context-popover" role="note">
+                <strong>{t('ask.recordContext')}</strong>
+                <span>{t('ask.contextScope')}</span>
                 <p>{t('ask.contextSources')}</p>
               </div>
             </details>
@@ -1118,7 +1225,7 @@
               aria-label={t('ask.stopGenerating')}
               title={t('ask.stopGenerating')}
             >
-              <span class="h-2.5 w-2.5 rounded-[3px] bg-current" aria-hidden="true"></span>
+              <span class="h-2.5 w-2.5 rounded-[var(--radius-xs)] bg-current" aria-hidden="true"></span>
             </button>
           {:else}
             <button

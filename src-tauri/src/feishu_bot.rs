@@ -2,13 +2,13 @@ use crate::bot_common::{
     build_device_list, handle_cmd, normalize_command, progress_text_for_command, status_payload,
     NON_TEXT_REPLY, UNKNOWN_CMD_REPLY,
 };
-use crate::config::AppConfig;
 use reqwest::Client;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
+use work_review_core::config::AppConfig;
 
 /// 飞书事件签名允许的时间窗口：±5 分钟（与钉钉/企微一致），防重放。
 const FEISHU_SIGN_WINDOW_SECS: i64 = 300;
@@ -297,9 +297,14 @@ pub async fn handle_feishu_webhook(
         }
     }
 
-    let reply = handle_cmd(&client, &devices, text)
-        .await
-        .unwrap_or_else(|| UNKNOWN_CMD_REPLY.to_string());
+    let reply = handle_cmd(
+        &client,
+        &devices,
+        text,
+        crate::bot_common::report_generate_timeout(config),
+    )
+    .await
+    .unwrap_or_else(|| UNKNOWN_CMD_REPLY.to_string());
 
     let tenant_token = match get_tenant_token(&client, app_id, app_secret).await {
         Some(t) => t,

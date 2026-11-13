@@ -17,9 +17,15 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
-fn summary_request_timeout(_provider: AiProvider, _endpoint: &str) -> Duration {
-    // 日报命令的外层截止时间是 300 秒；给请求留出 60 秒用于回退模板和收尾。
-    Duration::from_secs(240)
+fn summary_request_timeout(outer: Duration) -> Duration {
+    // 外层截止给回退模板和收尾预留 60 秒；下限 30 秒，避免过短配置把单次请求掐死。
+    let reserved = Duration::from_secs(60);
+    let floor = Duration::from_secs(30);
+    if outer > reserved {
+        (outer - reserved).max(floor)
+    } else {
+        outer.min(floor).max(Duration::from_secs(1))
+    }
 }
 
 fn format_domain_label(
@@ -252,6 +258,22 @@ fn extract_ai_text(response: &serde_json::Value, pointer: &str, provider: &str) 
     Ok(text.trim().to_string())
 }
 
+/// Claude 默认思考时先返回思考块，只拼接正文，不将签名或思考内容写进日报。
+fn extract_claude_text(response: &serde_json::Value) -> Result<String> {
+    let blocks = response["content"].as_array().ok_or_else(|| {
+        AppError::Analysis("Claude malformed response: expected content blocks".to_string())
+    })?;
+    let mut text = String::new();
+    for block in blocks {
+        if block["type"].as_str() == Some("text") {
+            text.push_str(block["text"].as_str().ok_or_else(|| {
+                AppError::Analysis("Claude malformed response: expected text block".to_string())
+            })?);
+        }
+    }
+    Ok(text.trim().to_string())
+}
+
 fn api_response_error(provider: &str, status: StatusCode, error_text: &str) -> AppError {
     let detail = error_text.trim();
     let message = if detail.is_empty() {
@@ -310,6 +332,7 @@ pub struct SummaryAnalyzer {
     pinned_blocks: Vec<String>,
     cached_ai_order: Option<Vec<String>>,
     client: Client,
+    ai_budget: Duration,
 }
 
 impl SummaryAnalyzer {
@@ -324,9 +347,11 @@ impl SummaryAnalyzer {
         locale: AppLocale,
         pinned_blocks: Vec<String>,
         cached_ai_order: Option<Vec<String>>,
+        generation_timeout: Duration,
     ) -> Self {
+        let ai_budget = summary_request_timeout(generation_timeout);
         let client = Client::builder()
-            .timeout(summary_request_timeout(provider, endpoint))
+            .timeout(ai_budget)
             .connect_timeout(Duration::from_secs(10))
             .build()
             .unwrap_or_else(|_| Client::new());
@@ -342,6 +367,7 @@ impl SummaryAnalyzer {
             pinned_blocks,
             cached_ai_order,
             client,
+            ai_budget,
         }
     }
 
@@ -486,7 +512,7 @@ impl SummaryAnalyzer {
 
             if response.status().is_success() {
                 let result: serde_json::Value = response.json().await?;
-                return extract_ai_text(&result, "/content/0/text", "Claude");
+                return extract_claude_text(&result);
             }
 
             let status = response.status();
@@ -1052,9 +1078,8 @@ impl Analyzer for SummaryAnalyzer {
             }
         }
 
-        // 区块编排和正文分析共享同一个 AI 预算，确保在外层 300 秒截止前仍能生成回退报告。
-        let ai_deadline =
-            tokio::time::Instant::now() + summary_request_timeout(self.provider, &self.endpoint);
+        // 区块编排和正文分析共享同一个 AI 预算，确保在外层截止前仍能生成回退报告。
+        let ai_deadline = tokio::time::Instant::now() + self.ai_budget;
 
         // 统计区块：AI 编排顺序 + 用户偏好
         // 有缓存顺序时直接用（记忆性），否则调 LLM 排序。
@@ -1158,7 +1183,7 @@ impl Analyzer for SummaryAnalyzer {
 #[cfg(test)]
 mod tests {
     use super::{
-        api_response_error, empty_ai_fallback_reason, extract_ai_text,
+        api_response_error, empty_ai_fallback_reason, extract_ai_text, extract_claude_text,
         openai_compatible_chat_completion_urls, request_ai_fallback_reason,
         summary_request_timeout, SummaryAnalyzer,
     };
@@ -1169,6 +1194,28 @@ mod tests {
     use std::collections::HashMap;
     use std::path::Path;
     use std::time::Duration;
+
+    #[test]
+    fn claude日报正文应跳过思考并拼接全部文本块() {
+        let response = serde_json::json!({"content": [
+            {"type": "thinking", "thinking": "", "signature": "原始签名"},
+            {"type": "text", "text": " 本日"},
+            {"type": "redacted_thinking", "data": "加密思考"},
+            {"type": "text", "text": "总结 "}
+        ]});
+        assert_eq!(extract_claude_text(&response).unwrap(), "本日总结");
+        assert_eq!(
+            extract_claude_text(&serde_json::json!({"content": [
+                {"type": "thinking", "thinking": "", "signature": "原始签名"}
+            ]}))
+            .unwrap(),
+            ""
+        );
+        assert!(extract_claude_text(&serde_json::json!({"content": [
+            {"type": "text"}
+        ]}))
+        .is_err());
+    }
 
     fn sample_stats_for_ai_structure() -> DailyStats {
         DailyStats {
@@ -1214,32 +1261,23 @@ mod tests {
                 .no_proxy()
                 .build()
                 .expect("测试 client 应可创建"),
+            ai_budget: Duration::from_secs(240),
         }
     }
 
     #[test]
     fn 日报_ai请求应统一使用低于外层截止时间的生成预算() {
-        let expected = Duration::from_secs(240);
         let outer_deadline = Duration::from_secs(300);
+        let expected = Duration::from_secs(240);
 
+        assert_eq!(summary_request_timeout(outer_deadline), expected);
         assert_eq!(
-            summary_request_timeout(AiProvider::OpenAI, "http://127.0.0.1:1234/v1"),
-            expected
+            summary_request_timeout(Duration::from_secs(60)),
+            Duration::from_secs(30)
         );
         assert_eq!(
-            summary_request_timeout(AiProvider::Ollama, "http://localhost:11434"),
-            expected
-        );
-        assert_eq!(
-            summary_request_timeout(AiProvider::OpenAI, "https://api.openai.com/v1"),
-            expected
-        );
-        assert_eq!(
-            summary_request_timeout(
-                AiProvider::Gemini,
-                "https://generativelanguage.googleapis.com/v1"
-            ),
-            expected
+            summary_request_timeout(Duration::from_secs(1800)),
+            Duration::from_secs(1740)
         );
         assert!(expected < outer_deadline);
     }

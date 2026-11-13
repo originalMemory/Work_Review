@@ -1,21 +1,21 @@
-<script>
+<script lang="ts">
   import { onMount } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
-  import { selectedDeviceId } from '../stores/deviceFilter.js';
-  import { t } from '$lib/i18n/index.js';
+  import { selectedDeviceId } from '../stores/deviceFilter.ts';
+  import { t } from '$lib/i18n/index.ts';
 
-  let devices = [];
+  let devices: { device_id: string; device_name: string }[] = [];
 
   onMount(async () => {
     try {
-      devices = await invoke('get_known_devices');
+      devices = await invoke<typeof devices>('get_known_devices');
     } catch (error) {
       console.warn('加载同步设备失败:', error);
     }
   });
 
-  async function changeDevice(event) {
-    const next = event.currentTarget.value || null;
+  async function changeDevice(event: Event) {
+    const next = (event.currentTarget as HTMLSelectElement).value || null;
     $selectedDeviceId = next;
     try {
       await invoke('set_ui_selected_device_id', { deviceId: next });

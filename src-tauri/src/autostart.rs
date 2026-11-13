@@ -8,7 +8,7 @@ use tauri::Manager;
 #[cfg(not(windows))]
 use tauri_plugin_autostart::ManagerExt;
 
-use crate::error::{AppError, Result};
+use work_review_core::error::{AppError, Result};
 
 #[cfg(windows)]
 const AUTOSTART_LAUNCH_ARG: &str = "--autostart";
@@ -86,12 +86,12 @@ pub fn init_autostart(_app: &AppHandle) -> Result<()> {
 pub fn enable_autostart(app: AppHandle, silent: bool) -> Result<()> {
     #[cfg(windows)]
     {
-        return with_windows_config(&app, |config| {
+        with_windows_config(&app, |config| {
             let auto = build_autolaunch(config, silent)?;
             auto.enable()
                 .map_err(|e| AppError::Unknown(format!("开启开机自启失败: {e}")))?;
             Ok(())
-        });
+        })
     }
 
     #[cfg(not(windows))]
@@ -111,12 +111,12 @@ pub fn enable_autostart(app: AppHandle, silent: bool) -> Result<()> {
 pub fn disable_autostart(app: AppHandle) -> Result<()> {
     #[cfg(windows)]
     {
-        return with_windows_config(&app, |config| {
+        with_windows_config(&app, |config| {
             let auto = build_autolaunch(config, false)?;
             auto.disable()
                 .map_err(|e| AppError::Unknown(format!("关闭开机自启失败: {e}")))?;
             Ok(())
-        });
+        })
     }
 
     #[cfg(not(windows))]
@@ -132,11 +132,11 @@ pub fn disable_autostart(app: AppHandle) -> Result<()> {
 pub fn is_autostart_enabled(app: AppHandle) -> Result<bool> {
     #[cfg(windows)]
     {
-        return with_windows_config(&app, |config| {
+        with_windows_config(&app, |config| {
             let auto = build_autolaunch(config, false)?;
             auto.is_enabled()
                 .map_err(|e| AppError::Unknown(format!("获取开机自启状态失败: {e}")))
-        });
+        })
     }
 
     #[cfg(not(windows))]
@@ -166,9 +166,9 @@ mod tests {
     #[test]
     fn 静默模式应额外注入_hidden_参数供开机时拉起隐藏窗口() {
         let silent = autolaunch_args(true);
-        assert!(silent.iter().any(|arg| *arg == AUTOSTART_HIDDEN_ARG));
+        assert!(silent.contains(&AUTOSTART_HIDDEN_ARG));
 
         let visible = autolaunch_args(false);
-        assert!(!visible.iter().any(|arg| *arg == AUTOSTART_HIDDEN_ARG));
+        assert!(!visible.contains(&AUTOSTART_HIDDEN_ARG));
     }
 }

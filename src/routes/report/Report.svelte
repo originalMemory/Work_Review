@@ -1,27 +1,112 @@
-<script>
+<script lang="ts">
   import { onMount, onDestroy } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialog';
   import { open } from '@tauri-apps/plugin-shell';
   import { marked } from 'marked';
   import DOMPurify from 'dompurify';
-  import { showToast } from '../../lib/stores/toast.js';
-  import { confirm } from '../../lib/stores/confirm.js';
-  import { cache } from '../../lib/stores/cache.js';
-  import { formatLocalizedDate, formatLocalizedTime, formatDurationLocalized, locale, t, tm, translateCategoryLabel } from '$lib/i18n/index.js';
-  import { formatUserError } from '$lib/utils/errorDisplay.js';
-  import { shouldShowPromptAppliedToast } from './reportPromptFeedback.js';
-  import { resolveReportMeta } from './reportMeta.js';
+  import { get } from 'svelte/store';
+  import { showToast } from '../../lib/stores/toast.ts';
+  import { confirm } from '../../lib/stores/confirm.ts';
+  import { portalToBody } from '$lib/actions/portal.ts';
+  import { cache, type CacheState } from '../../lib/stores/cache.ts';
+  import { formatLocalizedDate, formatLocalizedTime, formatDurationLocalized, locale, t, tm, translateCategoryLabel } from '$lib/i18n/index.ts';
+  import { formatUserError } from '$lib/utils/errorDisplay.ts';
+  import { reportEditorFontFamily } from '$lib/utils/reportEditorFont.ts';
+  import { shouldShowPromptAppliedToast } from './reportPromptFeedback.ts';
+  import { resolveReportMeta, type ResolvedReportMeta } from './reportMeta.ts';
   import {
     extractReportBlockName,
     getVisibleReportSections,
     parseReportSections,
     reportSectionMarkdownForDisplay,
     reportSectionMarkdownForStorage,
-  } from './reportSections.js';
+    type ReportSection,
+    type VisibleReportSection,
+  } from './reportSections.ts';
+  import { createReportGenerationOwnership, createReportRequestSnapshot, shiftIsoDate } from './reportDateNavigation.ts';
   import LocalizedDatePicker from '../../lib/components/LocalizedDatePicker.svelte';
   import DeviceFilter from '../../lib/components/DeviceFilter.svelte';
-  import { selectedDeviceId } from '../../lib/stores/deviceFilter.js';
+  import { selectedDeviceId } from '../../lib/stores/deviceFilter.ts';
+
+  interface DailyReport {
+    date: string;
+    locale?: string;
+    content: string;
+    ai_mode?: string;
+    model_name?: string | null;
+    fallback_reason?: string | null;
+    created_at: number;
+  }
+
+  interface PromptPreset {
+    name: string;
+    prompt: string;
+  }
+
+  interface ReportConfig {
+    ai_mode: string;
+    daily_report_custom_prompt: string;
+    daily_report_prompt_presets: PromptPreset[];
+    daily_report_export_dir: string | null;
+    daily_report_pinned_blocks: string[];
+    daily_report_hidden_blocks: string[];
+    daily_report_system_prompt_override?: string | null;
+    report_editor_font?: string;
+    [key: string]: unknown;
+  }
+
+  interface CategoryUsage {
+    category: string;
+    duration: number;
+  }
+
+  interface HourlyActivityBucket {
+    hour: number;
+    duration: number;
+  }
+
+  interface DailyStats {
+    total_duration: number;
+    screenshot_count: number;
+    app_usage: Array<{ app_name: string }>;
+    category_usage: CategoryUsage[];
+    hourly_activity_distribution: HourlyActivityBucket[];
+  }
+
+  interface CategoryDefinition {
+    key: string;
+    name: string;
+    color: string;
+  }
+
+  interface ExportRangeResult {
+    path: string;
+    count: number;
+  }
+
+  type BatchPreset = 'thisWeek' | 'lastWeek' | 'thisMonth' | 'lastMonth';
+
+  function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && value !== null && !Array.isArray(value);
+  }
+
+  function isDailyReport(value: unknown): value is DailyReport {
+    return isRecord(value)
+      && typeof value.date === 'string'
+      && typeof value.content === 'string'
+      && typeof value.created_at === 'number';
+  }
+
+  function isReportConfig(value: unknown): value is ReportConfig {
+    return isRecord(value)
+      && typeof value.ai_mode === 'string'
+      && typeof value.daily_report_custom_prompt === 'string'
+      && Array.isArray(value.daily_report_prompt_presets)
+      && Array.isArray(value.daily_report_pinned_blocks)
+      && Array.isArray(value.daily_report_hidden_blocks)
+      && (value.daily_report_export_dir === null || typeof value.daily_report_export_dir === 'string');
+  }
 
   function getLocalDateString() {
     const now = new Date();
@@ -29,25 +114,16 @@
   }
 
   function getYesterdayDateString() {
-    const yesterday = new Date();
-    yesterday.setDate(yesterday.getDate() - 1);
-    return `${yesterday.getFullYear()}-${String(yesterday.getMonth() + 1).padStart(2, '0')}-${String(yesterday.getDate()).padStart(2, '0')}`;
+    return shiftIsoDate(getLocalDateString(), -1);
   }
 
-  // ISO 日期偏移工具（KPI 上周同日基线共用）
-  function shiftIsoDate(dateValue, offsetDays) {
-    const next = new Date(`${dateValue}T12:00:00`);
-    next.setDate(next.getDate() + offsetDays);
-    return `${next.getFullYear()}-${String(next.getMonth() + 1).padStart(2, '0')}-${String(next.getDate()).padStart(2, '0')}`;
-  }
-
-  let report = null;
+  let report: DailyReport | null = null;
   let loading = false;
   let generating = false;
-  let error = null;
+  let error: string | null = null;
   let selectedDate = getLocalDateString();
-  let freshStats = null;
-  let lastWeekStats = null; // 上周同日基线（KPI 参照系;加载失败保持 null,不显示 delta）
+  let freshStats: DailyStats | null = null;
+  let lastWeekStats: DailyStats | null = null; // 上周同日基线（KPI 参照系;加载失败保持 null,不显示 delta）
   let isYesterdayReport = false; // 标记是否显示的是昨日日报
   let showPresetModal = false;
   let presetSaving = false;
@@ -55,20 +131,21 @@
   let editingPresetIndex = -1;
   let editingPresetName = '';
   let editingPresetPrompt = '';
-  let config = null;
+  let config: ReportConfig | null = null;
   let lastLoadedDate = '';
   let reportRequestId = 0;
+  const reportGenerationOwnership = createReportGenerationOwnership();
   let exportInProgress = false;
   let promptSaving = false;
-  let cacheData = null;
+  let cacheData: CacheState | null = null;
   // ── 2026-07 日报改版：页头动作收敛为「导出 ▾」菜单 + 生成设置抽屉 ──
   let showExportMenu = false;
   let showGenerateDrawer = false;
-  let categoryList = []; // 分类色板（数据对照面板构成条着色,与概览同源）
+  let categoryList: CategoryDefinition[] = []; // 分类色板（数据对照面板构成条着色,与概览同源）
   const unsubscribeCache = cache.subscribe(v => {
     cacheData = v;
     // 首次或缓存有值时，立即从缓存恢复配置（避免页面切换闪烁）
-    if (!config && v?.config) {
+    if (!config && isReportConfig(v.config)) {
       config = v.config;
     }
   });
@@ -78,64 +155,68 @@
   $: currentReportCacheKey = `${selectedDate}:${currentLocale}:${$selectedDeviceId || 'all'}`;
 
   // 获取 AI 模式显示名称
-  function getAiModeName(mode) {
+  function getAiModeName(mode: unknown): string {
     const normalizedMode = (mode || '').toString().trim().toLowerCase();
-    const modeNames = {
+    const modeNames: Record<string, string> = {
       'local': t('report.modeNames.local'),
       'summary': t('report.modeNames.summary'),
       'cloud': t('report.modeNames.cloud')
     };
-    return modeNames[normalizedMode] || mode || t('report.modeNames.unknown');
+    return modeNames[normalizedMode] || String(mode || '') || t('report.modeNames.unknown');
   }
 
-  function getFallbackReasonText(meta) {
+  function getFallbackReasonText(meta: ResolvedReportMeta): string {
     return meta?.fallbackReason || t('report.savedReportNotAi');
   }
 
   async function loadConfig() {
     try {
-      const cfg = await invoke('get_config');
+      const cfg = await invoke<ReportConfig>('get_config');
       cache.setConfig(cfg);
     } catch (e) {
       console.error('加载配置失败:', e);
     }
   }
 
-  async function loadReport(previousReport = null) {
-    const requestId = ++reportRequestId;
+  async function loadReport(previousReport: DailyReport | null = null) {
+    const { requestId, targetDate, targetLocale, targetCacheKey, targetDeviceId } = createReportRequestSnapshot(
+      ++reportRequestId,
+      selectedDate,
+      currentLocale,
+      $selectedDeviceId,
+    );
     freshStats = null;
     lastWeekStats = null;
 
     // 并行加载实时统计 + 上周同日基线（KPI 参照系）
-    invoke('get_daily_stats', { date: selectedDate, deviceId: $selectedDeviceId })
+    invoke<DailyStats>('get_daily_stats', { date: targetDate, deviceId: targetDeviceId })
       .then(stats => { if (requestId === reportRequestId) freshStats = stats; })
       .catch(() => {});
-    invoke('get_daily_stats', { date: shiftIsoDate(selectedDate, -7), deviceId: $selectedDeviceId })
+    invoke<DailyStats>('get_daily_stats', { date: shiftIsoDate(targetDate, -7), deviceId: targetDeviceId })
       .then(stats => { if (requestId === reportRequestId) lastWeekStats = stats; })
       .catch(() => {});
 
     // 乐观更新：先显示缓存数据
-    let cacheData;
-    const unsubscribe = cache.subscribe(c => { cacheData = c; });
-    unsubscribe();
+    const cachedState = get(cache);
+    const cachedReport = cachedState.reports[targetCacheKey]?.data;
 
-    if (cacheData.reports[currentReportCacheKey]?.data) {
-      report = cacheData.reports[currentReportCacheKey].data;
+    if (isDailyReport(cachedReport)) {
+      report = cachedReport;
       isYesterdayReport = false;
       loading = false;
 
       // 缓存有效则直接返回
-      if (cache.isValid(cacheData.reports[currentReportCacheKey], 'reports')) {
+      if (cache.isValid(cachedState.reports[targetCacheKey], 'reports')) {
         return;
       }
 
       // 后台静默刷新
       try {
-        const savedReport = await invoke('get_saved_report', { date: selectedDate, locale: currentLocale, deviceId: $selectedDeviceId });
+        const savedReport = await invoke<DailyReport | null>('get_saved_report', { date: targetDate, locale: targetLocale, deviceId: targetDeviceId });
         if (requestId !== reportRequestId) return;
         if (savedReport) {
           report = savedReport;
-          cache.setReport(currentReportCacheKey, savedReport);
+          cache.setReport(targetCacheKey, savedReport);
         }
       } catch (e) {
         console.warn('后台刷新日报失败:', e);
@@ -145,30 +226,38 @@
       loading = true;
       error = null;
       try {
-        const savedReport = await invoke('get_saved_report', { date: selectedDate, locale: currentLocale, deviceId: $selectedDeviceId });
+        const savedReport = await invoke<DailyReport | null>('get_saved_report', { date: targetDate, locale: targetLocale, deviceId: targetDeviceId });
         if (requestId !== reportRequestId) return;
         if (savedReport) {
           report = savedReport;
           isYesterdayReport = false;
-          cache.setReport(currentReportCacheKey, savedReport);
+          cache.setReport(targetCacheKey, savedReport);
         } else {
-          if (!savedReport && previousReport?.date === selectedDate && previousReport?.content) {
+          if (
+            !savedReport
+            && previousReport?.date === targetDate
+            && previousReport?.content
+            && reportGenerationOwnership.claim(requestId, cacheData?.reportGenerating ?? false)
+          ) {
             cache.setReportGenerating(true);
-            await invoke('generate_report', { date: selectedDate, force: false, locale: currentLocale, deviceId: $selectedDeviceId });
-            const localizedReport = await invoke('get_saved_report', { date: selectedDate, locale: currentLocale, deviceId: $selectedDeviceId });
+            await invoke('generate_report', { date: targetDate, force: false, locale: targetLocale, deviceId: targetDeviceId });
+            if (requestId !== reportRequestId) return;
+            const localizedReport = await invoke<DailyReport | null>('get_saved_report', { date: targetDate, locale: targetLocale, deviceId: targetDeviceId });
+            if (requestId !== reportRequestId) return;
 
             if (localizedReport) {
               report = localizedReport;
               isYesterdayReport = false;
-              cache.setReport(currentReportCacheKey, localizedReport);
+              cache.setReport(targetCacheKey, localizedReport);
               return;
             }
           }
 
           // 如果选择今天且今天无日报，尝试加载昨日日报
-          if (selectedDate === getLocalDateString()) {
-            const yesterday = getYesterdayDateString();
-            const yesterdayReport = await invoke('get_saved_report', { date: yesterday, locale: currentLocale, deviceId: $selectedDeviceId });
+          if (targetDate === getLocalDateString()) {
+            const yesterday = shiftIsoDate(targetDate, -1);
+            const yesterdayReport = await invoke<DailyReport | null>('get_saved_report', { date: yesterday, locale: targetLocale, deviceId: targetDeviceId });
+            if (requestId !== reportRequestId) return;
             if (yesterdayReport) {
               report = yesterdayReport;
               isYesterdayReport = true;
@@ -182,34 +271,54 @@
           }
         }
       } catch (e) {
-        error = formatUserError(e, t('common.loadFailedRetry'));
+        if (requestId === reportRequestId) {
+          error = formatUserError(e, t('common.loadFailedRetry'));
+        }
       } finally {
-        cache.setReportGenerating(false);
-        loading = false;
+        if (requestId === reportRequestId) {
+          loading = false;
+        }
+        if (reportGenerationOwnership.release(requestId)) {
+          cache.setReportGenerating(false);
+        }
       }
     }
   }
 
-  function selectDate(date) {
+  function selectPreviousDay() {
+    selectDate(shiftIsoDate(selectedDate, -1));
+  }
+
+  function selectDate(date: string) {
     if (!date || date === selectedDate) return;
     selectedDate = date;
   }
 
   async function generateReport(force = true) {
+    const { requestId, targetDate, targetLocale, targetCacheKey, targetDeviceId } = createReportRequestSnapshot(
+      ++reportRequestId,
+      selectedDate,
+      currentLocale,
+      $selectedDeviceId,
+    );
+    if (!reportGenerationOwnership.claim(requestId, cacheData?.reportGenerating ?? false)) return;
     cache.setReportGenerating(true);
     error = null;
     try {
       if (config?.ai_mode === 'summary') {
         await persistReportPrompt();
+        if (requestId !== reportRequestId) return;
       }
-      await invoke('generate_report', { date: selectedDate, force, locale: currentLocale, deviceId: $selectedDeviceId });
-      const savedReport = await invoke('get_saved_report', { date: selectedDate, locale: currentLocale, deviceId: $selectedDeviceId });
-      report = savedReport || { date: selectedDate, content: '', created_at: Date.now() / 1000 };
+      await invoke('generate_report', { date: targetDate, force, locale: targetLocale, deviceId: targetDeviceId });
+      if (requestId !== reportRequestId) return;
+      const savedReport = await invoke<DailyReport | null>('get_saved_report', { date: targetDate, locale: targetLocale, deviceId: targetDeviceId });
+      if (requestId !== reportRequestId) return;
+      report = savedReport || { date: targetDate, content: '', created_at: Date.now() / 1000 };
       isYesterdayReport = false;
-      cache.setReport(currentReportCacheKey, report);
+      cache.setReport(targetCacheKey, report);
       // 历史周条即时点亮当天（无需重新探测整周）
-      if (savedReport && selectedDate in weekReportStatus) {
-        weekReportStatus = { ...weekReportStatus, [selectedDate]: true };
+      if (savedReport && targetDate in weekReportStatus) {
+        weekReportStatus = { ...weekReportStatus, [targetDate]: true };
       }
 
       if (
@@ -222,9 +331,13 @@
         showToast(t('report.promptApplied'), 'success');
       }
     } catch (e) {
-      error = formatUserError(e, t('common.loadFailedRetry'));
+      if (requestId === reportRequestId) {
+        error = formatUserError(e, t('common.loadFailedRetry'));
+      }
     } finally {
-      cache.setReportGenerating(false);
+      if (reportGenerationOwnership.release(requestId)) {
+        cache.setReportGenerating(false);
+      }
     }
   }
 
@@ -246,6 +359,7 @@
   const MAX_PROMPT_PRESETS = 12;
 
   async function savePresets() {
+    if (!config) return;
     try {
       await invoke('save_config', { config });
     } catch (e) {
@@ -273,7 +387,7 @@
         exportDir = selected;
       }
 
-      const exportPath = await invoke('export_report_markdown', {
+      const exportPath = await invoke<string>('export_report_markdown', {
         date: report.date || selectedDate,
         content: report.content,
         exportDir,
@@ -311,7 +425,7 @@
   let batchEndDate = '';
 
   // ISO 日期字符串工具（避开 toISOString 的 UTC 时区坑）
-  function toIsoDate(date) {
+  function toIsoDate(date: Date): string {
     const y = date.getFullYear();
     const m = String(date.getMonth() + 1).padStart(2, '0');
     const d = String(date.getDate()).padStart(2, '0');
@@ -320,7 +434,7 @@
 
   // 计算"本周/上周"的范围，约定周一为一周开始
   // 注：getDay() 周日=0，周一=1，所以 (day + 6) % 7 是距离本周一的天数
-  function weekRange(offsetWeeks) {
+  function weekRange(offsetWeeks: number): { start: string; end: string } {
     const today = new Date();
     const dayFromMonday = (today.getDay() + 6) % 7;
     const monday = new Date(today);
@@ -330,15 +444,15 @@
     return { start: toIsoDate(monday), end: toIsoDate(sunday) };
   }
 
-  function monthRange(offsetMonths) {
+  function monthRange(offsetMonths: number): { start: string; end: string } {
     const today = new Date();
     const start = new Date(today.getFullYear(), today.getMonth() + offsetMonths, 1);
     const end = new Date(today.getFullYear(), today.getMonth() + offsetMonths + 1, 0);
     return { start: toIsoDate(start), end: toIsoDate(end) };
   }
 
-  function applyBatchPreset(preset) {
-    let range;
+  function applyBatchPreset(preset: BatchPreset) {
+    let range: { start: string; end: string } | null = null;
     if (preset === 'thisWeek') range = weekRange(0);
     else if (preset === 'lastWeek') range = weekRange(-1);
     else if (preset === 'thisMonth') range = monthRange(0);
@@ -383,7 +497,7 @@
 
     batchExporting = true;
     try {
-      const result = await invoke('export_reports_range', {
+      const result = await invoke<ExportRangeResult>('export_reports_range', {
         startDate: batchStartDate,
         endDate: batchEndDate,
         targetPath,
@@ -401,13 +515,14 @@
     }
   }
 
-  function renderMarkdown(content) {
-    const rawHtml = marked(content);
-    return DOMPurify.sanitize(rawHtml);
+  function renderMarkdown(content: string): string {
+    const rawHtml = marked.parse(content);
+    return typeof rawHtml === 'string' ? DOMPurify.sanitize(rawHtml) : '';
   }
 
-  async function handleReportLinkClick(event) {
-    const link = event.target.closest('a[href]');
+  async function handleReportLinkClick(event: MouseEvent) {
+    const target = event.target;
+    const link = target instanceof Element ? target.closest('a[href]') : null;
     if (!link) return;
 
     const href = link.getAttribute('href');
@@ -421,8 +536,8 @@
     }
   }
 
-  function interceptReportLinks(node) {
-    const listener = (event) => {
+  function interceptReportLinks(node: HTMLElement) {
+    const listener = (event: MouseEvent) => {
       handleReportLinkClick(event);
     };
 
@@ -439,15 +554,17 @@
   let editingSection = -1; // 当前正在编辑的段落索引
   let editingContent = ''; // 编辑中的内容
 
-  function startEditSection(sections, index) {
+  function startEditSection(sections: readonly ReportSection[], index: number) {
     editingSection = index;
     const section = sections[index];
     editingContent = reportSectionMarkdownForStorage(section);
   }
 
   /** 删除预设：走全局确认弹窗(与全应用删除交互一致);删除当前生效预设时清空提示词。 */
-  async function deletePreset(index) {
-    const preset = (config?.daily_report_prompt_presets || [])[index];
+  async function deletePreset(index: number) {
+    if (!config) return;
+    const currentConfig = config;
+    const preset = currentConfig.daily_report_prompt_presets[index];
     if (!preset) return;
     const ok = await confirm({
       tone: 'warning',
@@ -457,13 +574,42 @@
       cancelText: t('common.cancel'),
     });
     if (!ok) return;
-    const wasActive = config.daily_report_custom_prompt === preset.prompt;
-    config.daily_report_prompt_presets = config.daily_report_prompt_presets.filter((_, j) => j !== index);
+    const wasActive = currentConfig.daily_report_custom_prompt === preset.prompt;
+    currentConfig.daily_report_prompt_presets = currentConfig.daily_report_prompt_presets.filter((_, j) => j !== index);
     if (wasActive) {
-      config.daily_report_custom_prompt = '';
+      currentConfig.daily_report_custom_prompt = '';
       persistReportPrompt();
     }
     await savePresets();
+  }
+
+  function selectPromptPreset(preset: PromptPreset, active: boolean) {
+    if (!config) return;
+    config.daily_report_custom_prompt = active ? '' : preset.prompt;
+    void persistReportPrompt();
+  }
+
+  function resetSystemPromptOverride() {
+    if (config) config.daily_report_system_prompt_override = null;
+  }
+
+  async function savePresetEditor() {
+    if (presetSaving || !config) return;
+    presetSaving = true;
+    try {
+      const presets = [...config.daily_report_prompt_presets];
+      const entry = { name: editingPresetName.trim(), prompt: editingPresetPrompt.trim() };
+      if (editingPresetIndex >= 0) {
+        presets[editingPresetIndex] = entry;
+      } else {
+        presets.push(entry);
+      }
+      config.daily_report_prompt_presets = presets;
+      await savePresets();
+      showPresetModal = false;
+    } finally {
+      presetSaving = false;
+    }
   }
 
   function cancelEditSection() {
@@ -472,8 +618,8 @@
   }
 
   let savingSection = false;
-  async function saveEditSection(sections, index) {
-    if (savingSection) return;
+  async function saveEditSection(sections: readonly ReportSection[], index: number) {
+    if (savingSection || !report) return;
     savingSection = true;
     const newContent = editingContent.trim();
     const newSections = [...sections];
@@ -487,11 +633,13 @@
     }
 
     const fullContent = newSections.map(reportSectionMarkdownForStorage).join('\n');
+    const reportDate = report.date;
+    const reportCacheKey = `${reportDate}:${currentLocale}:${$selectedDeviceId || 'all'}`;
 
     try {
-      await invoke('update_report_content', { date: selectedDate, locale: currentLocale, content: fullContent, deviceId: $selectedDeviceId });
+      await invoke('update_report_content', { date: reportDate, locale: currentLocale, content: fullContent, deviceId: $selectedDeviceId });
       report = { ...report, content: fullContent };
-      cache.setReport(currentReportCacheKey, report);
+      cache.setReport(reportCacheKey, report);
       editingSection = -1;
       editingContent = '';
     } catch (e) {
@@ -501,7 +649,7 @@
     }
   }
 
-  function formatReportDate(dateStr) {
+  function formatReportDate(dateStr: string): string {
     // 用正午时间避免 "YYYY-MM-DD" 被按 UTC 午夜解析导致西时区日期偏移一天
     const date = new Date(`${dateStr}T12:00:00`);
     return formatLocalizedDate(date, { year: 'numeric', month: 'long', day: 'numeric', weekday: 'long' });
@@ -523,7 +671,9 @@
 
   $: visibleSections = getVisibleReportSections(reportSections, pinnedBlocks, hiddenBlocks);
 
-  async function togglePinBlock(section) {
+  async function togglePinBlock(section: ReportSection) {
+    if (!config) return;
+    const currentConfig = config;
     const blockName = extractReportBlockName(section);
     if (!blockName) return;
     const newPinned = pinnedBlocks.includes(blockName)
@@ -534,11 +684,13 @@
         pinnedBlocks: newPinned,
         hiddenBlocks,
       });
-      config = { ...config, daily_report_pinned_blocks: newPinned };
+      config = { ...currentConfig, daily_report_pinned_blocks: newPinned };
     } catch (e) { console.error('设置钉选失败:', e); }
   }
 
-  async function toggleHideBlock(section) {
+  async function toggleHideBlock(section: ReportSection) {
+    if (!config) return;
+    const currentConfig = config;
     const blockName = extractReportBlockName(section);
     if (!blockName) return;
     const newHidden = hiddenBlocks.includes(blockName)
@@ -549,7 +701,7 @@
         pinnedBlocks,
         hiddenBlocks: newHidden,
       });
-      config = { ...config, daily_report_hidden_blocks: newHidden };
+      config = { ...currentConfig, daily_report_hidden_blocks: newHidden };
     } catch (e) { console.error('设置隐藏失败:', e); }
   }
 
@@ -559,8 +711,10 @@
   // 生成端输出专用 summary 字段属后端增强,留待后端批次;派生失败时整段隐藏,不占版面。
   const INSIGHT_SCAN_LINES = 40;
   const INSIGHT_MAX_LENGTH = 160;
+  const HTML_COMMENT_START = '<' + '!--';
+  const HTML_COMMENT_RE = new RegExp(`${HTML_COMMENT_START}[\\s\\S]*?-->`, 'g');
 
-  function stripInlineMarkdown(text) {
+  function stripInlineMarkdown(text: string): string {
     return (text || '')
       .replace(/!\[[^\]]*\]\([^)]*\)/g, '')
       .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
@@ -568,7 +722,7 @@
       .trim();
   }
 
-  function deriveReportInsight(content) {
+  function deriveReportInsight(content: string): string {
     if (!content) return '';
     const lines = content.split('\n').slice(0, INSIGHT_SCAN_LINES);
     let firstParagraph = '';
@@ -576,7 +730,7 @@
       const line = rawLine.trim();
       if (!line) continue;
       if (
-        line.startsWith('<!--') ||
+        line.startsWith(HTML_COMMENT_START) ||
         line.startsWith('<details') ||
         line.startsWith('#') ||
         line.startsWith('|') ||
@@ -600,10 +754,10 @@
   $: reportInsight = report && !isYesterdayReport ? deriveReportInsight(report.content) : '';
 
   /** 字数统计（文章头元信息行）：剔除注释与 markdown 标记后按非空白字符计。 */
-  function countReportChars(content) {
+  function countReportChars(content: string | null | undefined): number {
     if (!content) return 0;
     return content
-      .replace(/<!--[\s\S]*?-->/g, '')
+      .replace(HTML_COMMENT_RE, '')
       .replace(/[#>*`_\-|[\]()!]/g, '')
       .replace(/\s+/g, '')
       .length;
@@ -618,11 +772,11 @@
   // ══════════ 历史周条：哪天有报告一眼可见（本周 7 天,点击切换日期,弱化为工具栏下细行） ══════════
   // 带首句摘要的历史列表需 `list_report_dates` 汇总接口,留待后端批次;
   // 这里用既有 get_saved_report 逐日探测"有/无",每个 locale 只探测一次。
-  let weekReportStatus = {}; // date -> bool
+  let weekReportStatus: Record<string, boolean | null> = {}; // date -> true/false/null(error)
   let weekStatusLocale = '';
   let weekStatusRequestId = 0;
 
-  function getCurrentWeekDates() {
+  function getCurrentWeekDates(): string[] {
     const today = new Date();
     const dayFromMonday = (today.getDay() + 6) % 7;
     const monday = new Date(today);
@@ -643,10 +797,10 @@
     const entries = await Promise.all(
       dates.map(async (date) => {
         try {
-          const saved = await invoke('get_saved_report', { date, locale: currentLocale, deviceId: $selectedDeviceId });
-          return [date, !!saved];
+          const saved = await invoke<DailyReport | null>('get_saved_report', { date, locale: currentLocale, deviceId: $selectedDeviceId });
+          return [date, Boolean(saved)] as const;
         } catch {
-          return [date, false];
+          return [date, null] as const;
         }
       })
     );
@@ -666,7 +820,8 @@
         date,
         label: formatLocalizedDate(parsed, { weekday: 'narrow' }),
         dayNum: parsed.getDate(),
-        hasReport: !!weekReportStatus[date],
+        hasReport: weekReportStatus[date] === true,
+        isError: weekReportStatus[date] === null,
         isFuture: date > todayStr,
         isToday: date === todayStr,
       };
@@ -677,7 +832,7 @@
 
   // ══════════ KPI 参照系（与报告同页的四个答案;快照固化留待后端批次,当前为实时口径） ══════════
   /** 专注峰值：hourly 分布最大桶向相邻延伸（相邻桶 ≥ 最大值 60% 时并入窗口），与概览定稿同一算法。 */
-  function computePeakWindow(distribution) {
+  function computePeakWindow(distribution: readonly HourlyActivityBucket[]) {
     const buckets = Array.from({ length: 24 }, (_, hour) => {
       const found = (distribution || []).find((bucket) => bucket.hour === hour);
       return found?.duration || 0;
@@ -702,12 +857,12 @@
     return { startHour, endHour, totalDuration };
   }
 
-  function formatSignedCompactDuration(diffSeconds) {
+  function formatSignedCompactDuration(diffSeconds: number): string {
     const sign = diffSeconds >= 0 ? '+' : '−';
     return `${sign}${formatDurationLocalized(Math.abs(diffSeconds), { compact: true })}`;
   }
 
-  function categorySharePct(stats, categoryKey) {
+  function categorySharePct(stats: DailyStats | null, categoryKey: string): number | null {
     if (!stats || !(stats.total_duration > 0)) return null;
     const item = (stats.category_usage || []).find((c) => c.category === categoryKey);
     return Math.round(((item?.duration || 0) / stats.total_duration) * 100);
@@ -732,7 +887,7 @@
 
   // ══════════ 数据对照面板（文末折叠）：分类构成条,与正文百分比互证 ══════════
   // 证据 chips 与跳时间线定位依赖生成端结构化引用,留待后端批次。
-  function categoryDisplayName(categoryKey, cats) {
+  function categoryDisplayName(categoryKey: string, cats: readonly CategoryDefinition[]): string {
     const translated = translateCategoryLabel(categoryKey);
     if (translated !== categoryKey) return translated;
     const found = cats.find((c) => c.key === categoryKey);
@@ -760,21 +915,21 @@
 
   // ══════════ 段落目录（宽屏贴右侧悬浮,≥1024px;窄窗折叠为文章顶部锚点条） ══════════
   let activeSectionIndex = 0;
-  let sectionObserver = null;
+  let sectionObserver: IntersectionObserver | null = null;
 
-  function tocTitle(section) {
+  function tocTitle(section: VisibleReportSection): string {
     return (section?.title || '').replace(/^#+\s*/, '').trim();
   }
 
   /** 段落锚点 action:注册到 IntersectionObserver,滚动时高亮当前段。 */
-  function tocAnchor(node, index) {
+  function tocAnchor(node: HTMLElement, index: number) {
     node.dataset.tocIndex = String(index);
     if (!sectionObserver && typeof IntersectionObserver !== 'undefined') {
       sectionObserver = new IntersectionObserver(
         (entries) => {
           for (const entry of entries) {
             if (entry.isIntersecting) {
-              activeSectionIndex = Number(entry.target.dataset.tocIndex) || 0;
+              activeSectionIndex = Number((entry.target as HTMLElement).dataset.tocIndex) || 0;
             }
           }
         },
@@ -783,7 +938,7 @@
     }
     sectionObserver?.observe(node);
     return {
-      update(nextIndex) {
+      update(nextIndex: number) {
         node.dataset.tocIndex = String(nextIndex);
       },
       destroy() {
@@ -792,16 +947,28 @@
     };
   }
 
-  function scrollToSection(index) {
+  function scrollToSection(index: number) {
     document
       .getElementById(`report-sec-${index}`)
       ?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
 
+  async function restoreHiddenBlock(blockName: string) {
+    if (!config) return;
+    const currentConfig = config;
+    const newHidden = hiddenBlocks.filter((item) => item !== blockName);
+    try {
+      await invoke('set_report_block_preference', { pinnedBlocks, hiddenBlocks: newHidden });
+      config = { ...currentConfig, daily_report_hidden_blocks: newHidden };
+    } catch (e) {
+      console.error('设置隐藏失败:', e);
+    }
+  }
+
   onMount(() => {
     loadConfig();
     // 分类色板：数据对照面板构成条着色（与概览/时间线同一色源）
-    invoke('get_categories')
+    invoke<CategoryDefinition[]>('get_categories')
       .then((cats) => { categoryList = cats || []; })
       .catch(() => { categoryList = []; });
     return () => {
@@ -843,6 +1010,13 @@
       <div class="report-hero-actions">
         <div class="page-toolbar-end">
           <DeviceFilter />
+          <button
+            type="button"
+            class="page-control-btn"
+            on:click={selectPreviousDay}
+          >
+            {t('report.previousDay')}
+          </button>
           <button
             class="page-control-btn {selectedDate === getLocalDateString() ? 'page-control-btn-active' : ''}"
             on:click={() => selectDate(getLocalDateString())}
@@ -971,9 +1145,9 @@
       {#each weekStripDays as day (day.date)}
         <button
           type="button"
-          class="report-weekstrip-day {day.hasReport ? '' : 'report-weekstrip-day-none'} {day.date === selectedDate ? 'report-weekstrip-day-active' : ''}"
+          class="report-weekstrip-day {day.isError ? 'report-weekstrip-day-error' : day.hasReport ? '' : 'report-weekstrip-day-none'} {day.date === selectedDate ? 'report-weekstrip-day-active' : ''}"
           disabled={day.isFuture}
-          title={day.isFuture ? '' : day.hasReport ? t('report.weekStripHasReport') : t('report.weekStripNoReport')}
+          title={day.isFuture ? '' : day.isError ? t('common.loadFailedRetry') : day.hasReport ? t('report.weekStripHasReport') : t('report.weekStripNoReport')}
           on:click={() => selectDate(day.date)}
         >
           <span class="report-weekstrip-day-label">{day.label} {day.dayNum}</span>
@@ -1018,17 +1192,13 @@
                   class="segment-btn flex-none rounded-lg border px-3 py-1.5 text-xs max-w-56 truncate
                     {presetActive ? 'settings-segment-success' : 'settings-segment-idle'}"
                   title={presetActive ? t('report.presetClickToUnselect') : preset.prompt}
-                  on:click={() => {
-                    // 再次点击已选中的预设 = 取消使用（回到"不带附加提示词"状态）
-                    config.daily_report_custom_prompt = presetActive ? '' : preset.prompt;
-                    persistReportPrompt();
-                  }}
+                  on:click={() => selectPromptPreset(preset, presetActive)}
                 >
                   {preset.name}
                 </button>
                 <button
                   type="button"
-                  class="absolute -top-1.5 left-1/2 -translate-x-1/2 flex h-5 w-5 items-center justify-center rounded-full bg-blue-500 text-xs leading-none text-white opacity-0 shadow-sm transition-opacity hover:bg-blue-600 group-hover/preset:opacity-100 focus-visible:opacity-100 dark:shadow-none"
+                  class="absolute -top-1.5 left-1/2 -translate-x-1/2 flex h-5 w-5 items-center justify-center rounded-[var(--radius-sm)] bg-blue-500 text-xs leading-none text-white opacity-0 shadow-sm transition-opacity hover:bg-blue-600 group-hover/preset:opacity-100 focus-visible:opacity-100 dark:shadow-none"
                   title={t('report.editPreset')}
                   on:click|stopPropagation={() => {
                     editingPresetIndex = i;
@@ -1039,7 +1209,7 @@
                 >✎</button>
                 <button
                   type="button"
-                  class="absolute -top-1.5 -end-1.5 flex h-5 w-5 items-center justify-center rounded-full bg-red-500 text-xs leading-none text-white opacity-0 shadow-sm transition-opacity hover:bg-red-600 group-hover/preset:opacity-100 focus-visible:opacity-100 dark:shadow-none"
+                  class="absolute -top-1.5 -end-1.5 flex h-5 w-5 items-center justify-center rounded-[var(--radius-sm)] bg-red-500 text-xs leading-none text-white opacity-0 shadow-sm transition-opacity hover:bg-red-600 group-hover/preset:opacity-100 focus-visible:opacity-100 dark:shadow-none"
                   title={t('common.delete')}
                   on:click|stopPropagation={() => deletePreset(i)}
                 >×</button>
@@ -1082,7 +1252,7 @@
               <button
                 type="button"
                 class="text-xs text-slate-400 hover:text-slate-700 dark:hover:text-[#adbac7] transition"
-                on:click={() => { config.daily_report_system_prompt_override = null; }}
+                on:click={resetSystemPromptOverride}
                 disabled={!config.daily_report_system_prompt_override}
               >
                 {t('report.resetSystemPrompt')}
@@ -1109,13 +1279,7 @@
             {#each hiddenBlocks as blockName}
               <button
                 class="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 dark:border-[#30363d] bg-white dark:bg-[#21262d] px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-[#adbac7] hover:border-blue-300 dark:hover:border-blue-500 transition-colors"
-                on:click={async () => {
-                  const newHidden = hiddenBlocks.filter((b) => b !== blockName);
-                  try {
-                    await invoke('set_report_block_preference', { pinnedBlocks, hiddenBlocks: newHidden });
-                    config = { ...config, daily_report_hidden_blocks: newHidden };
-                  } catch (e) { console.error('设置隐藏失败:', e); }
-                }}
+                on:click={() => restoreHiddenBlock(blockName)}
               >
                 <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></svg>
                 {tm(`report.blockNames.${blockName}`) || blockName}
@@ -1420,7 +1584,7 @@
 
 <!-- 段落编辑弹窗 -->
 {#if editingSection >= 0}
-  <div class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="report-edit-section-title">
+  <div class="modal-overlay" use:portalToBody role="dialog" aria-modal="true" aria-labelledby="report-edit-section-title">
     <button type="button" class="absolute inset-0 cursor-default" aria-label={t('report.cancelEdit')} on:click={cancelEditSection}></button>
     <div class="modal-panel relative z-10">
       <div class="modal-header">
@@ -1434,6 +1598,8 @@
       <div class="modal-body">
         <textarea
           class="report-edit-textarea"
+          aria-label={t('report.editSection')}
+          style:font-family={reportEditorFontFamily(config?.report_editor_font)}
           bind:value={editingContent}
         ></textarea>
       </div>
@@ -1463,7 +1629,7 @@
 <!-- 表格 / 标题 / 列表等 markdown 样式已统一放到 app.css .markdown-body -->
 
 {#if showPresetModal}
-  <div class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="report-preset-dialog-title">
+  <div class="modal-overlay" use:portalToBody role="dialog" aria-modal="true" aria-labelledby="report-preset-dialog-title">
     <button type="button" class="absolute inset-0 cursor-default" aria-label={t('report.cancelEdit')} on:click={() => { showPresetModal = false; }}></button>
     <div class="modal-panel relative z-10" style="max-width: 36rem;">
       <div class="modal-header">
@@ -1504,24 +1670,7 @@
         <button
           class="px-4 py-2 text-sm font-medium rounded-lg bg-blue-500 hover:bg-blue-600 text-white shadow-sm dark:shadow-none transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
           disabled={!editingPresetName.trim() || !editingPresetPrompt.trim() || presetSaving}
-          on:click={async () => {
-            if (presetSaving) return;
-            presetSaving = true;
-            try {
-              const presets = [...(config.daily_report_prompt_presets || [])];
-              const entry = { name: editingPresetName.trim(), prompt: editingPresetPrompt.trim() };
-              if (editingPresetIndex >= 0) {
-                presets[editingPresetIndex] = entry;
-              } else {
-                presets.push(entry);
-              }
-              config.daily_report_prompt_presets = presets;
-              await savePresets();
-              showPresetModal = false;
-            } finally {
-              presetSaving = false;
-            }
-          }}
+          on:click={savePresetEditor}
         >
           {#if presetSaving}
             <span class="inline-flex items-center gap-1.5">
@@ -1538,7 +1687,7 @@
 {/if}
 
 {#if showBatchExportModal}
-  <div class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="report-batch-export-dialog-title">
+  <div class="modal-overlay" use:portalToBody role="dialog" aria-modal="true" aria-labelledby="report-batch-export-dialog-title">
     <button type="button" class="absolute inset-0 cursor-default" aria-label={t('report.cancelEdit')} on:click={() => { if (!batchExporting) showBatchExportModal = false; }}></button>
     <div class="modal-panel relative z-10" style="max-width: 32rem;">
       <div class="modal-header">
