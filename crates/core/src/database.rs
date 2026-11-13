@@ -1268,6 +1268,9 @@ impl Database {
         }
 
         migration.commit()?;
+        if removed_ocr {
+            conn.execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")?;
+        }
         Ok(())
     }
 
@@ -9095,6 +9098,32 @@ mod tests {
         );
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM activities_fts WHERE activities_fts MATCH 'obsoleteocrsecret'", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
         drop(conn);
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn 删除ocr迁移后应立即缩小数据库与wal文件() {
+        let path = temp_db_path("remove-ocr-vacuum");
+        seed_legacy_ocr_database(&path);
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute(
+                "UPDATE activities SET ocr_text = ?1",
+                ["obsoleteocrsecret ".repeat(65_536)],
+            )
+            .unwrap();
+        }
+        let before = std::fs::metadata(&path).unwrap().len();
+        let db = Database::new(&path).unwrap();
+        let after = std::fs::metadata(&path).unwrap().len();
+        assert!(after < before / 2, "数据库应立即缩容: {before} -> {after}");
+        assert_eq!(
+            std::fs::metadata(format!("{}-wal", path.display()))
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(db.get_activity_by_id(1).unwrap().is_some());
+        drop(db);
         std::fs::remove_file(path).unwrap();
     }
 }

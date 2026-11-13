@@ -114,6 +114,8 @@ impl Database {
         if has_ocr {
             conn.execute("ALTER TABLE activities DROP COLUMN ocr_text", [])
                 .expect("删除历史 OCR 列失败");
+            conn.execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")
+                .expect("压缩删除 OCR 后的数据库失败");
         }
 
         let _ = conn.execute("ALTER TABLE activities ADD COLUMN screenshot_url TEXT", []);
@@ -907,8 +909,24 @@ mod tests {
             db.upsert_activities(&[record], &data_dir).unwrap();
             db.conn.lock().unwrap().execute_batch("ALTER TABLE activities ADD COLUMN ocr_text TEXT; UPDATE activities SET ocr_text = 'obsoleteocrsecret';").unwrap();
         }
+        {
+            let conn = Connection::open(data_dir.join("merged.db")).unwrap();
+            conn.execute(
+                "UPDATE activities SET ocr_text = ?1",
+                ["obsoleteocrsecret ".repeat(65_536)],
+            )
+            .unwrap();
+        }
+        let before = std::fs::metadata(data_dir.join("merged.db")).unwrap().len();
         for _ in 0..2 {
             let db = Database::new(&data_dir);
+            assert!(std::fs::metadata(data_dir.join("merged.db")).unwrap().len() < before / 2);
+            assert_eq!(
+                std::fs::metadata(data_dir.join("merged.db-wal"))
+                    .unwrap()
+                    .len(),
+                0
+            );
             let (records, total) = db
                 .query_activities_range(0, 200, Some("device-a"), 10, 0)
                 .unwrap();
