@@ -5,6 +5,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use chrono::TimeZone;
 use serde::Serialize;
 use std::sync::Arc;
 
@@ -114,6 +115,91 @@ pub async fn pull(
         report_cursor,
         summary_cursor,
         category_cursor,
+        server_timestamp: chrono::Local::now().timestamp(),
+    }))
+}
+
+/// 校验时间范围参数，返回错误消息（供测试复用）
+fn validate_range(from: i64, to: i64) -> Result<(), &'static str> {
+    if from < 0 {
+        return Err("from 不能为负数");
+    }
+    if to < from {
+        return Err("to 必须大于或等于 from");
+    }
+    Ok(())
+}
+
+/// GET /api/sync/range — 按指定时间段拉取记录（供 AI 分析/总结使用）。
+/// 鉴权与数据结构均与 pull 一致；activities 按 timestamp 闭区间过滤，
+/// 日报/小时摘要按 from/to 对应的本地日期过滤，分类缓存全量返回。
+pub async fn pull_range(
+    State(state): State<AppState>,
+    Query(q): Query<RangeQuery>,
+) -> Result<Json<RangeResponse>, (StatusCode, String)> {
+    if let Err(message) = validate_range(q.from, q.to) {
+        return Err((StatusCode::BAD_REQUEST, message.to_string()));
+    }
+    let limit = q.limit.unwrap_or(500).clamp(1, 2000);
+    let offset = q.offset.unwrap_or(0).max(0);
+    let device_id = q.device_id.as_deref();
+
+    let database_error = |error: rusqlite::Error| {
+        tracing::error!("时间段查询失败: {error}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "时间段查询失败".to_string(),
+        )
+    };
+
+    let from_date = chrono::Local
+        .timestamp_opt(q.from, 0)
+        .single()
+        .map(|dt| dt.date_naive().format("%Y-%m-%d").to_string())
+        .unwrap_or_default();
+    let to_date = chrono::Local
+        .timestamp_opt(q.to, 0)
+        .single()
+        .map(|dt| dt.date_naive().format("%Y-%m-%d").to_string())
+        .unwrap_or_default();
+
+    let (activities, total_activities) = state
+        .db
+        .query_activities_range(q.from, q.to, device_id, limit, offset)
+        .map_err(database_error)?;
+    let daily_reports = state
+        .db
+        .query_daily_reports_range(&from_date, &to_date, device_id)
+        .map_err(database_error)?;
+    let hourly_summaries = state
+        .db
+        .query_hourly_summaries_range(&from_date, &to_date, device_id)
+        .map_err(database_error)?;
+    let entity_categories = state
+        .db
+        .query_entity_categories_all()
+        .map_err(database_error)?;
+
+    let has_more = offset + (activities.len() as i64) < total_activities;
+    tracing::info!(
+        "range query [{}..{}] device={:?}: {} activities (total {total_activities}), {} reports, {} summaries, offset={offset} limit={limit}",
+        q.from,
+        q.to,
+        device_id,
+        activities.len(),
+        daily_reports.len(),
+        hourly_summaries.len(),
+    );
+
+    Ok(Json(RangeResponse {
+        activities,
+        daily_reports,
+        hourly_summaries,
+        entity_categories,
+        has_more,
+        offset,
+        limit,
+        total_activities,
         server_timestamp: chrono::Local::now().timestamp(),
     }))
 }
@@ -286,7 +372,7 @@ pub async fn list_devices(State(state): State<AppState>) -> Json<Vec<DeviceInfo>
 
 #[cfg(test)]
 mod tests {
-    use super::{sync_date_yyyy_mm_dd, sync_path_segment_ok};
+    use super::{sync_date_yyyy_mm_dd, sync_path_segment_ok, validate_range};
 
     #[test]
     fn screenshot_route_rejects_traversal_segments() {
@@ -295,5 +381,14 @@ mod tests {
         assert!(!sync_path_segment_ok("device/name"));
         assert!(sync_date_yyyy_mm_dd("2026-08-03"));
         assert!(!sync_date_yyyy_mm_dd("2026-8-3"));
+    }
+
+    #[test]
+    fn range_query_requires_valid_window() {
+        assert!(validate_range(0, 0).is_ok());
+        assert!(validate_range(1_752_710_400, 1_752_710_400 + 86_400).is_ok());
+        assert!(validate_range(-1, 100).is_err());
+        assert!(validate_range(200, 100).is_err());
+        assert!(validate_range(100, 100).is_ok());
     }
 }

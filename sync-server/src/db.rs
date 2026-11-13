@@ -484,6 +484,138 @@ impl Database {
         Ok((summaries, cursor))
     }
 
+    /// 按时间范围查询活动记录（供 AI 分析接口使用）。
+    /// 返回 (记录列表, 当前过滤条件下的总数)，记录按 timestamp 升序。
+    pub fn query_activities_range(
+        &self,
+        from: i64,
+        to: i64,
+        device_id: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> rusqlite::Result<(Vec<SyncActivity>, i64)> {
+        let conn = self.conn.lock().unwrap();
+        let total = conn.query_row(
+            "SELECT COUNT(*) FROM activities
+             WHERE timestamp BETWEEN ?1 AND ?2 AND (?3 IS NULL OR device_id = ?3)",
+            params![from, to, device_id],
+            |row| row.get(0),
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT uuid, device_id, sync_version, timestamp, app_name, window_title, screenshot_path, ocr_text, category, duration, browser_url, executable_path, semantic_category, semantic_confidence, screenshot_url
+             FROM activities
+             WHERE timestamp BETWEEN ?1 AND ?2 AND (?3 IS NULL OR device_id = ?3)
+             ORDER BY timestamp ASC, uuid ASC
+             LIMIT ?4 OFFSET ?5",
+        )?;
+        let activities = stmt
+            .query_map(params![from, to, device_id, limit, offset], |row| {
+                Ok(SyncActivity {
+                    uuid: row.get(0)?,
+                    device_id: row.get(1)?,
+                    sync_version: row.get(2)?,
+                    timestamp: row.get(3)?,
+                    app_name: row.get(4)?,
+                    window_title: row.get(5)?,
+                    screenshot_path: row.get(6)?,
+                    ocr_text: row.get(7)?,
+                    category: row.get(8)?,
+                    duration: row.get(9)?,
+                    browser_url: row.get(10)?,
+                    executable_path: row.get(11)?,
+                    semantic_category: row.get(12)?,
+                    semantic_confidence: row.get(13)?,
+                    screenshot_url: row.get(14)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((activities, total))
+    }
+
+    /// 按日期范围查询日报（date 为 YYYY-MM-DD，闭区间）
+    pub fn query_daily_reports_range(
+        &self,
+        from_date: &str,
+        to_date: &str,
+        device_id: Option<&str>,
+    ) -> rusqlite::Result<Vec<SyncDailyReport>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT date, locale, device_id, content, ai_mode, model_name, fallback_reason, created_at
+             FROM daily_reports
+             WHERE date BETWEEN ?1 AND ?2 AND (?3 IS NULL OR device_id = ?3)
+             ORDER BY date ASC, locale ASC, device_id ASC",
+        )?;
+        let reports = stmt
+            .query_map(params![from_date, to_date, device_id], |row| {
+                Ok(SyncDailyReport {
+                    date: row.get(0)?,
+                    locale: row.get(1)?,
+                    device_id: row.get(2)?,
+                    content: row.get(3)?,
+                    ai_mode: row.get(4)?,
+                    model_name: row.get(5)?,
+                    fallback_reason: row.get(6)?,
+                    created_at: row.get(7)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(reports)
+    }
+
+    /// 按日期范围查询小时摘要（date 为 YYYY-MM-DD，闭区间）
+    pub fn query_hourly_summaries_range(
+        &self,
+        from_date: &str,
+        to_date: &str,
+        device_id: Option<&str>,
+    ) -> rusqlite::Result<Vec<SyncHourlySummary>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT date, hour, device_id, summary, main_apps, activity_count, total_duration, representative_screenshots, created_at
+             FROM hourly_summaries
+             WHERE date BETWEEN ?1 AND ?2 AND (?3 IS NULL OR device_id = ?3)
+             ORDER BY date ASC, hour ASC, device_id ASC",
+        )?;
+        let summaries = stmt
+            .query_map(params![from_date, to_date, device_id], |row| {
+                Ok(SyncHourlySummary {
+                    date: row.get(0)?,
+                    hour: row.get(1)?,
+                    device_id: row.get(2)?,
+                    summary: row.get(3)?,
+                    main_apps: row.get(4)?,
+                    activity_count: row.get(5)?,
+                    total_duration: row.get(6)?,
+                    representative_screenshots: row.get(7)?,
+                    created_at: row.get(8)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(summaries)
+    }
+
+    /// 全量返回实体分类缓存（无时间维度，供 AI 参考分类口径）
+    pub fn query_entity_categories_all(&self) -> rusqlite::Result<Vec<SyncEntityCategory>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT entity_key, base_category, semantic_category, source, created_at
+             FROM entity_category_cache ORDER BY entity_key ASC",
+        )?;
+        let categories = stmt
+            .query_map([], |row| {
+                Ok(SyncEntityCategory {
+                    entity_key: row.get(0)?,
+                    base_category: row.get(1)?,
+                    semantic_category: row.get(2)?,
+                    source: row.get(3)?,
+                    created_at: row.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(categories)
+    }
+
     /// 更新/注册设备
     pub fn upsert_device(&self, device_id: &str, device_name: &str) {
         let conn = self.conn.lock().unwrap();

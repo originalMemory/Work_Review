@@ -68,6 +68,7 @@ async fn main() {
             post(sync_api::push).layer(DefaultBodyLimit::max(PUSH_BODY_LIMIT)),
         )
         .route("/api/sync/pull", get(sync_api::pull))
+        .route("/api/sync/range", get(sync_api::pull_range))
         .route(
             "/api/sync/screenshot/{device_id}/{date}/{filename}",
             put(sync_api::upload_screenshot)

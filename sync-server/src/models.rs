@@ -114,6 +114,37 @@ pub struct PullResponse {
     pub server_timestamp: i64,
 }
 
+/// GET /api/sync/range — 按时间范围拉取记录（供 AI 分析/总结使用）。
+/// 数据结构与 pull 一致：activities 按 timestamp 过滤，日报/小时摘要按
+/// from/to 对应的本地日期（YYYY-MM-DD）过滤，entity_categories 全量返回。
+#[derive(Debug, Deserialize)]
+pub struct RangeQuery {
+    /// 起始时间戳（秒，闭区间）
+    pub from: i64,
+    /// 结束时间戳（秒，闭区间），必须 >= from
+    pub to: i64,
+    /// 可选：只返回指定设备；缺省为所有设备
+    pub device_id: Option<String>,
+    /// 每页条数，默认 500，上限 2000
+    pub limit: Option<i64>,
+    /// 分页偏移，默认 0
+    pub offset: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RangeResponse {
+    pub activities: Vec<SyncActivity>,
+    pub daily_reports: Vec<SyncDailyReport>,
+    pub hourly_summaries: Vec<SyncHourlySummary>,
+    pub entity_categories: Vec<SyncEntityCategory>,
+    pub has_more: bool,
+    pub offset: i64,
+    pub limit: i64,
+    /// 当前时间范围/设备过滤下的活动总数，供调用方判断是否继续翻页
+    pub total_activities: i64,
+    pub server_timestamp: i64,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DeviceInfo {
     pub device_id: String,
